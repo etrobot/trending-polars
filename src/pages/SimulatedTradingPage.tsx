@@ -17,7 +17,7 @@ const HISTORY_PAGE_SIZE = 15;
 function historyStatusTone(status: string): string {
   if (status.includes('成交')) return 'text-green';
   if (status.includes('不确定') || status.includes('失败')) return 'text-trading-up';
-  if (status.includes('待') || status.includes('提交中') || status.includes('已提交')) return 'text-primary';
+  if (status.includes('待') || status.includes('提交中') || status.includes('已提交')) return 'text-primary-active';
   return 'text-muted';
 }
 
@@ -38,19 +38,15 @@ function PlanHistoryTable({
   const pageItems = history.slice(offset, offset + pageSize);
 
   return (
-    <section className="panel overflow-hidden">
-      <div className="module-header">
-        <h2 className="font-display text-base font-semibold text-ink">已执行</h2>
-        <span className="font-mono text-[11px] text-muted">{history.length} 条 · 持久化保存</span>
-      </div>
-      <div className="max-h-[420px] overflow-auto">
+    <>
+      <div className="overflow-auto">
         <table className="data-table min-w-[1180px]">
           <thead><tr><th>信号日</th><th>方向</th><th>状态</th><th>代码</th><th>名称</th><th className="text-right">排名</th><th className="text-right">数量</th><th className="text-right">参考/成交价</th><th>创建时间</th><th>提交/完成时间</th><th>原因与回查状态</th></tr></thead>
           <tbody>{pageItems.length === 0 ? <tr><td colSpan={11}><EmptyState title="尚无已执行计划" description="收盘决策生成的计划执行后会显示在这里。历史记录会持久保存在 Node.js 交易状态中。" /></td></tr> : pageItems.map((item) => (
             <tr key={item.id}>
               <td className="font-mono text-xs text-muted">{item.signal_date}</td>
               <td className={item.side === 'buy' ? 'font-semibold text-trading-up' : 'font-semibold text-trading-down'}>{item.side === 'buy' ? '买入' : '卖出'}</td>
-              <td className={`font-mono text-xs font-semibold ${historyStatusTone(item.status)}`}>{item.status}</td>
+              <td className={`font-mono text-xs ${historyStatusTone(item.status)}`}>{item.status}</td>
               <td className="font-mono text-xs text-muted">{item.stock_code}</td>
               <td className="font-semibold text-ink">{item.stock_name}</td>
               <td className="text-right font-mono text-xs">{item.rank ?? '—'}</td>
@@ -64,7 +60,7 @@ function PlanHistoryTable({
         </table>
       </div>
       {totalPages > 1 && <Pagination page={safePage} pages={totalPages} onPage={onPage} />}
-    </section>
+    </>
   );
 }
 
@@ -176,8 +172,8 @@ export function SimulatedTradingPage() {
 
   const account = overview?.account;
   const plan = overview?.plan;
-  const hasAccountSnapshot = Boolean(overview && overview.connection.status !== 'unavailable');
-  const connectionLabel = connecting ? '后台同步中' : overview?.connection.status === 'live' ? '已同步' : overview?.connection.status === 'cached' ? '上次快照' : '未连接';
+  const hasAccountSnapshot = Boolean(overview && overview.connection.status !== 'unavailable' && (overview.account.positions.length > 0 || overview.connection.status === 'live'));
+  const connectionLabel = connecting ? (hasAccountSnapshot ? '后台同步中' : '连接中') : overview?.connection.status === 'live' ? `已同步(${overview.connection.observed_at?.slice(5, 16).replace('-', '/') ?? ''})` : overview?.connection.status === 'cached' ? (hasAccountSnapshot ? '上次快照' : '未同步') : '未连接';
   const connectionDot = connecting ? 'bg-primary animate-pulse' : overview?.connection.status === 'live' && connected ? 'bg-green' : 'bg-muted';
   const tradingDisabled = busy || connecting || !overview || overview.connection.status === 'unavailable';
 
@@ -188,16 +184,16 @@ export function SimulatedTradingPage() {
   }) ?? [];
 
   const tabStyle = (active: boolean) =>
-    `px-3 py-1.5 font-mono text-[11px] font-semibold transition cursor-pointer ${
+    `px-3 py-1.5 font-mono text-[11px] transition cursor-pointer ${
       active
-        ? 'border-b-2 border-primary text-primary bg-[#2b2417]'
+        ? 'border-b-2 border-primary-active text-primary-active bg-primary/5'
         : 'border-b-2 border-transparent text-muted hover:text-ink hover:bg-surface-elevated'
     }`;
 
   return (
     <>
       <PageHeaderActions>
-        <span className="inline-flex h-7 shrink-0 items-center gap-1.5 bg-[#14261c] px-2 font-mono text-[11px] font-semibold text-trading-down" style={{ borderRadius: 2 }}><ShieldCheck className="h-3 w-3" />同花顺模拟</span>
+        <span className="inline-flex h-7 shrink-0 items-center gap-1.5 bg-accent-green-soft px-2 font-mono text-[11px] text-trading-down" style={{ borderRadius: 2 }}><ShieldCheck className="h-3 w-3" />同花顺模拟</span>
         <span title={overview?.connection.observed_at ? `账户快照：${overview.connection.observed_at}` : connected ? '状态推送在线' : '状态推送正在重连'} className="inline-flex h-7 shrink-0 items-center gap-1.5 border border-line bg-surface px-2 font-mono text-[11px] text-muted" style={{ borderRadius: 2 }}><span className={`h-1.5 w-1.5 ${connectionDot}`} />{connectionLabel}</span>
         <Button variant="secondary" disabled={busy || !automation} onClick={() => void toggleAutomation()}>{automation?.enabled ? <CirclePause className="h-3.5 w-3.5" /> : <CirclePlay className="h-3.5 w-3.5" />}自动化：{automation?.enabled ? '开' : '关'}</Button>
         <Button variant="ghost" disabled={busy || !automation?.enabled} onClick={() => void pause()}>{automation?.paused_today ? '恢复今日' : '暂停今日'}</Button>
@@ -208,20 +204,14 @@ export function SimulatedTradingPage() {
         <Button variant="primary" disabled={tradingDisabled} title="按当前报价立即执行上一收盘日生成的交易计划" onClick={() => confirmWindow('open')}><ClipboardCheck className="h-3.5 w-3.5" />立即执行</Button>
       </PageHeaderActions>
       <div className="terminal-page">
-      {connecting && <div className="border border-[#5d4c27] bg-[#2b2417] px-3 py-2 text-[11px] leading-4 text-primary">页面已从 Node.js 本地状态加载；同花顺账户正在后台同步，不会阻塞策略计划和历史记录显示。{overview?.connection.observed_at ? ` 当前展示 ${overview.connection.observed_at} 的上次快照。` : ''}</div>}
-      {!connecting && overview?.connection.status === 'cached' && <div className="border border-[#5d4c27] bg-[#2b2417] px-3 py-2 text-[11px] leading-4 text-primary">当前展示同花顺上次成功快照（{overview.connection.observed_at ?? '时间未知'}）。可点击"刷新账户"重新连接。</div>}
-      {error && <div className="border border-[#6b3434] bg-[#2c1919] px-3 py-2 text-[11px] leading-4 text-trading-up">{error}</div>}
+      {error && <div className="border border-accent-red-soft bg-accent-red-soft px-3 py-2 text-[11px] leading-4 text-trading-up">{error}</div>}
       {!overview && <LoadingPanel label="页面已就绪，正在后台连接同花顺模拟账户…" />}
       {overview && account && plan && (
       <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_300px]">
         <div className="space-y-3">
-          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base font-semibold text-ink">持仓</h2><span className="font-mono text-[11px] text-muted">{hasAccountSnapshot ? `${account.positions.length} 只` : '等待同步'}</span></div><div className="overflow-auto"><table className="data-table min-w-[920px]"><thead><tr><th>代码</th><th>名称</th><th>入场日</th><th className="text-right">交易日</th><th className="text-right">持仓</th><th className="text-right">可卖</th><th className="text-right">成本</th><th className="text-right">现价</th><th className="text-right">盈亏额</th><th className="text-right">盈亏率</th><th className="text-right">市值</th></tr></thead><tbody>{account.positions.length === 0 ? <tr><td colSpan={11}><EmptyState title={hasAccountSnapshot ? '暂无持仓' : '等待同花顺账户快照'} description={hasAccountSnapshot ? undefined : '页面和策略历史已可查看，账户数据将在后台连接完成后更新。'} /></td></tr> : account.positions.map((position) => <tr key={position.stock_code}><td className="font-mono text-xs text-muted">{position.stock_code}</td><td className="font-semibold text-ink">{position.stock_name}</td><td className="font-mono text-xs text-muted">{position.entry_date || '—'}</td><td className="text-right font-mono text-xs">{position.hold_days ?? '—'}</td><td className="text-right font-mono text-xs">{position.shares.toLocaleString()}</td><td className="text-right font-mono text-xs">{position.available_shares.toLocaleString()}</td><td className="text-right font-mono text-xs">{position.cost_price.toFixed(2)}</td><td className="text-right font-mono text-xs">{position.current_price.toFixed(2)}</td><td className={`text-right font-mono text-xs font-semibold ${pctColor(position.pnl_amount)}`}>{position.pnl_amount > 0 ? '+' : ''}{formatMoney(position.pnl_amount)}</td><td className={`text-right font-mono text-xs font-semibold ${pctColor(position.pnl_pct)}`}>{position.pnl_pct > 0 ? '+' : ''}{position.pnl_pct.toFixed(2)}%</td><td className="text-right font-mono text-xs font-semibold text-ink">{formatMoney(position.market_value)}</td></tr>)}</tbody></table></div></section>
+          <section className="panel overflow-hidden"><div className="overflow-auto"><table className="data-table min-w-[920px]"><thead><tr><th>代码</th><th>名称</th><th>入场日</th><th className="text-right">交易日</th><th className="text-right">持仓</th><th className="text-right">可卖</th><th className="text-right">成本</th><th className="text-right">现价</th><th className="text-right">盈亏额</th><th className="text-right">盈亏率</th><th className="text-right">市值</th></tr></thead><tbody>{account.positions.length === 0 ? <tr><td colSpan={11}><EmptyState title={hasAccountSnapshot ? '暂无持仓' : '等待同花顺账户快照'} description={hasAccountSnapshot ? undefined : '页面和策略历史已可查看，账户数据将在后台连接完成后更新。'} /></td></tr> : account.positions.map((position) => <tr key={position.stock_code}><td className="font-mono text-xs text-muted">{position.stock_code}</td><td className="font-semibold text-ink">{position.stock_name}</td><td className="font-mono text-xs text-muted">{position.entry_date || '—'}</td><td className="text-right font-mono text-xs">{position.hold_days ?? '—'}</td><td className="text-right font-mono text-xs">{position.shares.toLocaleString()}</td><td className="text-right font-mono text-xs">{position.available_shares.toLocaleString()}</td><td className="text-right font-mono text-xs">{position.cost_price.toFixed(2)}</td><td className="text-right font-mono text-xs">{position.current_price.toFixed(2)}</td><td className={`text-right font-mono text-xs ${pctColor(position.pnl_amount)}`}>{position.pnl_amount > 0 ? '+' : ''}{formatMoney(position.pnl_amount)}</td><td className={`text-right font-mono text-xs ${pctColor(position.pnl_pct)}`}>{position.pnl_pct > 0 ? '+' : ''}{position.pnl_pct.toFixed(2)}%</td><td className="text-right font-mono text-xs text-ink">{formatMoney(position.market_value)}</td></tr>)}</tbody></table></div></section>
 
           <section className="panel overflow-hidden">
-            <div className="module-header">
-              <h2 className="font-display text-base font-semibold text-ink">策略计划</h2>
-              <span className="font-mono text-[11px] text-muted">最近收盘生成 · 自动按开盘 / 临收盘窗口执行</span>
-            </div>
             <div className="flex border-b border-line">
               <button className={tabStyle(planTab === 'pending')} onClick={() => { setPlanTab('pending'); setHistoryPage(1); }}>
                 待执行{plan.orders.length > 0 && <span className="ml-1.5 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full bg-primary px-1 text-[10px] font-bold text-on-primary">{plan.orders.length}</span>}
@@ -236,7 +226,7 @@ export function SimulatedTradingPage() {
                   <thead><tr><th>方向</th><th>状态</th><th>信号日</th><th className="text-right">排名</th><th>窗口</th><th>代码</th><th>名称</th><th className="text-right">数量</th><th className="text-right">参考价</th><th className="text-right">预计金额</th><th>原因</th></tr></thead>
                   <tbody>{plan.orders.length === 0 ? <tr><td colSpan={11}><EmptyState title="暂无待执行指令" description="当前没有活动指令；交易日收盘后会按排行榜、持仓上限和退出条件生成下一交易日计划。" /></td></tr> : plan.orders.map((order) => <tr key={order.id}><td className={order.side === 'buy' ? 'font-semibold text-trading-up' : 'font-semibold text-trading-down'}>{order.side === 'buy' ? '买入' : '卖出'}</td><td className="font-mono text-xs text-muted">{order.status}</td><td className="font-mono text-xs text-muted">{order.signal_date ?? '—'}</td><td className="text-right font-mono text-xs">{order.rank ?? '—'}</td><td className="text-xs text-muted">{order.window}</td><td className="font-mono text-xs text-muted">{order.stock_code}</td><td className="font-semibold text-ink">{order.stock_name}</td><td className="text-right font-mono text-xs">{order.quantity.toLocaleString()}</td><td className="text-right font-mono text-xs">{order.price.toFixed(2)}</td><td className="text-right font-mono text-xs">{formatMoney(order.amount)}</td><td className="max-w-xs whitespace-normal text-xs text-muted">{order.reason}</td></tr>)}</tbody>
                 </table>
-                {plan.skipped.length > 0 && <div className="border-t border-[#5d4c27] bg-[#2b2417] px-3 py-2 text-[11px] leading-4 text-primary">{plan.skipped.join(' ')}</div>}
+                {plan.skipped.length > 0 && <div className="border-t border-primary/30 bg-primary/5 px-3 py-2 text-[11px] leading-4 text-primary-active">{plan.skipped.join(' ')}</div>}
               </div>
             ) : (
               <PlanHistoryTable history={executedHistory} page={historyPage} pageSize={HISTORY_PAGE_SIZE} onPage={setHistoryPage} />
@@ -247,17 +237,17 @@ export function SimulatedTradingPage() {
         </div>
 
         <aside className="space-y-3">
-          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base font-semibold text-ink">账户</h2><span className="font-mono text-[11px] text-muted">{plan.ranking_date}</span></div><div className="divide-y divide-line-soft">{[
+          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base text-ink">账户</h2><span className="font-mono text-[11px] text-muted">{plan.ranking_date}</span></div><div className="divide-y divide-line-soft">{[
             ['总资产', hasAccountSnapshot ? formatMoney(account.total_assets) : '—', 'text-ink'],
             ['可用资金', hasAccountSnapshot ? formatMoney(account.available_cash) : '—', 'text-ink'],
             ['持仓盈亏', hasAccountSnapshot ? formatMoney(account.pnl_summary.amount) : '—', hasAccountSnapshot ? pctColor(account.pnl_summary.amount) : 'text-muted'],
             ['盈亏率', hasAccountSnapshot ? `${account.pnl_summary.pct >= 0 ? '+' : ''}${account.pnl_summary.pct.toFixed(2)}%` : '—', hasAccountSnapshot ? pctColor(account.pnl_summary.pct) : 'text-muted'],
             ['当前仓位', hasAccountSnapshot ? `${account.current_position_pct.toFixed(1)}%` : '—', 'text-ink'],
-            ['资金上限', `${plan.target_position_pct}%`, 'text-primary'],
+            ['资金上限', `${plan.target_position_pct}%`, 'text-primary-active'],
             ['待执行指令', String(plan.orders.length), 'text-ink'],
-          ].map(([label, value, valueClass]) => <div key={label} className="flex items-center justify-between gap-3 px-3 py-2.5"><span className="text-[11px] text-muted">{label}</span><span className={`font-mono text-[11px] font-semibold ${valueClass}`}>{value}</span></div>)}</div></section>
+          ].map(([label, value, valueClass]) => <div key={label} className="flex items-center justify-between gap-3 px-3 py-2.5"><span className="text-[11px] text-muted">{label}</span><span className={`font-mono text-[11px] ${valueClass}`}>{value}</span></div>)}</div></section>
 
-          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base font-semibold text-ink">策略</h2></div><table className="data-table"><tbody>{[
+          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base text-ink">策略</h2></div><table className="data-table"><tbody>{[
             ['资金使用上限', `${plan.target_position_pct}%`],
             ['单票仓位', `${plan.position_size_pct}%`],
             ['持仓上限', `${plan.max_positions} 只`],
@@ -266,9 +256,9 @@ export function SimulatedTradingPage() {
             ['已执行计划', `${executedHistory.length} 条`],
             ['策略日期', plan.ranking_date],
             ['自动执行', automation?.next_window ?? '—'],
-          ].map(([label, value]) => <tr key={label}><td className="text-muted">{label}</td><td className="text-right font-mono font-semibold text-ink">{value}</td></tr>)}</tbody></table></section>
+          ].map(([label, value]) => <tr key={label}><td className="text-muted">{label}</td><td className="text-right font-mono text-ink">{value}</td></tr>)}</tbody></table></section>
 
-          <section className="panel p-3.5"><h2 className="font-display text-base font-semibold text-ink">风控</h2><div className="mt-3 space-y-2">{[['成交时序', '行情好买开盘 / 卖临收盘；行情弱相反'], ['单票上限', `基准资金 ${plan.position_size_pct}%`], ['持仓上限', `${plan.max_positions} 只`], ['每日新增', `≤ ${plan.max_entries_per_day} 只`], ['退出规则', `-5 / +15 / ${plan.max_hold_days}d`], ['执行工具', '同花顺 AppleScript']].map(([label, detail]) => <div key={label} className="flex items-center justify-between border-b border-line-soft pb-1.5 text-[11px] last:border-0 last:pb-0"><span className="text-muted">{label}</span><span className="font-mono text-ink">{detail}</span></div>)}</div></section>
+          <section className="panel p-3.5"><h2 className="font-display text-base text-ink">风控</h2><div className="mt-3 space-y-2">{[['成交时序', '行情好买开盘 / 卖临收盘；行情弱相反'], ['单票上限', `基准资金 ${plan.position_size_pct}%`], ['持仓上限', `${plan.max_positions} 只`], ['每日新增', `≤ ${plan.max_entries_per_day} 只`], ['退出规则', `-5 / +15 / ${plan.max_hold_days}d`], ['执行工具', '同花顺 AppleScript']].map(([label, detail]) => <div key={label} className="flex items-center justify-between border-b border-line-soft pb-1.5 text-[11px] last:border-0 last:pb-0"><span className="text-muted">{label}</span><span className="font-mono text-ink">{detail}</span></div>)}</div></section>
         </aside>
       </section>
       )}

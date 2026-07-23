@@ -1,55 +1,70 @@
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
 @import "tailwindcss";
 
 @theme {
-  --font-sans: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
-  --font-display: "IBM Plex Sans Condensed", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-sans: "IBM Plex Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-display: "IBM Plex Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
 
-  /* Binance Dark Canvas */
-  --color-canvas: #0b0e11;
-  --color-canvas-soft: #1e2329;
-  --color-surface: #1e2329;
-  --color-surface-elevated: #2b3139;
-  --color-ink: #ffffff;
-  --color-body: #eaecef;
-  --color-muted: #707a8a;
-  --color-line: #2b3139;
-  --color-line-soft: #242a30;
+  /* PostHog Cream Canvas */
+  --color-canvas: #eeefe9;
+  --color-canvas-soft: #e5e7e0;
+  --color-surface: #ffffff;
+  --color-surface-elevated: #e5e7e0;
+  --color-navy: #eeefe9;
+  --color-ink: #23251d;
+  --color-body: #4d4f46;
+  --color-muted: #6c6e63;
+  --color-charcoal: #33342d;
+  --color-ash: #9b9c92;
+  --color-stone: #b6b7af;
+  --color-line: #bfc1b7;
+  --color-line-soft: #dcdfd2;
 
-  /* Brand — Binance Yellow */
-  --color-primary: #fcd535;
-  --color-primary-active: #f0b90b;
-  --color-on-primary: #181a20;
-  --color-coral: #fcd535;
-  --color-coral-dark: #f0b90b;
+  /* Brand — PostHog Yellow-Orange */
+  --color-primary: #f7a501;
+  --color-primary-active: #dd9001;
+  --color-primary-pressed: #dd9001;
+  --color-primary-deep: #b17816;
+  --color-on-primary: #23251d;
+  --color-coral: #f7a501;
+  --color-coral-dark: #dd9001;
 
   /* Accent / text highlights */
-  --color-accent-text: #fcd535;
-
-  /* Sidebar canvas */
-  --color-navy: #0b0e11;
+  --color-accent-text: #f7a501;
 
   /* Trading semantics — Chinese convention (red = up, green = down) */
-  --color-trading-up: #f6465d;
-  --color-trading-down: #0ecb81;
-  --color-green: #0ecb81;
-  --color-green-text: #0ecb81;
-  --color-red-cn: #f6465d;
-  --color-red-cn-dark: #c73e4a;
-  --color-red-text: #f6465d;
+  --color-trading-up: #cd4239;
+  --color-trading-down: #2c8c66;
+  --color-green: #2c8c66;
+  --color-green-text: #2c8c66;
+  --color-red-cn: #cd4239;
+  --color-red-cn-dark: #b0362e;
+  --color-red-text: #cd4239;
+
+  /* Semantic accents */
+  --color-accent-blue: #2c84e0;
+  --color-accent-blue-soft: #dceaf6;
+  --color-accent-red: #cd4239;
+  --color-accent-red-soft: #f7d6d3;
+  --color-accent-green: #2c8c66;
+  --color-accent-green-soft: #d9eddf;
+  --color-accent-purple: #7c44a6;
+  --color-accent-purple-soft: #e7d8ee;
 
   /* Info / focus */
-  --color-info: #3b82f6;
+  --color-info: #2c84e0;
+  --color-focus-ring: rgba(59, 130, 246, 0.5);
 }
 
 :root {
-  color: #eaecef;
-  background: #0b0e11;
-  font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #4d4f46;
+  background: #eeefe9;
+  font-family: "IBM Plex Sans", "PingFang SC", "Microsoft YaHei", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  color-scheme: dark;
+  color-scheme: light;
 }
 
 * {
@@ -58,14 +73,14 @@
 
 html {
   min-width: 320px;
-  background: #0b0e11;
+  background: #eeefe9;
 }
 
 body {
   min-width: 320px;
   min-height: 100vh;
   margin: 0;
-  background: #0b0e11;
+  background: #eeefe9;
 }
 
 button,
@@ -88,8 +103,8 @@ select {
 }
 select option {
   font-size: 11px;
-  color: #eaecef;
-  background: #1e2329;
+  color: #23251d;
+  background: #ffffff;
 }
 
 .font-mono,
@@ -100,8 +115,8 @@ select {
 }
 
 ::selection {
-  color: #181a20;
-  background: #fcd535;
+  color: #23251d;
+  background: #f7a501;
 }
 
 ::-webkit-scrollbar {
@@ -110,24 +125,24 @@ select {
 }
 
 ::-webkit-scrollbar-track {
-  background: #0b0e11;
+  background: #eeefe9;
 }
 
 ::-webkit-scrollbar-thumb {
-  border: 1px solid #0b0e11;
-  background: #555555;
+  border: 1px solid #eeefe9;
+  background: #bfc1b7;
 }
 
 @layer components {
   .panel {
     @apply border border-line bg-surface;
-    border-radius: 3px;
+    border-radius: 6px;
     box-shadow: none;
   }
 
   .panel-dark {
-    @apply border border-white/10 bg-navy text-white;
-    border-radius: 3px;
+    @apply border border-line bg-surface;
+    border-radius: 6px;
     box-shadow: none;
   }
 
@@ -136,8 +151,8 @@ select {
   }
 
   .terminal-field {
-    @apply h-8 border border-line bg-canvas px-2.5 text-[11px] text-ink outline-none transition placeholder:text-muted focus:border-primary;
-    border-radius: 2px;
+    @apply h-8 border border-line bg-surface px-2.5 text-[11px] text-ink outline-none transition placeholder:text-muted focus:border-primary;
+    border-radius: 4px;
   }
 
   .module-header {
@@ -146,7 +161,7 @@ select {
 
   .table-scroll {
     @apply overflow-auto border border-line bg-surface;
-    border-radius: 3px;
+    border-radius: 6px;
   }
 
   .data-table {
@@ -159,19 +174,18 @@ select {
   }
 
   .data-table th {
-    @apply h-7 whitespace-nowrap border-b border-r border-line px-2.5 py-1.5 font-mono text-[11px] font-semibold tracking-[0.08em] text-muted uppercase last:border-r-0;
+    @apply h-7 whitespace-nowrap border-b-2 border-line-soft px-2.5 py-1.5 font-mono text-[11px] tracking-[0.08em] text-muted uppercase;
   }
 
   .data-table td {
-    @apply h-8 whitespace-nowrap border-b border-r border-line-soft px-2.5 py-1.5 leading-tight text-body last:border-r-0;
+    @apply h-8 whitespace-nowrap border-b border-line-soft px-2.5 py-1.5 leading-tight text-body;
   }
 
   .data-table tbody tr:nth-child(even) {
-    background: rgba(255, 255, 255, 0.018);
+    background: rgba(0, 0, 0, 0.02);
   }
 
   .data-table tbody tr {
-    @apply transition-colors hover:bg-[#2b3139];
   }
 
   .data-table tbody tr:last-child td {

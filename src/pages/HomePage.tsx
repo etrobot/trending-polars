@@ -90,14 +90,14 @@ export function HomePage() {
 
   const toggleSort = (key: BlockSort) => setSort((current) => current.key === key ? { key, desc: !current.desc } : { key, desc: true });
   const SortLabel = ({ field, children }: { field: BlockSort; children: string }) => (
-    <button className={`focus-ring inline-flex items-center gap-1 rounded ${sort.key === field ? 'text-primary' : ''}`} onClick={() => toggleSort(field)}>{children}<ArrowDownUp className="h-2.5 w-2.5" /></button>
+    <button className={`focus-ring inline-flex items-center gap-1 rounded ${sort.key === field ? 'text-primary-active' : ''}`} onClick={() => toggleSort(field)}>{children}<ArrowDownUp className="h-2.5 w-2.5" /></button>
   );
 
   return (
     <>
       <PageHeaderActions><Button disabled={refreshing} onClick={() => void refresh()}><RefreshCw className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />{refreshing ? '刷新中' : '刷新数据'}</Button></PageHeaderActions>
       <div className="terminal-page">
-      {error && <div className="border border-[#6b3434] bg-[#2c1919] px-3 py-2 text-[11px] leading-4 text-trading-up">{error}</div>}
+      {error && <div className="border border-accent-red-soft bg-accent-red-soft px-3 py-2 text-[11px] leading-4 text-trading-up">{error}</div>}
       <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard label="市场情绪" value={<span className="flex items-center gap-2">{sentimentLabel(data.sentiment.sentiment)} <SentimentPill sentiment={data.sentiment.sentiment} /></span>} detail={`${data.sentiment.total_blocks} 个活跃板块`} tone="coral" icon={<Flame className="h-4 w-4" />} />
         <MetricCard label="涨停家数" value={data.sentiment.total_limit_up} detail="全市场" icon={<TrendingUp className="h-4 w-4" />} />
@@ -127,13 +127,13 @@ export function HomePage() {
                   return (
                     <tr key={block.code} className="cursor-pointer" onClick={() => navigate(`/details?code=${block.code}&idx=${index}`)}>
                       <td className="font-semibold text-ink">{block.name}</td>
-                      <td className="text-center"><span className="inline-flex min-w-7 justify-center bg-[#2b2417] px-2 py-0.5 font-mono text-[11px] font-semibold text-primary" style={{ borderRadius: 2 }}>{block.block_info.limit_up_num}</span></td>
-                      <td className={`text-right font-mono font-semibold ${pctColor(change)}`}>{change > 0 ? '+' : ''}{change.toFixed(2)}%</td>
+                      <td className="text-center"><span className="inline-flex min-w-7 justify-center bg-primary/10 px-2 py-0.5 font-mono text-[11px] text-primary-deep" style={{ borderRadius: 2 }}>{block.block_info.limit_up_num}</span></td>
+                      <td className={`text-right font-mono ${pctColor(change)}`}>{change > 0 ? '+' : ''}{change.toFixed(2)}%</td>
                       <td className="text-center"><StatePill state={block.trend} /></td>
                       <td className="text-right font-mono text-xs">{block.trend.near_high ?? '—'}</td>
                       <td className="text-center text-xs">{block.trend.volume_trend ?? '—'}</td>
                       <td className="text-center"><StrategyPill action={block.strategy.action} label={block.strategy.label} /></td>
-                      <td><span className="font-mono text-xs font-semibold text-primary">{block.strategy.position}</span></td>
+                      <td><span className="font-mono text-xs text-primary-deep">{block.strategy.position}</span></td>
                     </tr>
                   );
                 })}
@@ -144,7 +144,7 @@ export function HomePage() {
 
         <aside className="panel overflow-hidden xl:max-h-[calc(100vh-158px)]">
           <div className="module-header">
-            <h2 className="font-display text-base font-semibold text-ink">指数</h2>
+            <h2 className="font-display text-base text-ink">指数</h2>
             <span className="font-mono text-[11px] text-muted">{indices.length}</span>
           </div>
           <div className="max-h-[calc(100vh-194px)] divide-y divide-line-soft overflow-y-auto">

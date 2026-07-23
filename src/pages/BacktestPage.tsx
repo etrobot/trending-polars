@@ -138,7 +138,7 @@ export function BacktestPage() {
     <>
       <PageHeaderActions>{headerActions}</PageHeaderActions>
       <div className="terminal-page">
-      {error && <div className="border border-[#6c2a25] bg-[#321918] px-3 py-2 font-mono text-[11px] text-trading-up">{error}</div>}
+      {error && <div className="border border-accent-red-soft bg-accent-red-soft px-3 py-2 font-mono text-[11px] text-trading-up">{error}</div>}
 
       {!result ? (
         <div className="panel"><EmptyState title="还没有可展示的回测" description="先运行一次策略回测，系统会自动构建可复现的历史截面。" /></div>
@@ -146,12 +146,12 @@ export function BacktestPage() {
         <>
         <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_260px_260px]">
           <div className="panel p-3.5">
-            <div className="mb-2 flex flex-wrap items-end justify-between gap-3 border-b border-line pb-2"><div><h2 className="font-display text-base font-semibold text-ink">策略净值</h2>{result.engine_version && <div className="mt-0.5 font-mono text-[10px] text-muted">真实日线 · 收盘信号 / 次日开盘成交 · 含交易成本</div>}</div><div className="font-mono text-[11px] text-muted">{result.date_range}</div></div>
+            <div className="mb-2 flex flex-wrap items-end justify-between gap-3 border-b border-line pb-2"><div><h2 className="font-display text-base text-ink">策略净值</h2>{result.engine_version && <div className="mt-0.5 font-mono text-[10px] text-muted">真实日线 · 收盘信号 / 次日开盘成交 · 含交易成本</div>}</div><div className="font-mono text-[11px] text-muted">{result.date_range}</div></div>
             <EquityCurve data={curve} />
           </div>
 
           <section className="panel overflow-hidden">
-            <div className="module-header"><h2 className="font-display text-base font-semibold text-ink">回测统计</h2></div>
+            <div className="module-header"><h2 className="font-display text-base text-ink">回测统计</h2></div>
             <div className="divide-y divide-line-soft">
               {[
                 ['初始资金', formatMoney(result.summary.initial_capital), 'text-ink'],
@@ -162,16 +162,16 @@ export function BacktestPage() {
                 ['最大回撤', `${(result.summary.max_drawdown_pct ?? 0).toFixed(2)}%`, 'text-trading-down'],
                 ['交易数', String(result.summary.total_trades), 'text-ink'],
                 ['最大持仓', `${result.summary.max_holdings} 只`, 'text-ink'],
-              ].map(([label, value, valueClass]) => <div key={label} className="flex items-center justify-between gap-3 px-3 py-2.5"><span className="text-[11px] text-muted">{label}</span><span className={`font-mono text-[11px] font-semibold ${valueClass}`}>{value}</span></div>)}
+              ].map(([label, value, valueClass]) => <div key={label} className="flex items-center justify-between gap-3 px-3 py-2.5"><span className="text-[11px] text-muted">{label}</span><span className={`font-mono text-[11px] ${valueClass}`}>{value}</span></div>)}
             </div>
           </section>
 
-          <section className="panel-dark p-3.5"><h2 className="font-display text-base font-semibold text-white">参数</h2><div className="mt-3 space-y-2">{[['仓位比例', `${result.config.position_size_pct}% / 单票`], ['最大持仓', `${result.config.max_hold_days} 个交易日`], ['每日新增', `≤ ${result.config.max_positions_per_day} 只`], ['止损 / 止盈', `${result.config.stop_loss_pct}% / +${result.config.take_profit_pct}%`], ['候选池', `前 ${result.config.max_candidates} 名`], ...(result.engine_version ? [['成交假设', 'T+1 开盘 + 滑点税费']] : [])].map(([label, value]) => <div key={label} className="flex items-center justify-between gap-3 border-b border-white/10 pb-2 font-mono text-[11px]"><span className="text-white/45">{label}</span><span className="text-right text-white">{value}</span></div>)}</div><div className="mt-4 flex items-center gap-2 font-mono text-[11px] text-white/40"><CalendarRange className="h-3 w-3" />{result.timestamp}</div></section>
+          <section className="panel p-3.5"><h2 className="font-display text-base text-ink">参数</h2><div className="mt-3 space-y-2">{[['仓位比例', `${result.config.position_size_pct}% / 单票`], ['最大持仓', `${result.config.max_hold_days} 个交易日`], ['每日新增', `≤ ${result.config.max_positions_per_day} 只`], ['止损 / 止盈', `${result.config.stop_loss_pct}% / +${result.config.take_profit_pct}%`], ['候选池', `前 ${result.config.max_candidates} 名`], ...(result.engine_version ? [['成交假设', 'T+1 开盘 + 滑点税费']] : [])].map(([label, value]) => <div key={label} className="flex items-center justify-between gap-3 border-b border-line-soft pb-2 font-mono text-[11px]"><span className="text-muted">{label}</span><span className="text-right text-ink">{value}</span></div>)}</div><div className="mt-4 flex items-center gap-2 font-mono text-[11px] text-muted"><CalendarRange className="h-3 w-3" />{result.timestamp}</div></section>
         </section>
 
         <section>
           <SectionHeading title="交易记录" description={`${result.trades.length} 条`} />
-          <div className="table-scroll"><table className="data-table min-w-[1040px]"><thead><tr><th>日期</th><th>代码</th><th>名称</th><th className="text-center">操作</th><th className="text-right">价格</th><th className="text-right">数量</th><th className="text-right">金额</th><th className="text-right">仓位</th><th className="text-right">持仓日</th><th className="text-right">盈亏</th><th>原因</th></tr></thead><tbody>{result.trades.map((trade, index) => <tr key={`${trade.date}-${trade.stock_code}-${index}`}><td className="font-mono text-xs">{trade.date}</td><td className="font-mono text-xs text-muted">{trade.stock_code}</td><td className="font-semibold text-ink">{trade.stock_name}</td><td className={`text-center text-xs font-semibold ${tradeAction(trade.action)}`}>{trade.action}</td><td className="text-right font-mono text-xs">{trade.price.toFixed(2)}</td><td className="text-right font-mono text-xs">{trade.shares.toLocaleString()}</td><td className="text-right font-mono text-xs">{formatMoney(trade.amount)}</td><td className="text-right font-mono text-xs">{trade.position_pct.toFixed(1)}%</td><td className="text-right font-mono text-xs">{trade.hold_days}</td><td className={`text-right font-mono text-xs font-semibold ${trade.pnl_pct > 0 ? 'text-trading-up' : trade.pnl_pct < 0 ? 'text-trading-down' : 'text-muted'}`}>{trade.pnl_pct > 0 ? '+' : ''}{trade.pnl_pct.toFixed(2)}%</td><td className="max-w-sm whitespace-normal text-xs text-muted">{trade.reason}</td></tr>)}</tbody></table></div>
+          <div className="table-scroll"><table className="data-table min-w-[1040px]"><thead><tr><th>日期</th><th>代码</th><th>名称</th><th className="text-center">操作</th><th className="text-right">价格</th><th className="text-right">数量</th><th className="text-right">金额</th><th className="text-right">仓位</th><th className="text-right">持仓日</th><th className="text-right">盈亏</th><th>原因</th></tr></thead><tbody>{result.trades.map((trade, index) => <tr key={`${trade.date}-${trade.stock_code}-${index}`}><td className="font-mono text-xs">{trade.date}</td><td className="font-mono text-xs text-muted">{trade.stock_code}</td><td className="font-semibold text-ink">{trade.stock_name}</td><td className={`text-center text-xs ${tradeAction(trade.action)}`}>{trade.action}</td><td className="text-right font-mono text-xs">{trade.price.toFixed(2)}</td><td className="text-right font-mono text-xs">{trade.shares.toLocaleString()}</td><td className="text-right font-mono text-xs">{formatMoney(trade.amount)}</td><td className="text-right font-mono text-xs">{trade.position_pct.toFixed(1)}%</td><td className="text-right font-mono text-xs">{trade.hold_days}</td><td className={`text-right font-mono text-xs ${trade.pnl_pct > 0 ? 'text-trading-up' : trade.pnl_pct < 0 ? 'text-trading-down' : 'text-muted'}`}>{trade.pnl_pct > 0 ? '+' : ''}{trade.pnl_pct.toFixed(2)}%</td><td className="max-w-sm whitespace-normal text-xs text-muted">{trade.reason}</td></tr>)}</tbody></table></div>
         </section>
         </>
       )}
@@ -181,7 +181,7 @@ export function BacktestPage() {
       </Modal>
 
       <Modal open={historyOpen} onClose={() => setHistoryOpen(false)} title="回测历史" description="选择一条记录查看完整的净值与交易账本。" width="max-w-xl">
-        <div className="divide-y divide-line-soft border border-line bg-surface">{history.length === 0 ? <EmptyState title="暂无历史记录" /> : history.map((item) => <div key={item.run_id} className="flex items-center gap-3 p-3"><button className="focus-ring min-w-0 flex-1 text-left" onClick={() => void loadRun(item.run_id)}><div className="flex items-center justify-between gap-3"><span className="font-mono text-[11px] text-ink">{item.timestamp}</span><span className={`font-mono text-[11px] font-semibold ${pctColor(item.total_return_pct)}`}>{item.total_return_pct > 0 ? '+' : ''}{item.total_return_pct.toFixed(2)}%</span></div><div className="mt-1 text-[11px] text-muted">{item.date_range} · {item.total_trades} 笔 · 胜率 {item.win_rate}%</div></button><button className="focus-ring border border-transparent p-1.5 text-muted hover:border-[#6c2a25] hover:bg-[#321918] hover:text-trading-up" onClick={() => void deleteRun(item.run_id)} aria-label="删除回测"><Trash2 className="h-3.5 w-3.5" /></button><ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted" /></div>)}</div>
+        <div className="divide-y divide-line-soft border border-line bg-surface">{history.length === 0 ? <EmptyState title="暂无历史记录" /> : history.map((item) => <div key={item.run_id} className="flex items-center gap-3 p-3"><button className="focus-ring min-w-0 flex-1 text-left" onClick={() => void loadRun(item.run_id)}><div className="flex items-center justify-between gap-3"><span className="font-mono text-[11px] text-ink">{item.timestamp}</span><span className={`font-mono text-[11px] ${pctColor(item.total_return_pct)}`}>{item.total_return_pct > 0 ? '+' : ''}{item.total_return_pct.toFixed(2)}%</span></div><div className="mt-1 text-[11px] text-muted">{item.date_range} · {item.total_trades} 笔 · 胜率 {item.win_rate}%</div></button><button className="focus-ring border border-transparent p-1.5 text-muted hover:border-accent-red-soft hover:bg-accent-red-soft hover:text-trading-up" onClick={() => void deleteRun(item.run_id)} aria-label="删除回测"><Trash2 className="h-3.5 w-3.5" /></button><ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted" /></div>)}</div>
       </Modal>
       </div>
     </>

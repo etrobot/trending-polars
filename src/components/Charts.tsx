@@ -19,7 +19,7 @@ export function EquityCurve({ data }: { data: EquityPoint[] }) {
   const line = points(values, width, height, padding);
   const polyline = line.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
   const positive = values.at(-1)! >= values[0];
-  const stroke = positive ? '#f6465d' : '#0ecb81';
+  const stroke = positive ? '#cd4239' : '#2c8c66';
   const area = `M ${line[0].x} ${height - padding} L ${polyline.replaceAll(',', ' ')} L ${line.at(-1)!.x} ${height - padding} Z`;
   return (
     <svg viewBox={`0 0 ${width} ${height}`} className="w-full overflow-visible" style={{ aspectRatio: '820/250' }} role="img" aria-label="策略净值曲线">
@@ -29,10 +29,10 @@ export function EquityCurve({ data }: { data: EquityPoint[] }) {
             <stop offset="100%" stopColor={stroke} stopOpacity="0" />
           </linearGradient>
         </defs>
-        {[0.25, 0.5, 0.75].map((ratio) => <line key={ratio} x1={padding} x2={width - padding} y1={height * ratio} y2={height * ratio} stroke="#2b3139" strokeDasharray="3 5" />)}
+        {[0.25, 0.5, 0.75].map((ratio) => <line key={ratio} x1={padding} x2={width - padding} y1={height * ratio} y2={height * ratio} stroke="#bfc1b7" strokeDasharray="3 5" />)}
         <path d={area} fill="url(#equity-area)" />
         <polyline points={polyline} fill="none" stroke={stroke} strokeWidth="1.8" strokeLinejoin="round" />
-        <circle cx={line.at(-1)!.x} cy={line.at(-1)!.y} r="4" fill={stroke} stroke="#0b0e11" strokeWidth="2" />
+        <circle cx={line.at(-1)!.x} cy={line.at(-1)!.y} r="4" fill={stroke} stroke="#eeefe9" strokeWidth="2" />
       </svg>
   );
 }
@@ -43,5 +43,5 @@ export function Sparkline({ values, positive = true }: { values: number[]; posit
   const height = 36;
   const line = points(values, width, height, 2);
   const polyline = line.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
-  return <svg viewBox={`0 0 ${width} ${height}`} className="h-9 w-28"><polyline points={polyline} fill="none" stroke={positive ? '#f6465d' : '#0ecb81'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>;
+  return <svg viewBox={`0 0 ${width} ${height}`} className="h-9 w-28"><polyline points={polyline} fill="none" stroke={positive ? '#cd4239' : '#2c8c66'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>;
 }
