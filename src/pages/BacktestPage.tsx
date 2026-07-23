@@ -75,8 +75,9 @@ export function BacktestPage() {
   }, [loadHistory]);
   useTaskResult(runTaskId, onRunDone);
 
-  const onCollectDone = useCallback((_task: TaskSnapshot) => {
+  const onCollectDone = useCallback((task: TaskSnapshot) => {
     setCollectTaskId(null);
+    if (task.status !== 'completed') setError(task.message || '历史行情采集未完成');
   }, []);
   useTaskResult(collectTaskId, onCollectDone);
 

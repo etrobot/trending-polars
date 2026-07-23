@@ -396,9 +396,9 @@ UNIQUE(date, stock_code, factor_name) -- 排行因子
 
 SQLite 中的 `sector_trend_daily` 与 `limit_up_record` 是板块和涨停事实主数据。读取分析结果时，即使 JSON 缓存过期、损坏或与数据库不一致，也以 SQLite 重建的 `blocks` / `sentiment` 为准；JSON 只补充指数分析、统计字段和备注。
 
-缓存中的 `source_date` 保存这些 blocktop 事实所属的 `YYYYMMDD` 交易日；聚合刷新只改变 `timestamp`，不会改变 `source_date`。因此数据库文件需要从 JSON 兼容恢复时，也不会把旧名单错误写到刷新日。
+缓存中的 `source_date` 保存这些 blocktop 事实所属的 `YYYYMMDD` 交易日。刷新任务只有在成功获取该日期的 blocktop、板块 K 线、涨停个股行情和指数行情后才更新 `source_date`，因此不会把旧名单错误写到刷新日。
 
-`GET /api/analysis?refresh=1` 只刷新聚合缓存，不写 `limit_up_record`。只有成功取得同花顺 `block_top.stock_list` 的 `POST /api/analysis/collect` 才能写入涨停事实。
+`GET /api/analysis?refresh=1` 与 `POST /api/analysis/collect` 使用同一套真实采集流水线。只有成功取得同花顺 `block_top.stock_list` 且板块、个股、指数覆盖达到最低要求时才写入 `limit_up_record`；否则后台任务失败并保留旧主数据。
 
 **缓存内容**：
 ```json
@@ -416,6 +416,7 @@ SQLite 中的 `sector_trend_daily` 与 `limit_up_record` 是板块和涨停事�
 
 **更新策略**：
 - 手动触发：`POST /api/ranking/compute`
+- 计算前按需求日期检查逐股行情起止覆盖；不足时自动补采并二次校验
 - 结构化主数据始终写入 `ranking_factor` / `stock_ranking`
 - 数据库为空时可兼容导入旧版 `server/data/ranking.json`
 

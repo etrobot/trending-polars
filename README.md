@@ -50,7 +50,7 @@
 
 > **涨停事实唯一来源**：只有 `block_top.stock_list` 中出现并写入 `limit_up_record` 的 `(date, stock_code)` 才视为涨停。项目不会根据日涨幅、证券板块规则或理论涨停价反推涨停；缺少 `block_top` 记录时状态为未知，不做补判。
 
-`GET /api/analysis?refresh=1` 仅刷新 JSON 中的聚合统计与指数缓存，不会创建或改写涨停事实；只有成功完成 `POST /api/analysis/collect` 后才批量写入对应交易日的 `limit_up_record`。
+`GET /api/analysis?refresh=1` 与 `POST /api/analysis/collect` 都会启动真实采集流水线：获取 `block_top`、板块日/周/月 K 线、涨停个股前复权 K 线和指数 K 线。只有关键数据覆盖校验通过后才写入对应交易日的 `limit_up_record` 并把任务标记为完成；网络被拦截或覆盖不足时任务明确失败并保留旧快照。
 
 **解析**：`parseBlockTop(payload) → BlockTopData[]`，兼容 `code`/`block_code`、`stock_list`/`stocks` 等字段别名。
 
@@ -77,7 +77,7 @@
 | `latest` | number\|null | 最新价 |
 | `is_st` | bool | 是否 ST |
 
-**数据流向**：`fetchBlockTop()` → `collectLimitUpAnalysis()`（app.ts）→ 板块 K 线采集 → 趋势分类 → 批量写入 SQLite 的 `stock_info` / `sector_info` / `limit_up_record` / `sector_trend_daily`，同时刷新 `analysis.json` 缓存
+**数据流向**：`fetchBlockTop()` → `collectLimitUpAnalysis()`（app.ts）→ 板块 K 线与涨停个股 K 线采集 → 指数 K 线采集 → 趋势分类 → 批量写入 SQLite 的 `stock_info` / `sector_info` / `limit_up_record` / `sector_trend_daily` / `stock_daily_price` / `index_daily_price`，同时刷新 `analysis.json` 缓存
 
 ### 2.2 板块 K 线行情 —— `server/historical-market.ts`
 
@@ -396,10 +396,13 @@ Phase 2: 四维评分计算（scoreStock()）
    → 单事务持久化到 stock_daily_price / index_daily_price / historical_snapshot
 
 2. 覆盖检查
-   ├─ 每只股票至少 20 条 K 线
-   └─ 全市场覆盖率 ≥ 20%（至少 2 只）
+   ├─ 快照需求日、实际截至日和请求交易日数匹配
+   ├─ 每只股票覆盖首个信号日前 20 日预热区间及目标交易日
+   └─ 全市场完整覆盖率 ≥ 20%（至少 2 只）
    → 不足则报错
 ```
+
+`assessHistoricalMarketCoverage()` 会检查实际逐股 K 线日期，不再只相信 `historical_snapshot` 元数据。截面排行、回测和模拟交易执行前统一调用该检查；覆盖不足时自动运行 `collectHistoricalMarketData()` 补采，补采后再次校验，仍不足则停止后续计算或交易。
 
 ### 5.2 回测执行
 
@@ -950,8 +953,8 @@ GET /api/health
 
 # ==== 分析数据 ====
 GET /api/analysis                    # 获取指数+板块分析
-GET /api/analysis?refresh=1          # 异步刷新分析（聚合统计）
-POST /api/analysis/collect           # 异步采集涨停板块+趋势分类
+GET /api/analysis?refresh=1          # 异步采集 blocktop+板块/个股/指数并刷新分析
+POST /api/analysis/collect           # 同上，保留主动采集语义
 
 # ==== 板块数据 ====
 GET /api/limit_up?date=20260723      # 板块涨停明细（扁平化）
@@ -964,11 +967,11 @@ GET /api/index_prices?symbol=sh000001&limit=120   # 指数K线
 
 # ==== 排行榜 ====
 GET /api/ranking                     # 查询排行榜（搜索/筛选/排序/分页）
-POST /api/ranking/compute            # 异步重算排行（Polars 排序）
+POST /api/ranking/compute            # 校验/补采需求日期行情后异步重算截面排行
 
 # ==== 回测 ====
 POST /api/backtest/collect?days=20   # 采集历史数据
-POST /api/backtest/run?days=20       # 运行回测
+POST /api/backtest/run?days=20       # 校验/补采所需区间后运行回测
 GET /api/backtest/list               # 回测列表
 GET /api/backtest/:runId             # 回测详情
 DELETE /api/backtest/:runId          # 删除回测

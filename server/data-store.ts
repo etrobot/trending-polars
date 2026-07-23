@@ -64,6 +64,38 @@ function emptyRanking(): { timestamp: string; date: string; total_stocks: number
   };
 }
 
+/**
+ * Promote a limit-up cohort into an unscored ranking universe. The cross-section
+ * engine only needs stock_code/stock_name to collect history; the remaining
+ * fields carry sector context forward and default to a "待计算" placeholder until
+ * the factors are computed.
+ */
+function universeFromLimitUp(records: LimitUpRecord[]): RankingRow[] {
+  const byCode = new Map<string, RankingRow>();
+  for (const record of records) {
+    const code = String(record.stock_code ?? '').trim();
+    if (!/^\d{6}$/.test(code) || byCode.has(code)) continue;
+    byCode.set(code, {
+      rank: byCode.size + 1,
+      stock_code: code,
+      stock_name: record.stock_name || code,
+      total_score: 0,
+      trend_score: 0,
+      alignment: '',
+      strategy_action: 'ignore',
+      strategy_label: '待计算',
+      strategy_position: '—',
+      sector_code: record.sector_code || undefined,
+      sector_name: record.sector_name || undefined,
+      continue_num: record.continue_num,
+      reason_type: record.reason_type || undefined,
+      latest_price: record.latest,
+      latest_change_rate: record.change_rate,
+    });
+  }
+  return [...byCode.values()];
+}
+
 async function writeJson(filePath: string, value: unknown, pretty = true): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = `${filePath}.${process.pid}-${randomUUID()}.tmp`;
@@ -177,6 +209,23 @@ export class DataStore {
     const normalized = this.sqlite.saveRanking(seed);
     await writeJson(path.join(this.runtime, 'ranking.json'), normalized);
     return normalized;
+  }
+
+  /**
+   * The stock pool for cross-section scoring. Returns the computed ranking when
+   * one exists, otherwise derives an unscored universe from the latest limit-up
+   * cohort so ranking/backtest/paper-trading can bootstrap on a database that
+   * only holds analysis facts. getRanking() stays scored-only so the board view
+   * and clearRankingData() semantics are unchanged.
+   */
+  async getRankingUniverse(): Promise<{ timestamp: string; date: string; total_stocks: number; rankings: RankingRow[] }> {
+    const ranking = await this.getRanking();
+    if (ranking.rankings.length) return ranking;
+    const date = this.sqlite.getLatestAnalysisDate();
+    if (!date) return ranking;
+    const rankings = universeFromLimitUp(this.sqlite.getLimitUpByDate(date));
+    if (!rankings.length) return ranking;
+    return { timestamp: formatDateTime(), date, total_stocks: rankings.length, rankings };
   }
 
   async saveRanking(data: Pick<RankingResponse, 'timestamp' | 'date' | 'total_stocks' | 'rankings'>): Promise<void> {

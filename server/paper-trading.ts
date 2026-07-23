@@ -402,12 +402,11 @@ export class PaperTradingService extends EventEmitter {
     return this.composeOverview(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange, limitUpRecords }, connection);
   }
 
-  async execute(confirmation: string, context?: PaperMarketContext, traceId?: string) {
-    return this.runWindowConfirmed(confirmation, 'open', context, traceId);
+  async execute(context?: PaperMarketContext, traceId?: string) {
+    return this.runWindow('open', context, traceId, { trigger: 'immediate' });
   }
 
-  async runWindowConfirmed(confirmation: string, window: TradingWindow, context?: PaperMarketContext, traceId?: string) {
-    if (confirmation !== 'SIMULATED') throw new Error('请输入 SIMULATED 确认只执行同花顺模拟交易');
+  async runWindowConfirmed(window: TradingWindow, context?: PaperMarketContext, traceId?: string) {
     return this.runWindow(window, context, traceId, { trigger: window === 'open' ? 'immediate' : 'manual' });
   }
 

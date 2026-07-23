@@ -92,12 +92,23 @@ export class TaskRegistry extends EventEmitter {
         return;
       }
       task.result = result;
-      this.update(task, 'completed', 100, '完成');
+      const completedMessage = result && typeof result === 'object' && 'message' in result
+        ? String((result as { message?: unknown }).message || '完成')
+        : '完成';
+      this.update(task, 'completed', 100, completedMessage);
       await this.audit.info('task', 'task_completed', {
         traceId: task.trace_id ?? task.id,
         data: { task_type: task.type, result },
       });
     } catch (error) {
+      if (task.cancelRequested) {
+        this.update(task, 'cancelled', task.progress, '任务已停止');
+        await this.audit.warn('task', 'task_cancelled', {
+          traceId: task.trace_id ?? task.id,
+          data: { task_type: task.type, progress: task.progress },
+        });
+        return;
+      }
       task.error = error instanceof Error ? error.message : String(error);
       this.update(task, 'failed', task.progress, task.error);
       await this.audit.error('task', 'task_failed', {

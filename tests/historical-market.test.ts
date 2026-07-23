@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  assessHistoricalMarketCoverage,
   BLOCK_KLINE_URL,
   fetchAdjustedKlines,
   fetchBlockKlines,
@@ -8,12 +9,41 @@ import {
   parseSinaKlines,
   parseTencentKlines,
 } from '../server/historical-market.js';
+import type { RankingRow } from '../src/types.js';
+import { historicalFixture } from './historical-fixture.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe('market kline sources', () => {
+  it('verifies actual per-stock date coverage instead of snapshot metadata alone', () => {
+    const history = historicalFixture('20260722');
+    const rankings = history.stocks.map((stock, index) => ({
+      rank: index + 1,
+      stock_code: stock.stock_code,
+      stock_name: stock.stock_name,
+      total_score: 50,
+      trend_score: 20,
+      alignment: 'tangled',
+      strategy_action: 'trade',
+      strategy_label: '测试',
+      strategy_position: '1成',
+    })) as RankingRow[];
+
+    expect(assessHistoricalMarketCoverage(history, rankings, { days: 60, asOfDate: '20260722' }))
+      .toMatchObject({ usable: true, covered_stocks: 4, minimum_covered_stocks: 2 });
+
+    const missingTargetRows = structuredClone(history);
+    missingTargetRows.stocks = missingTargetRows.stocks.map((stock, index) => (
+      index === 0 ? stock : { ...stock, bars: stock.bars.slice(0, -1) }
+    ));
+    const report = assessHistoricalMarketCoverage(missingTargetRows, rankings, { days: 60, asOfDate: '20260722' });
+    expect(report.usable).toBe(false);
+    expect(report.covered_stocks).toBe(1);
+    expect(report.reasons.join('；')).toContain('个股行情覆盖不足');
+  });
+
   it('parses Tencent qfq volume as shares without pretending it is turnover', () => {
     expect(parseTencentKlines([
       ['2026-07-22', '10.00', '10.20', '10.30', '9.90', '1234'],

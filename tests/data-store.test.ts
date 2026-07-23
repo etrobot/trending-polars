@@ -107,6 +107,36 @@ describe('node:sqlite data store', () => {
     await expect(store.getRanking()).resolves.toMatchObject({ total_stocks: 0, rankings: [] });
   });
 
+  it('derives the ranking universe from the latest limit-up cohort when no ranking is computed', async () => {
+    // No analysis at all: universe is empty, mirroring getRanking().
+    await expect(store.getRankingUniverse()).resolves.toMatchObject({ total_stocks: 0, rankings: [] });
+
+    // Analysis-only database (limit-up facts, no computed ranking): getRanking()
+    // stays empty, but the universe bootstraps from the limit-up cohort so
+    // ranking/backtest/paper-trading can run.
+    await store.saveAnalysis(blockTopAnalysis(), '20260723');
+    await expect(store.getRanking()).resolves.toMatchObject({ total_stocks: 0, rankings: [] });
+    const universe = await store.getRankingUniverse();
+    expect(universe.date).toBe('20260723');
+    expect(universe.total_stocks).toBe(1);
+    expect(universe.rankings).toEqual([
+      expect.objectContaining({ stock_code: '600000', stock_name: '浦发银行', sector_code: '881145', total_score: 0 }),
+    ]);
+
+    // Once a real ranking exists it takes precedence over the derived universe.
+    await store.saveRanking({
+      timestamp: '2026-07-23 15:05:00',
+      date: '20260723',
+      total_stocks: 1,
+      rankings: [rankingRow('600000', '浦发银行', 72)],
+    });
+    const scored = await store.getRankingUniverse();
+    expect(scored.rankings).toHaveLength(1);
+    expect(scored.rankings[0].stock_code).toBe('600000');
+    expect(scored.rankings[0].total_score).toBeGreaterThan(0);
+    expect(scored.rankings[0].strategy_label).not.toBe('待计算');
+  });
+
   it('initializes the documented schema with WAL and foreign keys', () => {
     const status = store.getStorageStatus();
     expect(status.database_path).toBe(path.join(root, 'trending.db'));

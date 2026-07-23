@@ -12,7 +12,7 @@ import {
 } from 'lucide-react';
 import { StrategyPill } from '../components/Pills';
 import { PageHeaderActions } from '../components/HeaderActions';
-import { Button, EmptyState, LoadingPanel, MetricCard, Pagination, SectionHeading } from '../components/Ui';
+import { Button, EmptyState, LoadingPanel, MetricCard, Pagination } from '../components/Ui';
 import { useTaskResult, useTasks } from '../context/TasksContext';
 import { api, pctColor } from '../lib/api';
 import type { RankingResponse, RankingRow, TaskSnapshot } from '../types';
@@ -79,8 +79,13 @@ export function RankingPage() {
   }, [action, debouncedSearch, order, page, sector, sort]);
   useEffect(() => { void load(); }, [load]);
 
-  const onTaskDone = useCallback((_task: TaskSnapshot) => {
+  const onTaskDone = useCallback((task: TaskSnapshot) => {
     setTaskId(null);
+    if (task.status !== 'completed') {
+      setComputing(false);
+      setError(task.message || '截面排行计算未完成');
+      return;
+    }
     void load();
   }, [load]);
   useTaskResult(taskId, onTaskDone);
@@ -134,7 +139,6 @@ export function RankingPage() {
       )}
 
       <section>
-        <SectionHeading title="因子明细" description={data ? `${data.total.toLocaleString('zh-CN')} / ${data.total_stocks.toLocaleString('zh-CN')} · ${data.timestamp}` : '载入中'} />
         <div className="panel overflow-hidden">
           <div className="grid gap-2 border-b border-line bg-surface-elevated p-2.5 sm:grid-cols-2 lg:grid-cols-[minmax(220px,1fr)_160px_200px_auto]">
             <label className="relative"><Search className="pointer-events-none absolute left-2.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted" /><input className="terminal-field focus-ring w-full pl-8" placeholder="股票名称、代码或板块" value={search} onChange={(event) => setSearch(event.target.value)} /></label>

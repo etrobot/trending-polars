@@ -67,6 +67,23 @@ export function queryRankings(
     pageSize?: number;
   },
 ): RankingResponse {
+  const pageSize = Math.min(200, Math.max(5, Number(options.pageSize ?? 50)));
+  // An uncomputed board has no rows, so pl.DataFrame([]) yields a schema-less
+  // frame whose sort('total_score', …) throws `"total_score" not found`. Return
+  // an empty response before touching Polars.
+  if (!source.rankings.length) {
+    return {
+      timestamp: source.timestamp,
+      date: source.date,
+      total_stocks: source.total_stocks,
+      total: 0,
+      page: 1,
+      page_size: pageSize,
+      rankings: [],
+      summary: { average_score: 0, median_score: 0, top_score: 0, actions: {} },
+      sectors: [],
+    };
+  }
   let frame = rankingFrame(source.rankings);
   const search = options.search?.trim();
   if (search) {
@@ -103,7 +120,6 @@ export function queryRankings(
   const sort = SORTABLE_FIELDS.has(options.sort ?? '') ? options.sort! : 'total_score';
   const descending = (options.order ?? 'desc') !== 'asc';
   frame = frame.sort(sort, descending, true);
-  const pageSize = Math.min(200, Math.max(5, Number(options.pageSize ?? 50)));
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const page = Math.min(pageCount, Math.max(1, Number(options.page ?? 1)));
   const rankings = frame.slice((page - 1) * pageSize, pageSize).toRecords() as unknown as RankingRow[];

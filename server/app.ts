@@ -3,12 +3,13 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import type { AnalysisData, BlockAnalysis, LimitUpStock } from '../src/types.js';
+import type { AnalysisData, BlockAnalysis, IndexAnalysis, LimitUpStock, RankingRow } from '../src/types.js';
 import { AuditLogger, guardDetachedPromise, type AuditLevel } from './audit-log.js';
-import { historicalStrategyCandidates, runPolarsBacktest } from './backtest-engine.js';
+import { historicalCrossSectionRankings, runPolarsBacktest } from './backtest-engine.js';
 import { DataStore } from './data-store.js';
-import { compactDate, formatDateTime, round, sleep } from './format.js';
+import { compactDate, formatDateTime, round } from './format.js';
 import {
+  assessHistoricalMarketCoverage,
   collectHistoricalMarketData,
   fetchAdjustedKlines,
   fetchBlockKlines,
@@ -19,8 +20,8 @@ import {
   type KLineData,
 } from './historical-market.js';
 import { PAPER_ENGINE_VERSION, PaperTradingService } from './paper-trading.js';
-import { queryRankings, recomputeRanking, refreshAnalysis } from './polars-engine.js';
-import { analyzeBlockTrend, blockStrategy, klinesToBars } from './scoring-engine.js';
+import { queryRankings, refreshAnalysis } from './polars-engine.js';
+import { analyzeBlockTrend, blockStrategy, classifyMarketState, klinesToBars } from './scoring-engine.js';
 import { TaskRegistry } from './tasks.js';
 import { ThsSimulatedBroker, ThsSimulatedBrokerError } from './ths-simulated-broker.js';
 
@@ -34,6 +35,32 @@ const asyncHandler = (handler: AsyncHandler) => (request: Request, response: Res
 function numberParam(value: unknown, fallback: number, min: number, max: number): number {
   const number = Number(value);
   return Number.isFinite(number) ? Math.min(max, Math.max(min, Math.trunc(number))) : fallback;
+}
+
+function marketDateParam(value: unknown, fallback = compactDate().slice(0, 8)): string {
+  const normalized = String(value ?? '').replace(/\D/g, '').slice(0, 8);
+  return /^\d{8}$/.test(normalized) ? normalized : fallback;
+}
+
+function stockSymbol(code: string): string {
+  return `${/^(6|68|5|9)/.test(code) ? 'sh' : 'sz'}${code}`;
+}
+
+async function runConcurrent<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  let cursor = 0;
+  const run = async () => {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      await worker(items[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(items.length, Math.max(1, concurrency)) }, () => run()));
 }
 
 function analysisWithStats(data: AnalysisData): AnalysisData {
@@ -90,12 +117,13 @@ async function collectLimitUpAnalysis(
   base: AnalysisData,
   date: string,
   options: { progress?: (pct: number, message: string) => void; cancelled?: () => boolean; concurrency?: number } = {},
-): Promise<{ analysis: AnalysisData; blocks: number; source: 'ths-limit-up' | 'none' }> {
+): Promise<{ analysis: AnalysisData; blocks: number; blocks_with_klines: number; source: 'ths-limit-up' | 'none' }> {
   const { blocks: tops, source } = await fetchBlockTop(date);
-  if (!tops.length) return { analysis: base, blocks: 0, source };
+  if (!tops.length) return { analysis: base, blocks: 0, blocks_with_klines: 0, source };
   const results: BlockAnalysis[] = [];
   let cursor = 0;
   let done = 0;
+  let blocksWithKlines = 0;
   const concurrency = Math.min(6, Math.max(1, options.concurrency ?? 4));
   const worker = async () => {
     while (true) {
@@ -109,7 +137,12 @@ async function collectLimitUpAnalysis(
         fetchBlockKlines(block.code, '11', 120),
         fetchBlockKlines(block.code, '21', 120),
       ]);
-      results.push(buildBlockAnalysis(block, daily.klines, weekly.klines, monthly.klines));
+      const throughDate = (kline: KLineData) => marketDateParam(kline.date, '') <= date;
+      const dailyKlines = daily.klines.filter(throughDate);
+      const weeklyKlines = weekly.klines.filter(throughDate);
+      const monthlyKlines = monthly.klines.filter(throughDate);
+      if (dailyKlines.length >= 20) blocksWithKlines += 1;
+      results.push(buildBlockAnalysis(block, dailyKlines, weeklyKlines, monthlyKlines));
       done += 1;
       options.progress?.(done / tops.length * 100, `板块趋势分类 ${done}/${tops.length}`);
     }
@@ -117,7 +150,53 @@ async function collectLimitUpAnalysis(
   await Promise.all(Array.from({ length: Math.min(concurrency, tops.length) }, () => worker()));
   results.sort((left, right) => right.block_info.limit_up_num - left.block_info.limit_up_num);
   const analysis: AnalysisData = { ...base, timestamp: formatDateTime(), blocks: results };
-  return { analysis: refreshAnalysis(analysis), blocks: results.length, source };
+  return { analysis: refreshAnalysis(analysis), blocks: results.length, blocks_with_klines: blocksWithKlines, source };
+}
+
+async function refreshBlockStockQuotes(
+  analysis: AnalysisData,
+  date: string,
+  store: DataStore,
+  options: { progress?: (completed: number, total: number, message: string) => void; cancelled?: () => boolean } = {},
+): Promise<{ analysis: AnalysisData; requested: number; loaded: number; rows: number }> {
+  const stocks = [...new Map(
+    analysis.blocks.flatMap((block) => block.stock_list ?? [])
+      .filter((stock) => /^\d{6}$/.test(stock.code))
+      .map((stock) => [stock.code, { code: stock.code, name: stock.name || stock.code }]),
+  ).values()];
+  const quotes = new Map<string, { latest: number; change_rate: number }>();
+  let loaded = 0;
+  let rows = 0;
+  let completed = 0;
+  await runConcurrent(stocks, 12, async (stock) => {
+    if (options.cancelled?.()) return;
+    const marketData = await fetchAdjustedKlines(stockSymbol(stock.code), 120);
+    const eligible = marketData.klines.filter((kline) => marketDateParam(kline.date, '') <= date);
+    const latest = eligible.at(-1);
+    if (latest) {
+      rows += await store.upsertStockPrices(stock.code, stock.name, marketData.klines);
+      quotes.set(stock.code, { latest: latest.close, change_rate: latest.changeRate ?? 0 });
+      loaded += 1;
+    }
+    completed += 1;
+    options.progress?.(completed, stocks.length, `采集涨停个股行情 ${completed}/${stocks.length}`);
+  });
+  const enrich = (stock: LimitUpStock): LimitUpStock => {
+    const quote = quotes.get(stock.code);
+    return quote ? { ...stock, latest: quote.latest, change_rate: quote.change_rate } : stock;
+  };
+  return {
+    analysis: {
+      ...analysis,
+      blocks: analysis.blocks.map((block) => {
+        const stockList = block.stock_list.map(enrich);
+        return { ...block, stock_list: stockList, block_info: { ...block.block_info, stock_list: stockList } };
+      }),
+    },
+    requested: stocks.length,
+    loaded,
+    rows,
+  };
 }
 
 function priceRows(klines: KLineData[]) {
@@ -177,6 +256,46 @@ function indexName(symbol: string): string {
   return INDEX_NAMES[symbol] ?? symbol;
 }
 
+async function refreshIndexAnalysis(
+  date: string,
+  store: DataStore,
+  options: { progress?: (completed: number, total: number, message: string) => void; cancelled?: () => boolean } = {},
+): Promise<{ indices: IndexAnalysis[]; requested: number; rows: number }> {
+  const symbols = Object.keys(INDEX_NAMES);
+  const indices: IndexAnalysis[] = [];
+  let completed = 0;
+  let rows = 0;
+  await runConcurrent(symbols, 6, async (symbol) => {
+    if (options.cancelled?.()) return;
+    const marketData = await fetchAdjustedKlines(symbol, 250);
+    const eligible = marketData.klines.filter((kline) => marketDateParam(kline.date, '') <= date);
+    const latest = eligible.at(-1);
+    if (latest) {
+      rows += await store.upsertIndexPrices(symbol, indexName(symbol), marketData.klines);
+      const state = classifyMarketState(klinesToBars(eligible));
+      indices.push({
+        name: indexName(symbol),
+        code: symbol,
+        state,
+        price: latest.close,
+        date: latest.date,
+        indicators: {
+          source: marketData.source,
+          ma5: state.ma5,
+          ma20: state.ma20,
+          near_high: state.near_high,
+          volume_trend: state.volume_trend,
+        },
+        signal: state.signal,
+      });
+    }
+    completed += 1;
+    options.progress?.(completed, symbols.length, `采集指数行情 ${completed}/${symbols.length}`);
+  });
+  indices.sort((left, right) => symbols.indexOf(left.code) - symbols.indexOf(right.code));
+  return { indices, requested: symbols.length, rows };
+}
+
 export interface AppServices {
   store: DataStore;
   tasks: TaskRegistry;
@@ -188,60 +307,207 @@ export function createApp(services: Partial<AppServices> = {}) {
   const store = services.store ?? new DataStore();
   const audit = services.audit ?? new AuditLogger(path.join(store.runtime, 'logs'));
   const tasks = services.tasks ?? new TaskRegistry(audit);
+  let historicalPreparationInFlight: Promise<HistoricalMarketData> | null = null;
+
+  const ensureHistoricalCoverage = async (options: {
+    rankings: RankingRow[];
+    days: number;
+    asOfDate: string;
+    traceId: string;
+    force?: boolean;
+    cancelled?: () => boolean;
+    progress?: (value: number, message: string) => void;
+  }): Promise<{ history: HistoricalMarketData; collected: boolean }> => {
+    const requestedDate = marketDateParam(options.asOfDate);
+    let history = await store.getHistoricalMarket();
+    let coverage = assessHistoricalMarketCoverage(history, options.rankings, { days: options.days, asOfDate: requestedDate });
+    await audit.info('market_data', 'coverage_checked', {
+      traceId: options.traceId,
+      data: coverage,
+    });
+    if (!options.force && coverage.usable && history) {
+      options.progress?.(20, `行情覆盖已满足：${coverage.covered_stocks}/${coverage.universe_size} 只`);
+      await audit.info('market_data', 'snapshot_cache_hit', {
+        traceId: options.traceId,
+        data: { ...coverage, generated_at: history.generated_at },
+      });
+      return { history, collected: false };
+    }
+
+    if (historicalPreparationInFlight) {
+      options.progress?.(8, '等待正在进行的个股行情采集');
+      await historicalPreparationInFlight;
+      history = await store.getHistoricalMarket();
+      coverage = assessHistoricalMarketCoverage(history, options.rankings, { days: options.days, asOfDate: requestedDate });
+      if (!options.force && coverage.usable && history) return { history, collected: false };
+    }
+
+    options.progress?.(3, `覆盖不足，开始获取 ${requestedDate} 前 ${options.days} 日个股行情`);
+    const collection = (async () => {
+      const result = await collectHistoricalMarketData(options.rankings, {
+        days: options.days,
+        asOfDate: requestedDate,
+        cancelled: options.cancelled,
+        audit,
+        traceId: options.traceId,
+        progress: (completed, total, message) => options.progress?.(8 + completed / total * 82, message),
+      });
+      if (!result) throw new Error('个股行情采集未完成');
+      await store.saveHistoricalMarket(result);
+      const persisted = await store.getHistoricalMarket() ?? result;
+      await audit.info('market_data', 'snapshot_saved', {
+        traceId: options.traceId,
+        data: {
+          database: store.databasePath,
+          tables: ['stock_daily_price', 'index_daily_price', 'historical_snapshot'],
+          as_of_date: persisted.as_of_date,
+          stocks: persisted.stocks.length,
+          failed_stocks: persisted.failed_stocks,
+        },
+      });
+      return persisted;
+    })();
+    historicalPreparationInFlight = collection;
+    try {
+      history = await collection;
+    } finally {
+      if (historicalPreparationInFlight === collection) historicalPreparationInFlight = null;
+    }
+
+    coverage = assessHistoricalMarketCoverage(history, options.rankings, { days: options.days, asOfDate: requestedDate });
+    await audit.info('market_data', 'coverage_verified', {
+      traceId: options.traceId,
+      data: coverage,
+    });
+    if (!coverage.usable) throw new Error(`个股行情仍不能覆盖需求日期段：${coverage.reasons.join('；')}`);
+    options.progress?.(94, `行情覆盖校验通过：${coverage.covered_stocks}/${coverage.universe_size} 只`);
+    return { history, collected: true };
+  };
+
+  const refreshMarketAnalysis = async (options: {
+    date: string;
+    traceId: string;
+    cancelled?: () => boolean;
+    progress?: (value: number, message: string) => void;
+  }) => {
+    const date = marketDateParam(options.date);
+    const base = await store.getAnalysis();
+    options.progress?.(4, `获取 ${date} 同花顺 blocktop`);
+    const collected = await collectLimitUpAnalysis(base, date, {
+      cancelled: options.cancelled,
+      progress: (pct, message) => options.progress?.(8 + pct * 0.38, message),
+    });
+    if (!collected.blocks) {
+      await audit.warn('market_analysis', 'limit_up_collection_empty', {
+        traceId: options.traceId,
+        data: { date, source: collected.source },
+      });
+      throw new Error('同花顺 blocktop 数据不可用，已保留现有分析快照');
+    }
+    const minimumBlockCoverage = Math.min(collected.blocks, Math.max(1, Math.floor(collected.blocks * 0.2)));
+    if (collected.blocks_with_klines < minimumBlockCoverage) {
+      throw new Error(`板块 K 线覆盖不足：${collected.blocks_with_klines}/${collected.blocks}`);
+    }
+    if (options.cancelled?.()) throw new Error('分析刷新已停止');
+
+    const quoted = await refreshBlockStockQuotes(collected.analysis, date, store, {
+      cancelled: options.cancelled,
+      progress: (completed, total, message) => options.progress?.(48 + completed / Math.max(1, total) * 24, message),
+    });
+    const minimumStockCoverage = quoted.requested
+      ? Math.min(quoted.requested, Math.max(1, Math.floor(quoted.requested * 0.2)))
+      : 0;
+    if (!quoted.requested || quoted.loaded < minimumStockCoverage) {
+      throw new Error(`涨停个股行情覆盖不足：${quoted.loaded}/${quoted.requested}`);
+    }
+    if (options.cancelled?.()) throw new Error('分析刷新已停止');
+
+    const indexResult = await refreshIndexAnalysis(date, store, {
+      cancelled: options.cancelled,
+      progress: (completed, total, message) => options.progress?.(74 + completed / Math.max(1, total) * 18, message),
+    });
+    const minimumIndexCoverage = Math.min(3, indexResult.requested);
+    if (indexResult.indices.length < minimumIndexCoverage) {
+      throw new Error(`指数行情覆盖不足：${indexResult.indices.length}/${indexResult.requested}`);
+    }
+    const analysis = refreshAnalysis({
+      ...quoted.analysis,
+      source_date: date,
+      indices: indexResult.indices,
+      timestamp: formatDateTime(),
+    });
+    options.progress?.(94, '写入指数、板块与个股行情');
+    await store.saveAnalysis(analysis, date);
+    await audit.info('market_analysis', 'analysis_collected', {
+      traceId: options.traceId,
+      data: {
+        date,
+        blocktop_source: collected.source,
+        blocks: collected.blocks,
+        blocks_with_klines: collected.blocks_with_klines,
+        stock_quotes: { requested: quoted.requested, loaded: quoted.loaded, rows: quoted.rows },
+        indices: { requested: indexResult.requested, loaded: indexResult.indices.length, rows: indexResult.rows },
+      },
+    });
+    return {
+      analysis,
+      date,
+      blocks: collected.blocks,
+      blocktop_source: collected.source,
+      stock_quotes: quoted.loaded,
+      indices: indexResult.indices.length,
+      message: `已获取 blocktop ${collected.blocks} 个板块、${quoted.loaded} 只个股、${indexResult.indices.length} 个指数`,
+    };
+  };
+
   const loadPaperContext = async (refreshForClose = false, traceId: string = randomUUID()) => {
-    const [analysis, ranking, storedHistory] = await Promise.all([
+    const [initialAnalysis, ranking] = await Promise.all([
       store.getAnalysis(),
-      store.getRanking(),
-      store.getHistoricalMarket(),
+      store.getRankingUniverse(),
     ]);
-    let history = storedHistory;
-    let strategyRankings = ranking.rankings;
-    let strategyDate = ranking.date;
-    let marketAverageChange = averageRankingChange(ranking.rankings);
+    let analysis = initialAnalysis;
     if (refreshForClose) {
       const now = formatDateTime();
       const hourMinute = Number(now.slice(11, 13)) * 60 + Number(now.slice(14, 16));
       if (hourMinute < 15 * 60) throw new Error('收盘决策只能在交易日 15:00 后运行');
-      const today = compactDate().slice(0, 8);
-      if (!history || history.as_of_date !== today) {
-        history = await collectHistoricalMarketData(ranking.rankings, {
-          days: 20,
-          asOfDate: today,
-          audit,
-          traceId,
-        });
-        if (!history) throw new Error('收盘历史行情准备失败');
-        await store.saveHistoricalMarket(history);
-        history = await store.getHistoricalMarket() ?? history;
-        await audit.info('market_data', 'snapshot_saved', {
-          traceId,
-          data: {
-            database: store.databasePath,
-            tables: ['stock_daily_price', 'index_daily_price', 'historical_snapshot'],
-            as_of_date: history.as_of_date,
-            stocks: history.stocks.length,
-            failed_stocks: history.failed_stocks,
-          },
-        });
-      } else {
-        await audit.info('market_data', 'snapshot_cache_hit', {
-          traceId,
-          data: { as_of_date: history.as_of_date, stocks: history.stocks.length, generated_at: history.generated_at },
-        });
-      }
-      strategyDate = history.as_of_date;
-      strategyRankings = historicalStrategyCandidates(history, strategyDate);
-      marketAverageChange = averageHistoricalChange(history, strategyDate);
-      await audit.info('factor_ranking', 'historical_ranking_completed', {
-        traceId,
-        data: {
-          ranking_date: strategyDate,
-          candidates: strategyRankings,
-          source_stocks: history.stocks.length,
-          engine: 'shared-backtest-score',
-        },
+      const refreshed = await refreshMarketAnalysis({ date: compactDate().slice(0, 8), traceId });
+      analysis = refreshed.analysis;
+    }
+    const targetDate = refreshForClose ? compactDate().slice(0, 8) : marketDateParam(ranking.date);
+    const prepared = await ensureHistoricalCoverage({
+      rankings: ranking.rankings,
+      days: 20,
+      asOfDate: targetDate,
+      traceId,
+      force: refreshForClose,
+    });
+    const history = prepared.history;
+    const strategyDate = history.as_of_date;
+    const strategyRankings = historicalCrossSectionRankings(history, strategyDate, ranking.rankings);
+    if (!strategyRankings.length) throw new Error(`行情已准备，但 ${strategyDate} 无法生成截面排行`);
+    if (refreshForClose || ranking.date !== strategyDate) {
+      await store.saveRanking({
+        timestamp: formatDateTime(),
+        date: strategyDate,
+        total_stocks: strategyRankings.length,
+        rankings: strategyRankings,
       });
     }
+    const sectorCoverage = await store.getSectorTrendsForDate(strategyDate);
+    if (!sectorCoverage.length) {
+      const refreshed = await refreshMarketAnalysis({ date: strategyDate, traceId });
+      analysis = refreshed.analysis;
+    }
+    const marketAverageChange = averageHistoricalChange(history, strategyDate) ?? averageRankingChange(strategyRankings);
+    await audit.info('factor_ranking', 'historical_ranking_completed', {
+      traceId,
+      data: {
+        ranking_date: strategyDate,
+        rows: strategyRankings.length,
+        source_stocks: history.stocks.length,
+        engine: 'shared-backtest-score',
+      },
+    });
     const limitUpDates = [...new Set([strategyDate.replaceAll('-', '').slice(0, 8), compactDate().slice(0, 8)])];
     const limitUpRecords = (await Promise.all(limitUpDates.map((item) => store.getLimitUpByDate(item))))
       .flatMap((records) => records.map((record) => ({ date: record.date, stock_code: record.stock_code })));
@@ -298,24 +564,10 @@ export function createApp(services: Partial<AppServices> = {}) {
 
   app.get('/api/analysis', asyncHandler(async (request, response) => {
     if (String(request.query.refresh ?? '0') === '1') {
-      const task = tasks.start('analysis_fetch', '刷新指数与板块分析', async ({ progress, cancelled, traceId }) => {
-        progress(12, '读取行情快照');
-        await sleep(120);
-        if (cancelled()) return null;
-        const current = await store.getAnalysis();
-        progress(48, 'Polars 聚合板块热度');
-        await sleep(160);
-        if (cancelled()) return null;
-        const refreshed = refreshAnalysis(current);
-        await audit.info('market_analysis', 'analysis_refreshed', {
-          traceId,
-          data: { source_timestamp: current.timestamp, result: refreshed },
-        });
-        progress(82, '重算市场宽度指标');
-        await store.saveAnalysisCache(refreshed);
-        await sleep(100);
-        return refreshed;
-      });
+      const date = marketDateParam(request.query.date);
+      const task = tasks.start('analysis_fetch', '刷新指数、板块与个股行情', ({ progress, cancelled, traceId }) => (
+        refreshMarketAnalysis({ date, progress, cancelled, traceId })
+      ));
       response.status(202).json({ task_id: task.id, status: 'started', message: '分析任务已启动' });
       return;
     }
@@ -323,44 +575,10 @@ export function createApp(services: Partial<AppServices> = {}) {
   }));
 
   app.post('/api/analysis/collect', asyncHandler(async (request, response) => {
-    const requestedDate = String(request.query.date ?? '').trim();
-    const date = /^\d{8}$/.test(requestedDate.replaceAll('-', '')) ? requestedDate.replaceAll('-', '') : compactDate().slice(0, 8);
-    const task = tasks.start('analysis_collect', '采集涨停板块并分类趋势', async ({ progress, cancelled, traceId }) => {
-      progress(6, '拉取同花顺涨停板块排行');
-      const base = await store.getAnalysis();
-      if (cancelled()) return null;
-      const collected = await collectLimitUpAnalysis(base, date, {
-        cancelled,
-        progress: (pct, message) => progress(10 + pct * 0.8, message),
-      });
-      if (cancelled()) return null;
-      if (!collected.blocks) {
-        await audit.warn('market_analysis', 'limit_up_collection_empty', {
-          traceId,
-          data: { date, source: collected.source },
-        });
-        throw new Error('同花顺涨停板块数据不可用（可能被反爬拦截），已保留现有分析快照');
-      }
-      progress(92, '重算市场情绪与宽度');
-      await store.saveAnalysis(collected.analysis, date);
-      await audit.info('market_analysis', 'limit_up_collected', {
-        traceId,
-        data: {
-          date,
-          blocks: collected.blocks,
-          source: collected.source,
-          total_limit_up: collected.analysis.sentiment.total_limit_up,
-          sentiment: collected.analysis.sentiment.sentiment,
-        },
-      });
-      return {
-        date,
-        blocks: collected.blocks,
-        source: collected.source,
-        sentiment: collected.analysis.sentiment.sentiment,
-        total_limit_up: collected.analysis.sentiment.total_limit_up,
-      };
-    });
+    const date = marketDateParam(request.query.date);
+    const task = tasks.start('analysis_collect', '采集指数、板块与个股行情', ({ progress, cancelled, traceId }) => (
+      refreshMarketAnalysis({ date, progress, cancelled, traceId })
+    ));
     response.status(202).json({ task_id: task.id, status: 'started', message: '涨停采集任务已启动' });
   }));
 
@@ -469,21 +687,35 @@ export function createApp(services: Partial<AppServices> = {}) {
     }));
   }));
 
-  app.post('/api/ranking/compute', asyncHandler(async (_request, response) => {
+  app.post('/api/ranking/compute', asyncHandler(async (request, response) => {
+    const requestedDate = marketDateParam(request.query.date);
+    const days = numberParam(request.query.days, 20, 5, 60);
     const task = tasks.start('ranking_compute', '计算多因子排行榜', async ({ progress, cancelled, traceId }) => {
-      progress(10, '载入 1,800+ 股票因子');
-      await sleep(120);
-      if (cancelled()) return null;
-      const source = await store.getRanking();
+      const source = await store.getRankingUniverse();
+      if (!source.rankings.length) throw new Error('当前股票池为空，无法获取个股行情并计算排行');
       await audit.info('factor_ranking', 'ranking_started', {
         traceId,
-        data: { source_date: source.date, source_timestamp: source.timestamp, rows: source.rankings.length },
+        data: { requested_date: requestedDate, source_date: source.date, source_timestamp: source.timestamp, rows: source.rankings.length },
       });
-      progress(42, 'Polars 重算趋势、价量与位置得分');
-      const computed = recomputeRanking(source);
-      await sleep(220);
+      const prepared = await ensureHistoricalCoverage({
+        rankings: source.rankings,
+        days,
+        asOfDate: requestedDate,
+        traceId,
+        cancelled,
+        progress: (value, message) => progress(value * 0.72, message),
+      });
       if (cancelled()) return null;
-      progress(78, '生成策略分层与全市场排名');
+      progress(76, `按 ${prepared.history.as_of_date} 行情计算截面因子`);
+      const rankings = historicalCrossSectionRankings(prepared.history, prepared.history.as_of_date, source.rankings);
+      if (!rankings.length) throw new Error(`${prepared.history.as_of_date} 行情不足，无法生成截面排行`);
+      const computed = {
+        timestamp: formatDateTime(),
+        date: prepared.history.as_of_date,
+        total_stocks: rankings.length,
+        rankings,
+      };
+      progress(90, '保存策略分层与全市场排名');
       await store.saveRanking(computed);
       await audit.info('factor_ranking', 'ranking_completed', {
         traceId,
@@ -495,8 +727,12 @@ export function createApp(services: Partial<AppServices> = {}) {
           tables: ['ranking_factor', 'stock_ranking'],
         },
       });
-      await sleep(120);
-      return { date: computed.date, total_stocks: computed.total_stocks };
+      return {
+        date: computed.date,
+        total_stocks: computed.total_stocks,
+        collected: prepared.collected,
+        message: `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成 ${computed.date} 截面排行（${computed.total_stocks} 只）`,
+      };
     });
     response.status(202).json({ task_id: task.id, status: 'started', message: '排行计算已启动' });
   }));
@@ -522,36 +758,28 @@ export function createApp(services: Partial<AppServices> = {}) {
 
   app.post('/api/backtest/collect', asyncHandler(async (request, response) => {
     const days = numberParam(request.query.days, 20, 5, 60);
+    const requestedDate = marketDateParam(request.query.date);
     const task = tasks.start('backtest_collect', `构建近 ${days} 日历史样本`, async ({ progress, cancelled, traceId }) => {
-      const ranking = await store.getRanking();
-      progress(3, '连接真实历史行情源');
-      const history = await collectHistoricalMarketData(ranking.rankings, {
+      const ranking = await store.getRankingUniverse();
+      if (!ranking.rankings.length) throw new Error('当前股票池为空，无法采集回测行情');
+      const prepared = await ensureHistoricalCoverage({
+        rankings: ranking.rankings,
         days,
-        asOfDate: ranking.date,
+        asOfDate: requestedDate,
+        traceId,
+        force: true,
         cancelled,
-        audit,
-        traceId,
-        progress: (completed, total, message) => progress(5 + completed / total * 88, message),
+        progress,
       });
-      if (!history || cancelled()) return null;
-      progress(95, '保存无未来数据的历史样本');
-      await store.saveHistoricalMarket(history);
-      await audit.info('market_data', 'snapshot_saved', {
-        traceId,
-        data: {
-          database: store.databasePath,
-          tables: ['stock_daily_price', 'index_daily_price', 'historical_snapshot'],
-          as_of_date: history.as_of_date,
-          stocks: history.stocks.length,
-        },
-      });
+      if (cancelled()) return null;
       return {
         days,
-        stocks: history.stocks.length,
-        failed_stocks: history.failed_stocks,
-        as_of_date: history.as_of_date,
-        source: history.source,
+        stocks: prepared.history.stocks.length,
+        failed_stocks: prepared.history.failed_stocks,
+        as_of_date: prepared.history.as_of_date,
+        source: prepared.history.source,
         status: 'ready',
+        message: `已获取并校验 ${prepared.history.as_of_date} 前 ${days} 日行情（${prepared.history.stocks.length} 只）`,
       };
     });
     response.status(202).json({ task_id: task.id, status: 'started', message: '采集任务已启动' });
@@ -560,33 +788,20 @@ export function createApp(services: Partial<AppServices> = {}) {
   app.post('/api/backtest/run', asyncHandler(async (request, response) => {
     const days = numberParam(request.query.days, 20, 5, 60);
     const maxHoldDays = numberParam(request.query.max_hold_days, 5, 1, 60);
+    const requestedDate = marketDateParam(request.query.date);
     const task = tasks.start('backtest_run', `运行 ${days} 日策略回测`, async ({ progress, cancelled, traceId }) => {
-      const source = await store.getRanking();
-      let history: HistoricalMarketData | null = await store.getHistoricalMarket();
-      const sourceDate = source.date.replaceAll('-', '').slice(0, 8);
-      const cacheUsable = history
-        && history.schema_version === 1
-        && history.universe_as_of_date === sourceDate
-        && history.requested_days >= days
-        && history.calendar.length >= days + 1;
-      if (!cacheUsable) {
-        progress(3, '历史样本缺失，开始采集真实日线');
-        history = await collectHistoricalMarketData(source.rankings, {
-          days,
-          asOfDate: source.date,
-          cancelled,
-          audit,
-          traceId,
-          progress: (completed, total, message) => progress(5 + completed / total * 52, message),
-        });
-        if (!history || cancelled()) return null;
-        await store.saveHistoricalMarket(history);
-        history = await store.getHistoricalMarket() ?? history;
-      } else {
-        progress(18, '载入已缓存的真实历史日线');
-      }
+      const source = await store.getRankingUniverse();
+      if (!source.rankings.length) throw new Error('当前股票池为空，无法运行回测');
+      const prepared = await ensureHistoricalCoverage({
+        rankings: source.rankings,
+        days,
+        asOfDate: requestedDate,
+        traceId,
+        cancelled,
+        progress: (value, message) => progress(value * 0.58, message),
+      });
       if (cancelled()) return null;
-      if (!history) throw new Error('历史行情准备失败');
+      const history = prepared.history;
       await audit.info('backtest', 'run_started', {
         traceId,
         data: { days, max_hold_days: maxHoldDays, history_as_of_date: history.as_of_date, stocks: history.stocks.length },
@@ -605,7 +820,12 @@ export function createApp(services: Partial<AppServices> = {}) {
           output_path: path.join(store.runtime, 'backtests', `${result.run_id}.json`),
         },
       });
-      return { run_id: result.run_id, summary: result.summary };
+      return {
+        run_id: result.run_id,
+        summary: result.summary,
+        collected: prepared.collected,
+        message: `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成 ${result.date_range} 回测`,
+      };
     });
     response.status(202).json({ task_id: task.id, status: 'started', message: '回测任务已启动' });
   }));
@@ -697,10 +917,6 @@ export function createApp(services: Partial<AppServices> = {}) {
   }));
 
   app.post('/api/simulated-trading/automation/run-window', asyncHandler(async (request, response) => {
-    if (request.body?.confirmation !== 'SIMULATED') {
-      response.status(400).json({ ok: false, error: '请输入 SIMULATED 确认手动触发同花顺模拟窗口' });
-      return;
-    }
     const requestedWindow = String(request.body?.window ?? 'open');
     if (!['open', 'near_close', 'close', 'post_close'].includes(requestedWindow)) {
       response.status(400).json({ ok: false, error: '交易窗口必须是 open、near_close、close 或 post_close' });
@@ -708,7 +924,6 @@ export function createApp(services: Partial<AppServices> = {}) {
     }
     try {
       response.json(await paper.runWindowConfirmed(
-        'SIMULATED',
         requestedWindow as 'open' | 'near_close' | 'close' | 'post_close',
         await loadPaperContext(requestedWindow === 'close', String(response.locals.traceId)),
         String(response.locals.traceId),
@@ -724,14 +939,9 @@ export function createApp(services: Partial<AppServices> = {}) {
   }));
 
   app.post('/api/simulated-trading/execute', asyncHandler(async (request, response) => {
-    const confirmation = String(request.body?.confirmation ?? '');
-    if (confirmation !== 'SIMULATED') {
-      response.status(400).json({ ok: false, error: '请输入 SIMULATED 确认只执行同花顺模拟交易' });
-      return;
-    }
     try {
       const traceId = String(response.locals.traceId);
-      response.json(await paper.execute(confirmation, await loadPaperContext(false, traceId), traceId));
+      response.json(await paper.execute(await loadPaperContext(false, traceId), traceId));
     } catch (error) {
       await audit.error('paper_trading', 'manual_execute_failed', {
         traceId: String(response.locals.traceId),

@@ -63,12 +63,48 @@ function candidatesAtDate(series: PreparedSeries[], date: string, exactLimitUpDa
   return records.map((row, index) => ({ ...row, rank: index + 1 }));
 }
 
+function trendAxisFromState(stateId: number | undefined, alignment: string | undefined): 'up' | 'range' | 'down' {
+  if (stateId != null && [1, 2, 3].includes(stateId)) return 'up';
+  if (stateId != null && [6, 7].includes(stateId)) return 'down';
+  if (stateId != null && [4, 5].includes(stateId)) return 'range';
+  return alignment === 'bullish' ? 'up' : alignment === 'bearish' ? 'down' : 'range';
+}
+
+/** Build the complete as-of-date cross section from persisted K lines. */
+export function historicalCrossSectionRankings(
+  history: HistoricalMarketData,
+  date: string,
+  previousRows: RankingRow[] = [],
+): RankingRow[] {
+  const targetDate = date.replaceAll('-', '').slice(0, 8);
+  const previousByCode = new Map(previousRows.map((row) => [row.stock_code, row]));
+  const exactLimitUpDates = limitUpDatesByCode(history);
+  const scored = history.stocks.flatMap((stock): RankingRow[] => {
+    const previous = previousByCode.get(stock.stock_code);
+    const row = scoreStock(prepareSeries(stock), targetDate, {
+      trend: trendAxisFromState(previous?.sector_trend_state_id, previous?.alignment),
+      trendName: previous?.sector_trend_name,
+      stateId: previous?.sector_trend_state_id,
+      code: previous?.sector_code,
+      name: previous?.sector_name,
+      limitUpDates: exactLimitUpDates.get(stock.stock_code),
+    });
+    if (!row) return [];
+    return [{
+      ...previous,
+      ...row,
+      continue_num: previous?.continue_num,
+      reason_info: previous?.reason_info,
+    }];
+  });
+  return scored
+    .sort((left, right) => right.total_score - left.total_score || left.stock_code.localeCompare(right.stock_code))
+    .map((row, index) => ({ ...row, rank: index + 1 }));
+}
+
 export function historicalStrategyCandidates(history: HistoricalMarketData, date: string): RankingRow[] {
-  return candidatesAtDate(
-    history.stocks.map(prepareSeries),
-    date.replaceAll('-', '').slice(0, 8),
-    limitUpDatesByCode(history),
-  );
+  return rankEntryCandidates(historicalCrossSectionRankings(history, date), new Set(), DEFAULT_T1_STRATEGY.maxCandidates)
+    .map((row, index) => ({ ...row, rank: index + 1 }));
 }
 
 function drawdownPercent(values: number[]): number {

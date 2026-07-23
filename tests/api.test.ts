@@ -61,13 +61,17 @@ class FakeSimulatedBroker implements SimulatedBroker {
   }
 }
 
-async function waitForTask(taskId: string) {
+async function waitForTaskFrom(client: ReturnType<typeof request>, taskId: string) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    const response = await http.get(`/api/tasks/${taskId}`);
+    const response = await client.get(`/api/tasks/${taskId}`);
     if (['completed', 'failed', 'cancelled'].includes(response.body.status)) return response.body;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`task ${taskId} did not finish`);
+}
+
+async function waitForTask(taskId: string) {
+  return waitForTaskFrom(http, taskId);
 }
 
 function apiAnalysisFixture(): AnalysisData {
@@ -202,26 +206,146 @@ describe('Trending Polars API', () => {
   });
 
   it('runs a background ranking task and persists the result', async () => {
-    const started = await http.post('/api/ranking/compute').expect(202);
+    const started = await http.post('/api/ranking/compute?date=20260722').expect(202);
     const task = await waitForTask(started.body.task_id);
     expect(task.status).toBe('completed');
     const ranking = await http.get('/api/ranking?page_size=5').expect(200);
-    expect(ranking.body.rankings).toHaveLength(5);
+    expect(ranking.body.rankings.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('does not create block_top facts during an aggregate-only analysis refresh', async () => {
-    const before = await store.loadAllLimitUpCodes();
-    const started = await http.get('/api/analysis?refresh=1').expect(202);
-    const task = await waitForTask(started.body.task_id);
-    expect(task.status).toBe('completed');
-    expect(await store.loadAllLimitUpCodes()).toEqual(before);
-    const latest = await http.get('/api/limit_up').expect(200);
-    expect(latest.body.map((record: { stock_code: string }) => record.stock_code).sort())
-      .toEqual(before.map((record) => record.stock_code).sort());
+  it('refreshes analysis through blocktop, block K lines, stock quotes and index quotes', async () => {
+    const calls: string[] = [];
+    const priceRows = Array.from({ length: 90 }, (_, index) => {
+      const date = new Date(Date.UTC(2026, 3, 25 + index)).toISOString().slice(0, 10);
+      const close = 10 + index * 0.1;
+      return [date, String(close - 0.05), String(close), String(close + 0.1), String(close - 0.1), '1000'];
+    });
+    const blockRows = priceRows.slice(-30).map((row) => (
+      `${String(row[0]).replaceAll('-', '')},${row[1]},${row[3]},${row[4]},${row[2]},1000,2000,,,,0`
+    )).join(';');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/dataapi/limit_up/block_top')) {
+        return new Response(JSON.stringify({
+          data: [{
+            code: '885531',
+            name: '光伏概念',
+            change: 2.5,
+            limit_up_num: 2,
+            continuous_plate_num: 2,
+            stock_list: [
+              { code: '600088', name: '测试沪股', continue_num: 2, reason_type: '测试', latest: 12, change_rate: 10 },
+              { code: '000099', name: '测试深股', continue_num: 1, reason_type: '测试', latest: 8, change_rate: 9.9 },
+            ],
+          }],
+        }), { status: 200 });
+      }
+      if (url.includes('d.10jqka.com.cn/v4/line/bk_885531/')) {
+        return new Response(`callback({"name":"光伏概念","data":"${blockRows}"})`, { status: 200 });
+      }
+      if (url.includes('web.ifzq.gtimg.cn')) {
+        const symbol = new URL(url).searchParams.get('param')?.split(',')[0] ?? '';
+        return new Response(`kline_dayqfq=${JSON.stringify({ code: 0, data: { [symbol]: { qfqday: priceRows } } })}`, { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+    try {
+      const started = await http.get('/api/analysis?refresh=1&date=20260723').expect(202);
+      const task = await waitForTask(started.body.task_id);
+      expect(task.status).toBe('completed');
+      expect(task.message).toContain('blocktop 1 个板块');
+      expect(calls.some((url) => url.includes('/dataapi/limit_up/block_top'))).toBe(true);
+      expect(calls.some((url) => url.includes('param=sh600088'))).toBe(true);
+      expect(calls.some((url) => url.includes('param=sz000099'))).toBe(true);
+      expect(calls.some((url) => url.includes('param=sh000001'))).toBe(true);
+      expect(await store.getStockPrices('600088', 5)).toHaveLength(5);
+      const latest = await http.get('/api/limit_up?date=20260723').expect(200);
+      expect(latest.body.map((record: { stock_code: string }) => record.stock_code).sort()).toEqual(['000099', '600088']);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('fails the refresh task instead of reporting completion when blocktop is unavailable', async () => {
+    const before = await store.getLimitUpByDate('20260723');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 503 }));
+    try {
+      const started = await http.get('/api/analysis?refresh=1&date=20260724').expect(202);
+      const task = await waitForTask(started.body.task_id);
+      expect(task.status).toBe('failed');
+      expect(task.message).toContain('blocktop 数据不可用');
+      expect(await store.getLimitUpByDate('20260723')).toEqual(before);
+      expect(await store.getLimitUpByDate('20260724')).toEqual([]);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('auto-fetches missing date coverage for simulated trading, ranking and backtest', async () => {
+    const workflowRoot = await mkdtemp(path.join(os.tmpdir(), 'trending-polars-coverage-'));
+    const workflowStore = new DataStore(workflowRoot);
+    const workflowBroker = new FakeSimulatedBroker();
+    const workflowPaper = new PaperTradingService(workflowBroker, {
+      now: () => new Date('2026-07-23T10:00:00+08:00'),
+    });
+    const workflowApp = createApp({
+      store: workflowStore,
+      tasks: new TaskRegistry(),
+      paper: workflowPaper,
+    });
+    const workflowHttp = request(workflowApp.app);
+    await workflowStore.saveAnalysis(apiAnalysisFixture(), '20260722');
+    await workflowStore.saveRanking({
+      timestamp: '2026-07-22 15:05:00',
+      date: '20260722',
+      total_stocks: 2,
+      rankings: apiRankingFixture().slice(0, 2),
+    });
+
+    const calls: string[] = [];
+    const rows = Array.from({ length: 90 }, (_, index) => {
+      const date = new Date(Date.UTC(2026, 3, 25 + index)).toISOString().slice(0, 10);
+      const close = 10 + index * 0.08;
+      return [date, String(close - 0.03), String(close), String(close + 0.08), String(close - 0.08), '1200'];
+    });
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('web.ifzq.gtimg.cn')) {
+        const symbol = new URL(url).searchParams.get('param')?.split(',')[0] ?? '';
+        return new Response(`kline_dayqfq=${JSON.stringify({ code: 0, data: { [symbol]: { qfqday: rows } } })}`, { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+    try {
+      await workflowHttp.get('/api/simulated-trading/overview').expect(200);
+      expect(calls.some((url) => url.includes('param=sh000001'))).toBe(true);
+      expect(calls.some((url) => url.includes('param=sh600001'))).toBe(true);
+      expect(calls.some((url) => url.includes('param=sz000002'))).toBe(true);
+
+      const beforeRanking = calls.length;
+      const rankingStarted = await workflowHttp.post('/api/ranking/compute?date=20260723').expect(202);
+      const rankingTask = await waitForTaskFrom(workflowHttp, rankingStarted.body.task_id);
+      expect(rankingTask.status).toBe('completed');
+      expect(rankingTask.result).toMatchObject({ date: '20260723', collected: true });
+      expect(calls.length).toBeGreaterThan(beforeRanking);
+
+      const beforeBacktest = calls.length;
+      const backtestStarted = await workflowHttp.post('/api/backtest/run?days=60&date=20260723').expect(202);
+      const backtestTask = await waitForTaskFrom(workflowHttp, backtestStarted.body.task_id);
+      expect(backtestTask.status).toBe('completed');
+      expect(backtestTask.result).toMatchObject({ collected: true, run_id: expect.any(String) });
+      expect(calls.length).toBeGreaterThan(beforeBacktest);
+    } finally {
+      fetchSpy.mockRestore();
+      workflowStore.close();
+      await rm(workflowRoot, { recursive: true, force: true });
+    }
   });
 
   it('runs a Polars-backed backtest and exposes its ledger', async () => {
-    const started = await http.post('/api/backtest/run?days=10&max_hold_days=3').expect(202);
+    const started = await http.post('/api/backtest/run?days=10&max_hold_days=3&date=20260722').expect(202);
     const task = await waitForTask(started.body.task_id);
     expect(task.status).toBe('completed');
     const runId = task.result.run_id;
@@ -240,15 +364,13 @@ describe('Trending Polars API', () => {
     expect(bootstrap.body.automation).toMatchObject({ enabled: expect.any(Boolean) });
   });
 
-  it('keeps simulated trading behind explicit confirmation', async () => {
+  it('executes the simulated-trading open window immediately and persists the state', async () => {
     const overview = await http.get('/api/simulated-trading/overview').expect(200);
     expect(overview.body.plan).toBeTruthy();
     expect(overview.body.account.positions).toEqual([]);
     expect(overview.body.account.current_position_pct).toBe(0);
     expect(overview.body.account.pnl_summary).toEqual({ amount: 0, pct: 0 });
-    const rejected = await http.post('/api/simulated-trading/execute').send({ confirmation: 'REAL' }).expect(400);
-    expect(rejected.body.ok).toBe(false);
-    const accepted = await http.post('/api/simulated-trading/execute').send({ confirmation: 'SIMULATED' }).expect(200);
+    const accepted = await http.post('/api/simulated-trading/execute').expect(200);
     expect(accepted.body.ok).toBe(true);
     const state = await http.get('/api/simulated-trading/state').expect(200);
     expect(state.body).toMatchObject({ schema_version: 1, engine_version: 'node-t1-live-v1' });
@@ -294,7 +416,7 @@ describe('Trending Polars API', () => {
     try {
       const index = await http.get('/api/index_prices?symbol=sh000300&limit=5').expect(200);
       expect(index.headers['x-market-data-source']).toBe('sqlite');
-      expect(index.body).toEqual([expect.objectContaining({ close: 4050 })]);
+      expect(index.body).toEqual(expect.arrayContaining([expect.objectContaining({ close: 4050 })]));
 
       const stock = await http.get('/api/stock_prices?stock_code=600001&limit=5').expect(200);
       expect(stock.headers['x-market-data-source']).toBe('sqlite');

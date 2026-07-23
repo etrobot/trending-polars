@@ -75,10 +75,115 @@ interface CollectionOptions {
   traceId?: string;
 }
 
-const WARMUP_DAYS = 70;
+export const HISTORICAL_WARMUP_DAYS = 70;
+
+export interface HistoricalCoverageReport {
+  usable: boolean;
+  requested_as_of_date: string;
+  resolved_as_of_date: string | null;
+  required_days: number;
+  required_start_date: string | null;
+  universe_size: number;
+  covered_stocks: number;
+  minimum_covered_stocks: number;
+  missing_stock_codes: string[];
+  reasons: string[];
+}
 
 function compactDate(value: string): string {
   return value.replaceAll('-', '').slice(0, 8);
+}
+
+/**
+ * Validate the rows that a strategy can actually consume instead of trusting
+ * historical_snapshot metadata alone. A covered stock must include the target
+ * trading day and enough leading rows for the first requested signal day to
+ * have a 20-day scoring window.
+ */
+export function assessHistoricalMarketCoverage(
+  history: HistoricalMarketData | null,
+  rankings: RankingRow[],
+  options: { days: number; asOfDate: string },
+): HistoricalCoverageReport {
+  const requestedAsOfDate = compactDate(options.asOfDate);
+  const requiredDays = Math.min(60, Math.max(1, Math.trunc(options.days)));
+  const universe = uniqueUniverse(rankings);
+  const minimumCoveredStocks = universe.length
+    ? Math.min(universe.length, Math.min(20, Math.max(2, Math.floor(universe.length * 0.2))))
+    : 0;
+  const emptyReport: HistoricalCoverageReport = {
+    usable: false,
+    requested_as_of_date: requestedAsOfDate,
+    resolved_as_of_date: null,
+    required_days: requiredDays,
+    required_start_date: null,
+    universe_size: universe.length,
+    covered_stocks: 0,
+    minimum_covered_stocks: minimumCoveredStocks,
+    missing_stock_codes: universe.map((row) => row.stock_code),
+    reasons: [],
+  };
+  if (!requestedAsOfDate) return { ...emptyReport, reasons: ['需求日期无效'] };
+  if (!universe.length) return { ...emptyReport, reasons: ['当前股票池为空'] };
+  if (!history) return { ...emptyReport, reasons: ['本地没有历史行情快照'] };
+
+  const reasons: string[] = [];
+  const calendar = [...new Set(history.calendar.map(compactDate).filter((date) => date && date <= requestedAsOfDate))].sort();
+  const resolvedAsOfDate = calendar.at(-1) ?? null;
+  const requiredCalendarRows = requiredDays + 20;
+  const requiredStartDate = calendar.length >= requiredCalendarRows
+    ? calendar[calendar.length - requiredCalendarRows]
+    : null;
+
+  if (compactDate(history.universe_as_of_date) !== requestedAsOfDate) {
+    reasons.push(`快照需求日为 ${history.universe_as_of_date || '未知'}，当前需要 ${requestedAsOfDate}`);
+  }
+  if (history.requested_days < requiredDays) {
+    reasons.push(`快照仅准备 ${history.requested_days} 日，当前需要 ${requiredDays} 日`);
+  }
+  if (!resolvedAsOfDate) {
+    reasons.push('交易日历为空');
+  } else if (compactDate(history.as_of_date) !== resolvedAsOfDate) {
+    reasons.push(`快照截至 ${history.as_of_date || '未知'}，交易日历截至 ${resolvedAsOfDate}`);
+  }
+  if (!requiredStartDate) {
+    reasons.push(`交易日历不足：至少需要 ${requiredCalendarRows} 个交易日（含评分预热）`);
+  }
+
+  const seriesByCode = new Map(history.stocks.map((stock) => [stock.stock_code, stock]));
+  const coveredCodes: string[] = [];
+  const missingCodes: string[] = [];
+  for (const row of universe) {
+    const stock = seriesByCode.get(row.stock_code);
+    const dates = stock?.bars
+      .map((bar) => compactDate(bar[0]))
+      .filter((date) => date && (!resolvedAsOfDate || date <= resolvedAsOfDate))
+      .sort() ?? [];
+    const covered = Boolean(
+      requiredStartDate
+      && resolvedAsOfDate
+      && dates.length >= 20
+      && dates[0] <= requiredStartDate
+      && dates.includes(resolvedAsOfDate),
+    );
+    (covered ? coveredCodes : missingCodes).push(row.stock_code);
+  }
+  if (coveredCodes.length < minimumCoveredStocks) {
+    reasons.push(`个股行情覆盖不足：${coveredCodes.length}/${universe.length}，至少需要 ${minimumCoveredStocks} 只完整覆盖`);
+  }
+
+  return {
+    usable: reasons.length === 0,
+    requested_as_of_date: requestedAsOfDate,
+    resolved_as_of_date: resolvedAsOfDate,
+    required_days: requiredDays,
+    required_start_date: requiredStartDate,
+    universe_size: universe.length,
+    covered_stocks: coveredCodes.length,
+    minimum_covered_stocks: minimumCoveredStocks,
+    missing_stock_codes: missingCodes,
+    reasons,
+  };
 }
 
 function secIdForStock(code: string): string {
@@ -557,7 +662,7 @@ export async function collectHistoricalMarketData(
   if (!universe.length) throw new Error('当前股票池为空，无法采集历史行情');
 
   const requestedDays = Math.min(60, Math.max(5, Math.trunc(options.days)));
-  const limit = requestedDays + WARMUP_DAYS + 5;
+  const limit = requestedDays + HISTORICAL_WARMUP_DAYS + 5;
   const endDate = compactDate(options.asOfDate);
   await audit.info('market_data', 'collection_started', {
     traceId: options.traceId,
@@ -675,7 +780,7 @@ export async function collectHistoricalMarketData(
     as_of_date: calendar.at(-1) ?? endDate,
     universe_as_of_date: endDate,
     requested_days: requestedDays,
-    warmup_days: WARMUP_DAYS,
+    warmup_days: HISTORICAL_WARMUP_DAYS,
     calendar,
     stocks: stocks.sort((left, right) => left.stock_code.localeCompare(right.stock_code)),
     indices: [{ symbol: 'sh000001', index_name: '上证指数', bars: calendarBars }],

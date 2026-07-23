@@ -10,7 +10,7 @@ import {
 } from 'lucide-react';
 import { StatePill, StrategyPill, SentimentPill } from '../components/Pills';
 import { PageHeaderActions } from '../components/HeaderActions';
-import { Button, EmptyState, LoadingPanel, MetricCard, SectionHeading } from '../components/Ui';
+import { Button, EmptyState, LoadingPanel, MetricCard } from '../components/Ui';
 import { useTaskResult, useTasks } from '../context/TasksContext';
 import { api, pctColor, sentimentLabel } from '../lib/api';
 import type { AnalysisData, BlockAnalysis, IndexAnalysis, TaskSnapshot } from '../types';
@@ -53,8 +53,13 @@ export function HomePage() {
 
   useEffect(() => { void load(); }, [load]);
 
-  const onRefreshDone = useCallback((_task: TaskSnapshot) => {
+  const onRefreshDone = useCallback((task: TaskSnapshot) => {
     setRefreshTaskId(null);
+    if (task.status !== 'completed') {
+      setRefreshing(false);
+      setError(task.message || '行情刷新未完成');
+      return;
+    }
     void load();
   }, [load]);
   useTaskResult(refreshTaskId, onRefreshDone);
@@ -81,7 +86,7 @@ export function HomePage() {
   const indices = useMemo(() => data?.indices.filter((item) => item.state.state_id >= 1 && item.state.state_id <= 7) ?? [], [data]);
 
   if (loading) return <><PageHeaderActions><Button disabled><RefreshCw className="h-3.5 w-3.5 animate-spin" />加载中</Button></PageHeaderActions><LoadingPanel label="正在读取指数、板块与市场情绪…" /></>;
-  if (!data || error) return <><PageHeaderActions><Button onClick={() => void load()}><RefreshCw className="h-3.5 w-3.5" />重新加载</Button></PageHeaderActions><div className="panel"><EmptyState title="市场数据加载失败" description={error || '当前没有可用数据'} /></div></>;
+  if (!data) return <><PageHeaderActions><Button onClick={() => void load()}><RefreshCw className="h-3.5 w-3.5" />重新加载</Button></PageHeaderActions><div className="panel"><EmptyState title="市场数据加载失败" description={error || '当前没有可用数据'} /></div></>;
 
   const toggleSort = (key: BlockSort) => setSort((current) => current.key === key ? { key, desc: !current.desc } : { key, desc: true });
   const SortLabel = ({ field, children }: { field: BlockSort; children: string }) => (
@@ -92,6 +97,7 @@ export function HomePage() {
     <>
       <PageHeaderActions><Button disabled={refreshing} onClick={() => void refresh()}><RefreshCw className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />{refreshing ? '刷新中' : '刷新数据'}</Button></PageHeaderActions>
       <div className="terminal-page">
+      {error && <div className="border border-[#6b3434] bg-[#2c1919] px-3 py-2 text-[11px] leading-4 text-trading-up">{error}</div>}
       <section className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard label="市场情绪" value={<span className="flex items-center gap-2">{sentimentLabel(data.sentiment.sentiment)} <SentimentPill sentiment={data.sentiment.sentiment} /></span>} detail={`${data.sentiment.total_blocks} 个活跃板块`} tone="coral" icon={<Flame className="h-4 w-4" />} />
         <MetricCard label="涨停家数" value={data.sentiment.total_limit_up} detail="全市场" icon={<TrendingUp className="h-4 w-4" />} />
@@ -101,7 +107,6 @@ export function HomePage() {
 
       <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_280px]">
         <div className="min-w-0">
-        <SectionHeading title="板块" />
           <div className="table-scroll">
             <table className="data-table min-w-[920px]">
               <thead>

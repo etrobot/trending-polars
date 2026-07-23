@@ -286,7 +286,7 @@ describe('Node T+1 paper-trading core', () => {
     const market = context('20260722', [ranking('600001', '测试甲', 80, 10, 1)], ['20260722', '20260723']);
 
     await expect(service.runWindow('open', market)).rejects.toThrow('开盘执行窗口');
-    const result = await service.runWindowConfirmed('SIMULATED', 'open', market);
+    const result = await service.runWindowConfirmed('open', market);
     expect(result.results.map((order) => order.stock_code)).toEqual(['600001']);
     expect(broker.placed).toHaveLength(1);
   });
@@ -514,7 +514,7 @@ describe('Node T+1 paper-trading core', () => {
       weakMarket.marketAverageChange,
     );
     expect(overview.plan.orders[0]).toMatchObject({ execution_window: 'near_close', status: '待临收盘执行' });
-    const result = await service.runWindowConfirmed('SIMULATED', 'open', weakMarket);
+    const result = await service.runWindowConfirmed('open', weakMarket);
     expect(result.results[0]).toMatchObject({ stock_code: '600001', execution_window: 'near_close' });
     expect(broker.placed).toHaveLength(1);
   });
