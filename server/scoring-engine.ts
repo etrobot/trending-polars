@@ -1,7 +1,6 @@
 import type { MarketState, RankingRow } from '../src/types.js';
 import { round } from './format.js';
 import type { HistoricalBar, HistoricalStockSeries, KLineData } from './historical-market.js';
-import { limitUpRate } from './trading-strategy.js';
 
 // ---------------------------------------------------------------------------
 // Shared analysis math for the individual-stock 多因子评分 (backtest + live) and
@@ -164,19 +163,18 @@ export function volumePriceScore(bars: Bar[], endIndex: number): VolumePriceScor
 
 // ---- 维度 4：波动率-趋势适配评分（0-15）------------------------------------
 
-/** 统计最近 lookback 日的涨停次数（按板块/科创/ST/北交所自适应涨停幅度）。 */
+/** 统计最近 lookback 个交易日的权威涨停记录，只接受同花顺 block_top 日期集合。 */
 export function limitUpCount(
   bars: Bar[],
   endIndex: number,
-  code: string,
-  name: string,
+  limitUpDates: ReadonlySet<string>,
   lookback = 20,
 ): number {
-  const threshold = limitUpRate(code, name) * 100 - 0.5;
   const start = Math.max(0, endIndex - lookback + 1);
   let count = 0;
   for (let index = start; index <= endIndex; index += 1) {
-    if (bars[index].changePct >= threshold) count += 1;
+    const date = bars[index].date.replaceAll('-', '').slice(0, 8);
+    if (limitUpDates.has(date)) count += 1;
   }
   return count;
 }
@@ -219,6 +217,8 @@ export interface SectorContext {
   stateId?: number;
   code?: string;
   name?: string;
+  /** 该股票由 block_top 确认的涨停日期；不能用日涨幅反推。 */
+  limitUpDates?: ReadonlySet<string>;
 }
 
 /**
@@ -263,7 +263,7 @@ export function scoreStock(series: PreparedSeries, date: string, sector?: Sector
   const volumePrice = volumePriceScore(series.bars, endIndex);
 
   // 维度 4：波动率-趋势适配评分
-  const limitUps = limitUpCount(series.bars, endIndex, series.stockCode, series.stockName);
+  const limitUps = limitUpCount(series.bars, endIndex, sector?.limitUpDates ?? new Set());
   const volatility = volatilityClassOf(limitUps);
   const trendAxis = sector?.trend ?? alignmentToTrendAxis(alignment);
   const volatilityTrend = volatilityTrendScore(volatility, trendAxis);

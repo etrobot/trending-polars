@@ -9,7 +9,6 @@ import {
   createT1StrategyConfig,
   DEFAULT_T1_STRATEGY,
   exitSignalReason,
-  limitUpPrice,
   rankEntryCandidates,
 } from './trading-strategy.js';
 
@@ -34,14 +33,42 @@ interface EntryOrder {
 
 const INITIAL_CAPITAL = 100_000;
 
-function candidatesAtDate(series: PreparedSeries[], date: string): RankingRow[] {
-  const rows = series.map((item) => scoreStock(item, date)).filter((item): item is RankingRow => item != null);
+function limitUpDatesByCode(history: HistoricalMarketData): Map<string, Set<string>> {
+  const result = new Map<string, Set<string>>();
+  for (const record of history.limit_up_records ?? []) {
+    const date = record.date.replaceAll('-', '').slice(0, 8);
+    const dates = result.get(record.stock_code) ?? new Set<string>();
+    dates.add(date);
+    result.set(record.stock_code, dates);
+  }
+  return result;
+}
+
+function limitUpCodesByDate(history: HistoricalMarketData): Map<string, Set<string>> {
+  const result = new Map<string, Set<string>>();
+  for (const record of history.limit_up_records ?? []) {
+    const date = record.date.replaceAll('-', '').slice(0, 8);
+    const codes = result.get(date) ?? new Set<string>();
+    codes.add(record.stock_code);
+    result.set(date, codes);
+  }
+  return result;
+}
+
+function candidatesAtDate(series: PreparedSeries[], date: string, exactLimitUpDates: Map<string, Set<string>>): RankingRow[] {
+  const rows = series.map((item) => scoreStock(item, date, {
+    limitUpDates: exactLimitUpDates.get(item.stockCode),
+  })).filter((item): item is RankingRow => item != null);
   const records = rankEntryCandidates(rows, new Set(), DEFAULT_T1_STRATEGY.maxCandidates);
   return records.map((row, index) => ({ ...row, rank: index + 1 }));
 }
 
 export function historicalStrategyCandidates(history: HistoricalMarketData, date: string): RankingRow[] {
-  return candidatesAtDate(history.stocks.map(prepareSeries), date.replaceAll('-', '').slice(0, 8));
+  return candidatesAtDate(
+    history.stocks.map(prepareSeries),
+    date.replaceAll('-', '').slice(0, 8),
+    limitUpDatesByCode(history),
+  );
 }
 
 function drawdownPercent(values: number[]): number {
@@ -98,6 +125,8 @@ export function runPolarsBacktest(
 
   const prepared = history.stocks.map(prepareSeries);
   const seriesByCode = new Map(prepared.map((series) => [series.stockCode, series]));
+  const exactLimitUpDates = limitUpDatesByCode(history);
+  const exactLimitUpCodes = limitUpCodesByDate(history);
   const positions = new Map<string, Position>();
   const pendingExits = new Map<string, string>();
   const lastKnownClose = new Map<string, number>();
@@ -136,8 +165,7 @@ export function runPolarsBacktest(
       const barIndex = series?.indexByDate.get(date);
       const bar = barIndex == null ? null : series?.bars[barIndex];
       if (!series || !bar?.open || bar.open <= 0) continue;
-      const previousBar = barIndex != null && barIndex > 0 ? series.bars[barIndex - 1] : null;
-      if (previousBar && bar.open >= limitUpPrice(previousBar.close, order.stockCode, order.stockName) - 0.001) continue;
+      if (exactLimitUpCodes.get(date)?.has(order.stockCode)) continue;
 
       const fillPrice = round(bar.open * (1 + strategy.slippageRate), 3);
       const sizing = calculateEntrySize(cash, INITIAL_CAPITAL, fillPrice, strategy);
@@ -200,7 +228,7 @@ export function runPolarsBacktest(
     if (dateIndex < dates.length - 1) {
       const heldOrOrdered = new Set([...positions.keys(), ...pendingEntries.map((order) => order.stockCode)]);
       const availableSlots = Math.max(0, strategy.maxPositions - positions.size);
-      pendingEntries = candidatesAtDate(prepared, date)
+      pendingEntries = candidatesAtDate(prepared, date, exactLimitUpDates)
         .filter((candidate) => !heldOrOrdered.has(candidate.stock_code))
         .slice(0, Math.min(strategy.maxEntriesPerDay, availableSlots))
         .map((candidate) => ({
@@ -246,8 +274,11 @@ export function runPolarsBacktest(
     max_hold_days: maxHoldDays,
     engine_version: 'historical-t1-v2',
     data_source: history.source,
-    methodology: '当日收盘生成信号，下一交易日开盘成交；个股与宽基/中证指数日线按腾讯→新浪→东方财富顺序获取前复权数据，并计入滑点、佣金与卖出印花税。',
-    bias_notes: ['股票池来自当前可用排行快照，仍可能存在幸存者偏差；交易信号和成交价格不使用未来行情。'],
+    methodology: '当日收盘生成信号，下一交易日开盘成交；涨停事实仅使用同花顺 block_top 记录，不从涨跌幅或理论涨停价反推；个股与宽基/中证指数日线按腾讯→新浪→东方财富顺序获取前复权数据，并计入滑点、佣金与卖出印花税。',
+    bias_notes: [
+      '股票池来自当前可用排行快照，仍可能存在幸存者偏差；交易信号和成交价格不使用未来行情。',
+      '缺少 block_top 记录的日期视为“涨停状态未知”，不会用价格幅度补判。',
+    ],
     summary: {
       initial_capital: INITIAL_CAPITAL,
       final_capital: round(cash, 2),

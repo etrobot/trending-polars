@@ -121,8 +121,9 @@ function context(
   calendar: string[] = [],
   marketAnalysis: AnalysisData = analysis,
   marketAverageChange?: number,
+  limitUpRecords: Array<{ date: string; stock_code: string }> = [],
 ): PaperMarketContext {
-  return { analysis: marketAnalysis, rankingDate: date, rankings, calendar, marketAverageChange };
+  return { analysis: marketAnalysis, rankingDate: date, rankings, calendar, marketAverageChange, limitUpRecords };
 }
 
 function analysisForTiming(sentiment: 'hot' | 'normal' | 'cold', stateId?: number): AnalysisData {
@@ -141,6 +142,44 @@ function analysisForTiming(sentiment: 'hot' | 'normal' | 'cold', stateId?: numbe
 }
 
 describe('Node T+1 paper-trading core', () => {
+  it('does not infer limit-up from quote amplitude and skips only block_top-confirmed stocks', async () => {
+    let now = new Date('2026-07-22T15:06:00+08:00');
+    const highQuoteBroker = new FlowBroker({
+      availableCash: 100_000,
+      totalAssets: 100_000,
+      positions: [],
+      orders: [],
+    }, { '000001': 11 });
+    const service = new PaperTradingService(highQuoteBroker, { now: () => now });
+    const signalContext = context('20260722', [ranking('000001', '振幅测试', 80, 10)], ['20260722', '20260723']);
+    await service.runWindow('close', signalContext);
+    now = new Date('2026-07-23T09:31:00+08:00');
+    await service.runWindow('open', signalContext);
+    expect(highQuoteBroker.placed).toEqual([
+      expect.objectContaining({ side: 'buy', stock_code: '000001', price: 11 }),
+    ]);
+
+    now = new Date('2026-07-22T15:06:00+08:00');
+    const confirmedBroker = new FlowBroker({
+      availableCash: 100_000,
+      totalAssets: 100_000,
+      positions: [],
+      orders: [],
+    }, { '000001': 10 });
+    const confirmedService = new PaperTradingService(confirmedBroker, { now: () => now });
+    await confirmedService.runWindow('close', signalContext);
+    now = new Date('2026-07-23T09:31:00+08:00');
+    await confirmedService.runWindow('open', context(
+      '20260722',
+      [ranking('000001', '振幅测试', 80, 10)],
+      ['20260722', '20260723'],
+      analysis,
+      undefined,
+      [{ date: '20260723', stock_code: '000001' }],
+    ));
+    expect(confirmedBroker.placed).toEqual([]);
+  });
+
   it('backfills the previous close plan from ranking order and respects the total position limit', async () => {
     const now = new Date('2026-07-23T11:00:00+08:00');
     const store = new TestStateStore();

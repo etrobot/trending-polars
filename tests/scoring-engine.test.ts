@@ -13,7 +13,7 @@ import {
   type PreparedSeries,
 } from '../server/scoring-engine.js';
 
-/** 由每日涨跌幅（百分比）构造 Bar 序列，精确控制趋势与涨停日。 */
+/** 由每日涨跌幅（百分比）构造 Bar 序列；涨停事实另由 block_top 日期集合传入。 */
 function barsFromReturns(startPrice: number, returns: number[], volumes?: number[]): Bar[] {
   const bars: Bar[] = [];
   let previousClose = startPrice;
@@ -64,13 +64,13 @@ describe('dimension 4 — 波动率-趋势适配矩阵', () => {
     expect(volatilityClassOf(6)).toBe('high');
   });
 
-  it('counts board-aware limit-up days within the lookback window', () => {
+  it('counts only block_top-confirmed limit-up days within the lookback window', () => {
     const returns = Array.from({ length: 25 }, (_, index) => (index === 22 || index === 24 ? 10 : 0.3));
     const bars = barsFromReturns(10, returns);
-    // 主板阈值≈9.5%：最近 20 日内两根 +10% 计为涨停。
-    expect(limitUpCount(bars, bars.length - 1, '600001', '主板股')).toBe(2);
-    // 科创板阈值≈19.5%：同样的 +10% 不算涨停。
-    expect(limitUpCount(bars, bars.length - 1, '688001', '科创股')).toBe(0);
+    const confirmedDates = new Set([bars[22].date, bars[24].date]);
+    expect(limitUpCount(bars, bars.length - 1, confirmedDates)).toBe(2);
+    // 即使日涨幅为 +10%，没有 block_top 记录也不能判为涨停。
+    expect(limitUpCount(bars, bars.length - 1, new Set())).toBe(0);
   });
 });
 
@@ -94,7 +94,10 @@ describe('scoreStock — 四维评分与标签', () => {
 
   it('scores a high-volatility uptrend at the top of the matrix column', () => {
     const returns = Array.from({ length: 60 }, (_, index) => ([45, 50, 55].includes(index) ? 10 : 0.5));
-    const row = scoreStock(prepared(barsFromReturns(10, returns)), String(100059))!;
+    const bars = barsFromReturns(10, returns);
+    const row = scoreStock(prepared(bars), String(100059), {
+      limitUpDates: new Set([bars[45].date, bars[50].date, bars[55].date]),
+    })!;
     expect(row.volatility_class).toBe('high');
     expect(row.limit_up_count_20d).toBeGreaterThanOrEqual(3);
     expect(row.volatility_trend_score).toBe(15);

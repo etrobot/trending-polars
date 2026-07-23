@@ -1,19 +1,20 @@
-import { copyFile, mkdir, mkdtemp, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../server/app.js';
-import { DataStore, DEFAULT_DATA_DIR } from '../server/data-store.js';
+import { DataStore } from '../server/data-store.js';
 import { PaperTradingService } from '../server/paper-trading.js';
 import { TaskRegistry } from '../server/tasks.js';
 import type { SimulatedAccountSnapshot, SimulatedBroker } from '../server/ths-simulated-broker.js';
-import type { PaperOrder } from '../src/types.js';
+import type { AnalysisData, BacktestResult, PaperOrder, RankingRow } from '../src/types.js';
 import { historicalFixture } from './historical-fixture.js';
 
 let root = '';
 let http: ReturnType<typeof request>;
 let simulatedBroker: FakeSimulatedBroker;
+let store: DataStore;
 
 class FakeSimulatedBroker implements SimulatedBroker {
   snapshotCalls = 0;
@@ -69,17 +70,97 @@ async function waitForTask(taskId: string) {
   throw new Error(`task ${taskId} did not finish`);
 }
 
+function apiAnalysisFixture(): AnalysisData {
+  return {
+    timestamp: '2026-07-22 15:00:00',
+    indices: [],
+    sentiment: { total_blocks: 12, total_limit_up: 12, sentiment: 'cold' },
+    blocks: Array.from({ length: 12 }, (_, index) => ({
+      code: String(880000 + index),
+      name: `测试板块${index + 1}`,
+      block_info: { limit_up_num: 1, change: index / 10, max_continue: 1 },
+      trend: { state_id: 1, state_name: '主线主升', trend: '上升趋势' },
+      strategy: { action: 'accumulate' as const, label: '趋势跟踪', position: '5-7成' },
+      stock_list: [{
+        code: String(600001 + index).padStart(6, '0'),
+        name: `测试股票${index + 1}`,
+        continue_num: 1,
+        reason_type: 'block_top 测试记录',
+      }],
+    })),
+  };
+}
+
+function apiRankingFixture(): RankingRow[] {
+  const identities = [
+    ['600001', '历史样本甲'],
+    ['000002', '历史样本乙'],
+    ['300003', '历史样本丙'],
+    ['600004', '历史样本丁'],
+    ['000779', '甘咨询'],
+    ['600006', '测试股票六'],
+    ['600007', '测试股票七'],
+    ['600008', '测试股票八'],
+    ['600009', '测试股票九'],
+    ['600010', '测试股票十'],
+  ];
+  return identities.map(([stock_code, stock_name], index) => ({
+    rank: index + 1,
+    stock_code,
+    stock_name,
+    total_score: 80 - index,
+    trend_score: 35 - index / 2,
+    volume_price_score: 20,
+    position_score: 15,
+    volatility_trend_score: 8,
+    alignment: 'bullish',
+    strategy_action: 'accumulate',
+    strategy_label: '趋势跟踪',
+    strategy_position: '5-7成',
+    latest_price: 10 + index,
+    latest_change_rate: 1,
+    sector_code: '880000',
+    sector_name: '测试板块1',
+    sector_trend_state_id: 1,
+  }));
+}
+
+function archivedBacktestFixture(): BacktestResult {
+  return {
+    run_id: '20260718_235624',
+    timestamp: '2026-07-18 23:56:24',
+    date_range: '20260701 → 20260718',
+    max_hold_days: 5,
+    summary: {
+      initial_capital: 100_000,
+      final_capital: 100_000,
+      total_return: 0,
+      total_return_pct: 0,
+      total_trades: 0,
+      buy_count: 0,
+      sell_count: 0,
+      win_count: 0,
+      win_rate: 0,
+      expire_count: 0,
+      max_holdings: 0,
+    },
+    config: {},
+    trades: [],
+  };
+}
+
 beforeAll(async () => {
   root = await mkdtemp(path.join(os.tmpdir(), 'trending-polars-test-'));
-  await mkdir(path.join(root, 'backtests'), { recursive: true });
-  await mkdir(path.join(root, 'runtime'), { recursive: true });
-  await copyFile(path.join(DEFAULT_DATA_DIR, 'analysis.json'), path.join(root, 'analysis.json'));
-  await copyFile(path.join(DEFAULT_DATA_DIR, 'ranking.json'), path.join(root, 'ranking.json'));
-  for (const file of await readdir(path.join(DEFAULT_DATA_DIR, 'backtests'))) {
-    await copyFile(path.join(DEFAULT_DATA_DIR, 'backtests', file), path.join(root, 'backtests', file));
-  }
-  const store = new DataStore(root);
+  store = new DataStore(root);
+  await store.saveAnalysis(apiAnalysisFixture(), '20260722');
+  await store.saveRanking({
+    timestamp: '2026-07-22 15:05:00',
+    date: '20260722',
+    total_stocks: 10,
+    rankings: apiRankingFixture(),
+  });
   await store.saveHistoricalMarket(historicalFixture());
+  await store.saveBacktest(archivedBacktestFixture());
   simulatedBroker = new FakeSimulatedBroker();
   const built = createApp({
     store,
@@ -92,6 +173,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  store.close();
   await rm(root, { recursive: true, force: true });
 });
 
@@ -99,6 +181,14 @@ describe('Trending Polars API', () => {
   it('exposes health and enriched analysis data', async () => {
     const health = await http.get('/api/health').expect(200);
     expect(health.body.stack).toContain('nodejs-polars');
+    expect(health.body.storage).toMatchObject({
+      journal_mode: 'wal',
+      foreign_keys: true,
+      busy_timeout_ms: 5000,
+      synchronous: 'normal',
+      schema_version: 14,
+      tables: expect.arrayContaining(['limit_up_record', 'stock_daily_price', 'ranking_factor']),
+    });
     const analysis = await http.get('/api/analysis').expect(200);
     expect(analysis.body.blocks.length).toBeGreaterThan(10);
     expect(analysis.body.stats).toMatchObject({ valid_blocks: expect.any(Number) });
@@ -117,6 +207,17 @@ describe('Trending Polars API', () => {
     expect(task.status).toBe('completed');
     const ranking = await http.get('/api/ranking?page_size=5').expect(200);
     expect(ranking.body.rankings).toHaveLength(5);
+  });
+
+  it('does not create block_top facts during an aggregate-only analysis refresh', async () => {
+    const before = await store.loadAllLimitUpCodes();
+    const started = await http.get('/api/analysis?refresh=1').expect(202);
+    const task = await waitForTask(started.body.task_id);
+    expect(task.status).toBe('completed');
+    expect(await store.loadAllLimitUpCodes()).toEqual(before);
+    const latest = await http.get('/api/limit_up').expect(200);
+    expect(latest.body.map((record: { stock_code: string }) => record.stock_code).sort())
+      .toEqual(before.map((record) => record.stock_code).sort());
   });
 
   it('runs a Polars-backed backtest and exposes its ledger', async () => {
@@ -178,7 +279,32 @@ describe('Trending Polars API', () => {
     }
   });
 
-  it('deletes a backtest through the runtime tombstone without touching the seed contract', async () => {
+  it('falls back to persisted SQLite prices when every network source fails', async () => {
+    await store.upsertIndexPrices('sh000300', '沪深300', [{
+      date: '20260722',
+      open: 4000,
+      close: 4050,
+      high: 4060,
+      low: 3990,
+      volume: 10_000,
+      amount: 40_500_000,
+      changeRate: 1.25,
+    }]);
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 503 }));
+    try {
+      const index = await http.get('/api/index_prices?symbol=sh000300&limit=5').expect(200);
+      expect(index.headers['x-market-data-source']).toBe('sqlite');
+      expect(index.body).toEqual([expect.objectContaining({ close: 4050 })]);
+
+      const stock = await http.get('/api/stock_prices?stock_code=600001&limit=5').expect(200);
+      expect(stock.headers['x-market-data-source']).toBe('sqlite');
+      expect(stock.body).toHaveLength(5);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('deletes a JSON-archived backtest without touching SQLite market data', async () => {
     const runId = '20260718_235624';
     const deleted = await http.delete(`/api/backtest/${runId}`).expect(200);
     expect(deleted.body.success).toBe(true);

@@ -69,6 +69,8 @@ export interface SentimentData {
 
 export interface AnalysisData {
   timestamp: string;
+  /** block_top / sector trend facts belong to this YYYYMMDD trading date. */
+  source_date?: string;
   indices: IndexAnalysis[];
   blocks: BlockAnalysis[];
   sentiment: SentimentData;

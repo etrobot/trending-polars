@@ -19,6 +19,17 @@ export interface HistoricalStockSeries {
   bars: HistoricalBar[];
 }
 
+export interface HistoricalIndexSeries {
+  symbol: string;
+  index_name: string;
+  bars: HistoricalBar[];
+}
+
+export interface HistoricalLimitUpRecord {
+  date: string;
+  stock_code: string;
+}
+
 export interface HistoricalMarketData {
   schema_version: 1;
   source: 'eastmoney-unadjusted' | 'multi-source-qfq';
@@ -29,6 +40,9 @@ export interface HistoricalMarketData {
   warmup_days: number;
   calendar: string[];
   stocks: HistoricalStockSeries[];
+  indices?: HistoricalIndexSeries[];
+  /** 同花顺 block_top 的权威涨停事实；不得从日涨幅反推。 */
+  limit_up_records?: HistoricalLimitUpRecord[];
   failed_stocks: number;
 }
 
@@ -664,6 +678,7 @@ export async function collectHistoricalMarketData(
     warmup_days: WARMUP_DAYS,
     calendar,
     stocks: stocks.sort((left, right) => left.stock_code.localeCompare(right.stock_code)),
+    indices: [{ symbol: 'sh000001', index_name: '上证指数', bars: calendarBars }],
     failed_stocks: failedStocks,
   };
   await audit.info('market_data', 'collection_completed', {

@@ -41,27 +41,6 @@ function analysisWithStats(data: AnalysisData): AnalysisData {
   return { ...enriched, timestamp: data.timestamp };
 }
 
-function flattenLimitUp(data: AnalysisData, date: string) {
-  const seen = new Set<string>();
-  return data.blocks.flatMap((block) => block.stock_list.map((stock) => ({
-    date,
-    stock_code: stock.code,
-    stock_name: stock.name,
-    sector_code: block.code,
-    sector_name: block.name,
-    continue_num: stock.continue_num ?? 1,
-    reason_type: stock.reason_type ?? '',
-    sector_change: block.block_info.change,
-    latest: stock.latest ?? null,
-    change_rate: stock.change_rate ?? null,
-  }))).filter((item) => {
-    const key = `${item.stock_code}:${item.sector_code}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
 function buildBlockAnalysis(
   block: BlockTopData,
   daily: KLineData[],
@@ -180,6 +159,24 @@ function averageHistoricalChange(history: HistoricalMarketData, date: string): n
   return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : undefined;
 }
 
+const INDEX_NAMES: Record<string, string> = {
+  sh000001: '上证指数',
+  sz399001: '深证成指',
+  sz399006: '创业板指',
+  sh000688: '科创50',
+  sh000300: '沪深300',
+  sh000905: '中证500',
+  sz399997: '中证白酒',
+  sh000933: '中证医药',
+  sz399975: '证券公司',
+  sz980017: '国证芯片',
+  sz399967: '中证军工',
+};
+
+function indexName(symbol: string): string {
+  return INDEX_NAMES[symbol] ?? symbol;
+}
+
 export interface AppServices {
   store: DataStore;
   tasks: TaskRegistry;
@@ -215,10 +212,12 @@ export function createApp(services: Partial<AppServices> = {}) {
         });
         if (!history) throw new Error('收盘历史行情准备失败');
         await store.saveHistoricalMarket(history);
+        history = await store.getHistoricalMarket() ?? history;
         await audit.info('market_data', 'snapshot_saved', {
           traceId,
           data: {
-            path: path.join(store.runtime, 'historical-market.json'),
+            database: store.databasePath,
+            tables: ['stock_daily_price', 'index_daily_price', 'historical_snapshot'],
             as_of_date: history.as_of_date,
             stocks: history.stocks.length,
             failed_stocks: history.failed_stocks,
@@ -243,12 +242,16 @@ export function createApp(services: Partial<AppServices> = {}) {
         },
       });
     }
+    const limitUpDates = [...new Set([strategyDate.replaceAll('-', '').slice(0, 8), compactDate().slice(0, 8)])];
+    const limitUpRecords = (await Promise.all(limitUpDates.map((item) => store.getLimitUpByDate(item))))
+      .flatMap((records) => records.map((record) => ({ date: record.date, stock_code: record.stock_code })));
     return {
       analysis: analysisWithStats(analysis),
       rankingDate: strategyDate,
       rankings: strategyRankings,
       calendar: history?.calendar ?? [],
       marketAverageChange,
+      limitUpRecords,
     };
   };
   const paper = services.paper ?? new PaperTradingService(new ThsSimulatedBroker({ audit }), {
@@ -287,7 +290,8 @@ export function createApp(services: Partial<AppServices> = {}) {
     response.json({
       ok: true,
       service: 'trending-polars',
-      stack: ['React', 'Tailwind CSS', 'Express', 'nodejs-polars'],
+      stack: ['React', 'Tailwind CSS', 'Express', 'nodejs-polars', 'node:sqlite'],
+      storage: store.getStorageStatus(),
       timestamp: formatDateTime(),
     });
   });
@@ -308,7 +312,7 @@ export function createApp(services: Partial<AppServices> = {}) {
           data: { source_timestamp: current.timestamp, result: refreshed },
         });
         progress(82, '重算市场宽度指标');
-        await store.saveAnalysis(refreshed);
+        await store.saveAnalysisCache(refreshed);
         await sleep(100);
         return refreshed;
       });
@@ -338,7 +342,7 @@ export function createApp(services: Partial<AppServices> = {}) {
         throw new Error('同花顺涨停板块数据不可用（可能被反爬拦截），已保留现有分析快照');
       }
       progress(92, '重算市场情绪与宽度');
-      await store.saveAnalysis(collected.analysis);
+      await store.saveAnalysis(collected.analysis, date);
       await audit.info('market_analysis', 'limit_up_collected', {
         traceId,
         data: {
@@ -361,9 +365,8 @@ export function createApp(services: Partial<AppServices> = {}) {
   }));
 
   app.get('/api/limit_up', asyncHandler(async (request, response) => {
-    const analysis = await store.getAnalysis();
-    const date = String(request.query.date || analysis.timestamp.slice(0, 10).replaceAll('-', ''));
-    response.json(flattenLimitUp(analysis, date));
+    const date = String(request.query.date || await store.getLatestAnalysisDate() || compactDate().slice(0, 8));
+    response.json(await store.getLimitUpByDate(date));
   }));
 
   app.get('/api/klines', asyncHandler(async (request, response) => {
@@ -374,8 +377,16 @@ export function createApp(services: Partial<AppServices> = {}) {
     }
     const limit = numberParam(request.query.limit, 120, 1, 1000);
     const marketData = await fetchAdjustedKlines(symbol, limit);
-    response.setHeader('x-market-data-source', marketData.source);
-    response.json({ symbol, klines: marketData.klines, count: marketData.klines.length, source: marketData.source });
+    let source: string = marketData.source;
+    let klines = marketData.klines;
+    if (klines.length) {
+      await store.upsertIndexPrices(symbol, indexName(symbol), klines);
+    } else {
+      klines = await store.getIndexPrices(symbol, limit);
+      if (klines.length) source = 'sqlite';
+    }
+    response.setHeader('x-market-data-source', source);
+    response.json({ symbol, klines, count: klines.length, source });
   }));
 
   app.get('/api/stock_prices', asyncHandler(async (request, response) => {
@@ -390,8 +401,16 @@ export function createApp(services: Partial<AppServices> = {}) {
       ? stockCode
       : `${/^(6|68|5|9)/.test(code) ? 'sh' : 'sz'}${code}`;
     const marketData = await fetchAdjustedKlines(symbol, limit);
-    response.setHeader('x-market-data-source', marketData.source);
-    response.json(priceRows(marketData.klines));
+    let source: string = marketData.source;
+    let klines = marketData.klines;
+    if (klines.length) {
+      await store.upsertStockPrices(code, await store.getStockName(code) ?? code, klines);
+    } else {
+      klines = await store.getStockPrices(code, limit);
+      if (klines.length) source = 'sqlite';
+    }
+    response.setHeader('x-market-data-source', source);
+    response.json(priceRows(klines));
   }));
 
   app.get('/api/index_prices', asyncHandler(async (request, response) => {
@@ -407,8 +426,16 @@ export function createApp(services: Partial<AppServices> = {}) {
       : `${/^(399|980)/.test(code) ? 'sz' : 'sh'}${code}`;
     const limit = numberParam(request.query.limit, 120, 1, 1000);
     const marketData = await fetchAdjustedKlines(symbol, limit);
-    response.setHeader('x-market-data-source', marketData.source);
-    response.json(priceRows(marketData.klines));
+    let source: string = marketData.source;
+    let klines = marketData.klines;
+    if (klines.length) {
+      await store.upsertIndexPrices(symbol, indexName(symbol), klines);
+    } else {
+      klines = await store.getIndexPrices(symbol, limit);
+      if (klines.length) source = 'sqlite';
+    }
+    response.setHeader('x-market-data-source', source);
+    response.json(priceRows(klines));
   }));
 
   app.get('/api/block_prices', asyncHandler(async (request, response) => {
@@ -464,7 +491,8 @@ export function createApp(services: Partial<AppServices> = {}) {
           ranking_date: computed.date,
           total_stocks: computed.total_stocks,
           top_rankings: computed.rankings.slice(0, 50),
-          output_path: path.join(store.runtime, 'ranking.json'),
+          database: store.databasePath,
+          tables: ['ranking_factor', 'stock_ranking'],
         },
       });
       await sleep(120);
@@ -510,7 +538,12 @@ export function createApp(services: Partial<AppServices> = {}) {
       await store.saveHistoricalMarket(history);
       await audit.info('market_data', 'snapshot_saved', {
         traceId,
-        data: { path: path.join(store.runtime, 'historical-market.json'), as_of_date: history.as_of_date, stocks: history.stocks.length },
+        data: {
+          database: store.databasePath,
+          tables: ['stock_daily_price', 'index_daily_price', 'historical_snapshot'],
+          as_of_date: history.as_of_date,
+          stocks: history.stocks.length,
+        },
       });
       return {
         days,
@@ -548,6 +581,7 @@ export function createApp(services: Partial<AppServices> = {}) {
         });
         if (!history || cancelled()) return null;
         await store.saveHistoricalMarket(history);
+        history = await store.getHistoricalMarket() ?? history;
       } else {
         progress(18, '载入已缓存的真实历史日线');
       }
@@ -619,8 +653,10 @@ export function createApp(services: Partial<AppServices> = {}) {
     // 随后的 overview 请求再在浏览器后台完成实时账户同步。
     const [analysis, ranking] = await Promise.all([store.getAnalysis(), store.getRanking()]);
     const marketAverageChange = averageRankingChange(ranking.rankings);
+    const limitUpRecords = (await store.getLimitUpByDate(ranking.date))
+      .map((record) => ({ date: record.date, stock_code: record.stock_code }));
     const [overview, automation] = await Promise.all([
-      paper.cachedOverview(analysisWithStats(analysis), ranking.date, ranking.rankings, [], traceId, marketAverageChange),
+      paper.cachedOverview(analysisWithStats(analysis), ranking.date, ranking.rankings, [], traceId, marketAverageChange, limitUpRecords),
       paper.getAutomation(),
     ]);
     response.json({ overview, automation: automation.automation });
@@ -636,6 +672,7 @@ export function createApp(services: Partial<AppServices> = {}) {
       context.calendar,
       traceId,
       context.marketAverageChange,
+      context.limitUpRecords,
     ));
   }));
 

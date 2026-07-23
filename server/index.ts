@@ -38,7 +38,10 @@ paperSockets.on('connection', (socket) => {
 });
 
 services.paper.startScheduler();
-server.on('close', () => services.paper.stopScheduler());
+server.on('close', () => {
+  services.paper.stopScheduler();
+  services.store.close();
+});
 
 server.listen(port, host, () => {
   console.log(`Trending Polars API listening on http://${host}:${port}`);

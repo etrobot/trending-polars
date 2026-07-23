@@ -36,7 +36,7 @@
 
 **核心逻辑**：指数定仓位 → 情绪定买卖 → 个股定标的 → 回测定参数 → 计划定执行
 
-**技术栈**：TypeScript + Node.js 20+ · Express 5 · React 19 · Tailwind CSS 4 · nodejs-polars · WebSocket (ws) · AppleScript 桥接
+**技术栈**：TypeScript + Node.js 22.13+ · Express 5 · React 19 · Tailwind CSS 4 · nodejs-polars · `node:sqlite` · WebSocket (ws) · AppleScript 桥接
 
 ---
 
@@ -47,6 +47,10 @@
 **接口**：`fetchBlockTop(date?) → { blocks: BlockTopData[], source: BlockTopSource }`
 
 采集同花顺 `dataapi/limit_up/block_top` 涨停板块排行。网络失败/被反爬拦截时优雅返回空数组（`source='none'`），由调用方回退到预生成 `analysis.json`。
+
+> **涨停事实唯一来源**：只有 `block_top.stock_list` 中出现并写入 `limit_up_record` 的 `(date, stock_code)` 才视为涨停。项目不会根据日涨幅、证券板块规则或理论涨停价反推涨停；缺少 `block_top` 记录时状态为未知，不做补判。
+
+`GET /api/analysis?refresh=1` 仅刷新 JSON 中的聚合统计与指数缓存，不会创建或改写涨停事实；只有成功完成 `POST /api/analysis/collect` 后才批量写入对应交易日的 `limit_up_record`。
 
 **解析**：`parseBlockTop(payload) → BlockTopData[]`，兼容 `code`/`block_code`、`stock_list`/`stocks` 等字段别名。
 
@@ -73,7 +77,7 @@
 | `latest` | number\|null | 最新价 |
 | `is_st` | bool | 是否 ST |
 
-**数据流向**：`fetchBlockTop()` → `collectLimitUpAnalysis()`（app.ts）→ 板块 K 线采集 → 趋势分类 → 持久化到 `analysis.json`
+**数据流向**：`fetchBlockTop()` → `collectLimitUpAnalysis()`（app.ts）→ 板块 K 线采集 → 趋势分类 → 批量写入 SQLite 的 `stock_info` / `sector_info` / `limit_up_record` / `sector_trend_daily`，同时刷新 `analysis.json` 缓存
 
 ### 2.2 板块 K 线行情 —— `server/historical-market.ts`
 
@@ -130,7 +134,7 @@
 - `parseSinaKlines(rows, factors, limit) → KLineData[]` — 新浪 + 复权因子自行前复权
 - `parseEastmoneyAdjustedKlines(lines) → KLineData[]` — 东方财富前复权 CSV
 
-**数据流向**：`fetchAdjustedKlines()` → `collectHistoricalMarketData()` → `historical-market.json`
+**数据流向**：`fetchAdjustedKlines()` → `collectHistoricalMarketData()` → 单事务批量 upsert 到 SQLite 的 `stock_daily_price`，快照范围写入 `historical_snapshot`
 
 ### 2.5 中证指数行情 —— `server/historical-market.ts`
 
@@ -154,7 +158,7 @@
 | 国证芯片 | `sz980017` | 科技 |
 | 中证军工 | `sz399967` | 军工 |
 
-**数据流向**：`fetchAdjustedKlines()` → `index_daily_price` → `analysis.json`（外部预生成），或 `classifyMarketState()` 本地分类
+**数据流向**：`fetchAdjustedKlines()` → SQLite `index_daily_price`（网络失败时可从库内回退）→ `analysis.json` 指数状态缓存，或 `classifyMarketState()` 本地分类
 
 ---
 
@@ -325,7 +329,7 @@ Phase 2: 四维评分计算（scoreStock()）
 
 #### 维度 4：波动率-趋势适配评分（15 分）
 
-**波动率分类**（`volatilityClassOf()`）：`high`（≥3次涨停/20日） / `medium`（1-2次） / `low`（0次）
+**波动率分类**（`volatilityClassOf()`）：从最近 20 个交易日的 `limit_up_record` 精确计数，`high`（≥3次） / `medium`（1-2次） / `low`（0次）。K 线涨跌幅不参与涨停识别。
 
 **交叉评分矩阵**（`volatilityTrendScore()`）：
 
@@ -350,7 +354,7 @@ Phase 2: 四维评分计算（scoreStock()）
 
 ### 4.4 因子存储架构
 
-**当前实现**：扁平 JSON 文件 `server/data/ranking.json`，每条记录为 `RankingRow` 对象。
+**当前实现**：SQLite `ranking_factor` 是因子主表，使用 `(date, stock_code, factor_name)` 复合主键；`stock_ranking` 保存固定字段作为向下兼容冗余表；`server/data/runtime/ranking.json` 仅保留最新排行榜缓存。
 
 | 字段 | 说明 | 类型 | 分值 |
 |------|------|------|------|
@@ -373,7 +377,7 @@ Phase 2: 四维评分计算（scoreStock()）
 | `latest_price` | 最新价 | numeric | — |
 | `latest_change_rate` | 最新涨跌幅% | numeric | — |
 
-> 🚧 **设计改进**：KV 存储 `ranking_factor(date, stock_code, factor_name) → val_numeric / val_text` 未实现。当前为扁平 JSON 结构，不支持按因子名查询历史。
+写入时在一个事务内完成股票/板块基础信息、KV 因子和冗余排行表的批量写入。读取优先从 `ranking_factor` 重建结果，按 `total_score` 动态排名；若因子表为空才降级读取 `stock_ranking`。旧版 `ranking.json` 会在数据库为空时自动导入一次。
 
 ---
 
@@ -389,7 +393,7 @@ Phase 2: 四维评分计算（scoreStock()）
 1. 并发采集历史日线（Semaphore 12 → 24）
    ├─ 获取交易日历（sh000001 日线作为基准）
    └─ 并发拉取每只股票 60+70 天真实日线（多源降级链路）
-   → 持久化到 historical-market.json
+   → 单事务持久化到 stock_daily_price / index_daily_price / historical_snapshot
 
 2. 覆盖检查
    ├─ 每只股票至少 20 条 K 线
@@ -428,7 +432,7 @@ for each date in 交易日:
   │
   ├─ 步骤2: 执行买入信号
   │     ├─ 取当日候选（前一交易日收盘信号，由 scoreStock() 生成）
-  │     ├─ 检查涨停价可成交性（limitUpPrice()）
+  │     ├─ 检查执行日是否存在 block_top 涨停记录
   │     └─ 以开盘价买入（含滑点、佣金）
   │
   ├─ 步骤3: 检查持仓生成卖出信号
@@ -449,19 +453,9 @@ for each date in 交易日:
 ```
 始终以次日开盘价成交（简化实现）
 
-检查是否触及涨停价：
-  - 60/00 开头 → 10% 涨停
-  - 30/68 开头 → 20% 涨停
-  - 8/4 开头（北交所）→ 30% 涨停
-  触及涨停 → 无法成交，跳过
-```
-
-**A 股涨停价计算**（`limitUpPrice()`，`trading-strategy.ts`）：
-
-```
-涨停价 = round(prev_close × (1 + 涨停比例), 2)
-（四舍五入到分）
-ST 股票涨停比例 5%
+检查执行日 `(date, stock_code)` 是否存在于 SQLite `limit_up_record`：
+  - 存在 → block_top 已确认涨停，无法买入，跳过
+  - 不存在 → 不以开盘涨幅或理论价格补判，继续按正常成交规则处理
 ```
 
 ### 5.3 回测输出
@@ -511,9 +505,9 @@ ST 股票涨停比例 5%
 | 数据 | 来源 | 用途 |
 |------|------|------|
 | 缓存分析结果 | `server/data/runtime/analysis.json` | 指数仓位建议 |
-| 排行榜 | `server/data/runtime/ranking.json` | 选股标的 |
+| 排行榜 | `server/data/trending.db`：`ranking_factor` + `stock_ranking` | 选股标的；`runtime/ranking.json` 仅作最新缓存 |
 | 市场情绪 | `analysis.json` 中的 sentiment | 买卖门控 |
-| 历史行情快照 | `server/data/runtime/historical-market.json` | 收盘决策时重排行（`historicalStrategyCandidates()`） |
+| 历史行情快照 | `server/data/trending.db`：`stock_daily_price` + `index_daily_price` + `historical_snapshot` | 收盘决策时重排行（`historicalStrategyCandidates()`） |
 
 **大盘指数仓位映射**（`assessMarketTiming()` 在 `paper-trading.ts`）：
 
@@ -558,7 +552,7 @@ PaperMarketContext
   │     ├─ 情绪门控: cold 情绪 → 不买入
   │     ├─ 仓位门控: 当前持仓数 ≥ 目标 → 不买入
   │     ├─ 排行榜取前 N 名（maxCandidates=5）
-  │     ├─ 过滤: 已持仓/涨停中/已清仓/不满足条件
+  │     ├─ 过滤: 已持仓/block_top 确认涨停/已清仓/不满足条件
   │     ├─ 市场强 → 开盘买（window=open）
   │     └─ 市场弱 → 临收盘买（window=near_close）
   │
@@ -605,8 +599,6 @@ T1StrategyConfig {
 - `rankEntryCandidates(rows, excludedCodes, limit)` — 过滤 `accumulate`/`trade` 策略，按总分排序取前 N
 - `calculateEntrySize(cash, referenceCapital, price, config)` — 计算仓位股数（含佣金）
 - `exitSignalReason(pnlPct, holdDays, config)` — 止损/止盈/到期判断
-- `limitUpRate(code, name)` — 自适应涨停幅度（ST 5%/创业板科创板 20%/北交所 30%/主板 10%）
-- `limitUpPrice(prevClose, code, name)` — 涨停价计算
 - `tradingDayDistance(fromDate, toDate, calendar)` — 交易日天数（含交易日历和周末回退）
 
 ---
@@ -892,22 +884,19 @@ paperSockets: 连接时发送 { type: "status", connected: true }，后续事件
                                               ▲
                                               │ 读写
                    ┌─────────────────────────────────────────────────────────────────────┐
-                   │                       数据持久层 (JSON 文件)                        │
+                   │                    数据持久层 (SQLite + JSON)                      │
                    │  ┌──────────────────────────────────────────────────────────────┐   │
-                   │  │  server/data/  (基础数据目录)                                │   │
-                   │  │  analysis.json  ranking.json                                │   │
-                   │  │  backtests/*.json                                           │   │
+                   │  │  server/data/trending.db  (`node:sqlite`, WAL)               │   │
+                   │  │  股票/板块/涨停/行情/趋势/排行榜因子                         │   │
+                   │  │  ranking_factor 主表 + stock_ranking 兼容表                  │   │
                    │  └──────────────────────────────────────────────────────────────┘   │
                    │                                                                     │
                    │  ┌──────────────────────────────────────────────────────────────┐   │
-                   │  │  server/data/runtime/  (运行时数据目录)                       │   │
-                   │  │  analysis.json  (运行时副本)                                  │   │
-                   │  │  ranking.json   (运行时副本)                                  │   │
-                   │  │  historical-market.json  (历史行情快照)                        │   │
-                   │  │  paper-trading-state.json  (自动化状态)                        │   │
-                   │  │  backtests/*.json  (回测结果)                                  │   │
-                   │  │  logs/quant-audit-*.jsonl  (审计日志)                           │   │
-                   │  │  deleted-backtests.json  (回测删除墓碑)                         │   │
+                   │  │  JSON 缓存与归档                                              │   │
+                   │  │  analysis.json / runtime/ranking.json                        │   │
+                   │  │  runtime/paper-trading-state.json                            │   │
+                   │  │  backtests/*.json / runtime/backtests/*.json                 │   │
+                   │  │  runtime/logs/*.jsonl / deleted-backtests.json               │   │
                    │  └──────────────────────────────────────────────────────────────┘   │
                    └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -938,7 +927,22 @@ npm test             # 运行测试
 npm run test:watch   # 监听模式测试
 ```
 
-### 11.2 API 端点
+要求 Node.js `>=22.13.0`。`server/data/` 整体在 `.gitignore` 中，仓库不再携带任何市场数据、账户状态或回测结果。首次创建 `DataStore` 时会自动建立 `server/data/trending.db`、启用 WAL/外键并幂等执行 v1.4 表结构；没有外部数据时 API 返回空快照，随后可通过采集接口填充。若用户自行放入旧版 `ranking.json` / `historical-market.json`，仍会兼容导入。
+
+### 11.2 SQLite 运维
+
+```bash
+# 查看表与索引
+sqlite3 server/data/trending.db '.tables'
+sqlite3 server/data/trending.db 'PRAGMA journal_mode; PRAGMA foreign_keys; PRAGMA user_version;'
+
+# 在线安全备份（推荐）
+sqlite3 server/data/trending.db ".backup 'server/data/trending.db.backup'"
+```
+
+`GET /api/health` 的 `storage` 字段同时返回数据库路径、WAL 状态、外键状态、`busy_timeout`、同步级别、schema version 和表清单。
+
+### 11.3 API 端点
 
 ```bash
 # ==== 健康检查 ====
@@ -1005,11 +1009,12 @@ ws://localhost:8787/ws/simulated-trading  # 模拟交易状态推送
 |------|------|------|
 | API 路由 | `server/app.ts` | Express 路由、中间件、服务组合、涨停采集流水线 |
 | 服务入口 | `server/index.ts` | HTTP + WebSocket 服务器启动 |
-| 数据存储 | `server/data-store.ts` | JSON 文件读写、运行时覆盖层 |
+| 混合数据存储 | `server/data-store.ts` | SQLite 门面、旧 JSON 种子迁移、缓存/状态/回测归档 |
+| SQLite 仓储 | `server/sqlite-store.ts` | `node:sqlite` 建表迁移、WAL、事务批量 upsert、结构化查询 |
 | 行情采集 | `server/historical-market.ts` | 多源 K 线、板块 K 线、涨停排行采集 |
 | 评分引擎 | `server/scoring-engine.ts` | 四维多因子评分、七态市场分类、板块趋势分析、策略矩阵 |
 | 排行榜查询 | `server/polars-engine.ts` | 排行榜查询/排序/筛选、情绪聚合、重算 |
-| 交易策略 | `server/trading-strategy.ts` | 参数配置、选股过滤、仓位计算、止盈止损、涨停价计算 |
+| 交易策略 | `server/trading-strategy.ts` | 参数配置、选股过滤、仓位计算、止盈止损；不负责涨停判定 |
 | 回测引擎 | `server/backtest-engine.ts` | 历史回测、日内循环、评分驱动 |
 | 模拟交易 | `server/paper-trading.ts` | 交易计划、执行、调度、监控 |
 | 同花顺桥接 | `server/ths-simulated-broker.ts` | AppleScript 调用、持仓解析 |
@@ -1052,8 +1057,9 @@ const closes = bars.slice(0, barIndex + 1).map((bar) => bar.close);
 
 | 层级 | 数据 | 有效期 |
 |------|------|--------|
-| 基础目录 | `analysis.json` / `ranking.json` | 持久化，外部导入 |
-| 运行时目录 | 运行时副本、历史快照 | 持久化，可覆盖 |
+| SQLite | 股票/板块/涨停/日行情/板块趋势/排行因子 | 结构化持久化，数据库为准 |
+| 基础目录 | `analysis.json` / `ranking.json` | 首次启动兼容导入种子 |
+| 运行时缓存 | `analysis.json` / `ranking.json` | 最新计算结果缓存，可重建 |
 | 状态文件 | 自动化状态、交易日志 | 持久化，跨重启 |
 | 内存字典 | 回测预加载 | 回测期间 |
 
@@ -1098,7 +1104,9 @@ const closes = bars.slice(0, barIndex + 1).map((bar) => bar.close);
 | 问题 | 可能原因 | 解决方案 |
 |------|---------|---------|
 | 分析数据为空 | 未导入 `analysis.json` | 将预生成文件放入 `server/data/`，或调用 `POST /api/analysis/collect` 采集 |
-| 排行榜为空 | 未导入 `ranking.json` | 将排行文件放入 `server/data/`，或调用 `POST /api/ranking/compute` |
+| 排行榜为空 | SQLite 尚无排行且未提供兼容种子 | 将 `ranking.json` 放入 `server/data/` 触发首次导入，或调用 `POST /api/ranking/compute` |
+| SQLite 无法启动 | Node 版本过低 | 升级到 Node.js 22.13+；项目直接使用内置 `node:sqlite`，不需要安装原生依赖 |
+| 行情接口网络失败 | 腾讯/新浪/东方财富暂时不可用 | 已落库的个股/指数 K 线会自动从 `stock_daily_price` / `index_daily_price` 回退 |
 | 同花顺 AppleScript 失败 | 未打开模拟练习窗口 | 打开同花顺 → 模拟练习 |
 | 委托回查失败 | 界面未更新 / 弹窗遮挡 | 检查同花顺界面状态 |
 | 自动化调度不执行 | 未启用 | 前端调用 `POST /api/simulated-trading/automation/toggle` |
@@ -1112,24 +1120,24 @@ const closes = bars.slice(0, barIndex + 1).map((bar) => bar.close);
 
 | 维度 | Python 版 | TypeScript 版 |
 |------|-----------|---------------|
-| 语言 | Python 3.12+ | TypeScript 5+ / Node.js 20+ |
+| 语言 | Python 3.12+ | TypeScript 5+ / Node.js 22.13+ |
 | 数据采集 | 同花顺涨停排行主动采集 | ✅ 板块 K 线 ✅ 个股行情 ✅ 涨停排行（`fetchBlockTop()`） |
 | 涨停采集 | 本地实现 | ✅ `fetchBlockTop()` + `parseBlockTop()` 实时采集，Network fallback 到预生成数据 |
 | 趋势分析 | 本地计算七种状态分类 | ✅ `classifyMarketState()` 本地计算（`scoring-engine.ts`） |
 | 板块趋势 | 本地计算 | ✅ `analyzeBlockTrend()` 本地计算 + 周/月线交叉验证 |
-| 数据存储 | SQLite + CSV | JSON 文件（扁平结构） |
-| 排行榜 | 两阶段计算 + KV 存储 | 单阶段重算 + 扁平 JSON；核心评分引擎 `scoring-engine.ts` 支持回测与实时双路径 |
+| 数据存储 | SQLite + CSV | ✅ 内置 `node:sqlite` + JSON 缓存/归档；WAL、外键、批量事务 |
+| 排行榜 | 两阶段计算 + KV 存储 | ✅ `ranking_factor` KV 主表 + `stock_ranking` 兼容表；核心评分引擎支持回测与实时双路径 |
 | 评分架构 | 内联在回测中 | ✅ 独立 `scoring-engine.ts`，回测（`scoreStock()`）和实时路径共享同一份评分逻辑 |
 | 价量评分 | 简单规则 | ✅ 14 种精细分类（`volumePriceScore()`） |
 | 波动率-趋势矩阵 | 固定 8 分 | ✅ 完整 3×3 交叉评分矩阵（`volatilityTrendScore()`） |
 | 板块加分 | 无 | ✅ `scoreStock()` 支持 `SectorContext` 传入，趋势评分加/减 ±4 分 |
 | 回测 | 按市场强弱决定开盘/收盘买 | 始终开盘买（简化），使用 `scoreStock()` 统一评分 |
-| 停牌处理 | 跳过 | ✅ 开盘价≤0 或涨停价不可成交时跳过 |
-| 交易策略 | 内联 | ✅ 独立 `trading-strategy.ts`：`rankEntryCandidates()` / `calculateEntrySize()` / `exitSignalReason()` / `limitUpPrice()` |
+| 停牌处理 | 跳过 | ✅ 开盘价≤0 时跳过；涨停只按 block_top 记录过滤 |
+| 交易策略 | 内联 | ✅ 独立 `trading-strategy.ts`：`rankEntryCandidates()` / `calculateEntrySize()` / `exitSignalReason()` |
 | Web 框架 | Flask | Express 5 |
 | 前端 | Jinja2 模板 | React 19 + Tailwind CSS |
 | 实时推送 | 无 | ✅ WebSocket 双通道（`/ws/tasks` + `/ws/simulated-trading`） |
 | 任务管理 | 无 | ✅ 异步任务注册 + 进度追踪 + WebSocket 广播 |
 | 审计日志 | 无 | ✅ JSONL 结构化审计（`audit-log.ts`） |
 | 复权处理 | 外部数据源 pre-QFQ | 腾讯 qfqday / 新浪自行复权 / 东方财富前复权 |
-| 涨停幅度 | 固定 10% | ✅ 自适应：ST 5% / 创业板科创板 20% / 北交所 30% / 主板 10% |
+| 涨停判定 | 价格幅度推断 | ✅ 仅同花顺 `block_top` / SQLite `limit_up_record`，禁止按涨幅反推 |

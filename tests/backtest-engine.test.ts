@@ -45,4 +45,28 @@ describe('historical backtest timing', () => {
       .map((trade) => ({ date: trade.date, code: trade.stock_code, price: trade.price, reason: trade.reason }));
     expect(earlierBuys(changed)).toEqual(earlierBuys(baseline));
   });
+
+  it('uses block_top records instead of a calculated price threshold for limit-up filtering', () => {
+    const fixture = historicalFixture();
+    const baseline = runPolarsBacktest(fixture, { days: 10, maxHoldDays: 3 });
+    const firstBuy = baseline.trades.find((trade) => trade.action === '买入')!;
+    const priceOnly = structuredClone(fixture);
+    const stock = priceOnly.stocks.find((item) => item.stock_code === firstBuy.stock_code)!;
+    const buyIndex = stock.bars.findIndex((bar) => bar[0] === firstBuy.date);
+    const theoreticalLimitPrice = Number((stock.bars[buyIndex - 1][2] * 1.1).toFixed(3));
+    stock.bars[buyIndex][1] = theoreticalLimitPrice;
+    stock.bars[buyIndex][3] = Math.max(stock.bars[buyIndex][3], theoreticalLimitPrice);
+
+    const priceOnlyResult = runPolarsBacktest(priceOnly, { days: 10, maxHoldDays: 3 });
+    expect(priceOnlyResult.trades).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: '买入', stock_code: firstBuy.stock_code, date: firstBuy.date }),
+    ]));
+
+    const confirmed = structuredClone(priceOnly);
+    confirmed.limit_up_records = [{ date: firstBuy.date, stock_code: firstBuy.stock_code }];
+    const confirmedResult = runPolarsBacktest(confirmed, { days: 10, maxHoldDays: 3 });
+    expect(confirmedResult.trades).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: '买入', stock_code: firstBuy.stock_code, date: firstBuy.date }),
+    ]));
+  });
 });

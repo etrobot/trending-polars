@@ -21,7 +21,6 @@ import {
   createT1StrategyConfig,
   DEFAULT_T1_STRATEGY,
   exitSignalReason,
-  limitUpPrice,
   rankEntryCandidates,
   tradingDayDistance,
   type T1StrategyConfig,
@@ -41,6 +40,8 @@ export interface PaperMarketContext {
   rankingDate: string;
   rankings: RankingRow[];
   calendar?: string[];
+  /** 同花顺 block_top 的权威涨停记录。 */
+  limitUpRecords?: Array<{ date: string; stock_code: string }>;
   /** 上一交易日全市场平均涨跌幅；有值时优先用于判断强弱。 */
   marketAverageChange?: number;
 }
@@ -88,6 +89,13 @@ class MemoryPaperTradingStateStore implements PaperTradingStateStore {
 
 function compactDate(value: string): string {
   return value.replaceAll('-', '').slice(0, 8);
+}
+
+function exactLimitUpCodes(context: PaperMarketContext, date: string): Set<string> {
+  const normalizedDate = compactDate(date);
+  return new Set((context.limitUpRecords ?? [])
+    .filter((record) => compactDate(record.date) === normalizedDate)
+    .map((record) => record.stock_code));
 }
 
 function displayDate(value: string): string {
@@ -347,9 +355,10 @@ export class PaperTradingService extends EventEmitter {
     calendar: string[] = [],
     traceId: string = randomUUID(),
     marketAverageChange?: number,
+    limitUpRecords: Array<{ date: string; stock_code: string }> = [],
   ): Promise<PaperOverview> {
     if (this.overviewInFlight) return this.overviewInFlight;
-    this.overviewInFlight = this.exclusive(() => this.buildOverview({ analysis, rankingDate, rankings, calendar, marketAverageChange }, traceId))
+    this.overviewInFlight = this.exclusive(() => this.buildOverview({ analysis, rankingDate, rankings, calendar, marketAverageChange, limitUpRecords }, traceId))
       .finally(() => { this.overviewInFlight = null; });
     return this.overviewInFlight;
   }
@@ -361,6 +370,7 @@ export class PaperTradingService extends EventEmitter {
     calendar: string[] = [],
     traceId: string = randomUUID(),
     marketAverageChange?: number,
+    limitUpRecords: Array<{ date: string; stock_code: string }> = [],
   ): Promise<PaperOverview> {
     const state = structuredClone(await this.getState());
     const observation = state.last_account_observation;
@@ -377,7 +387,7 @@ export class PaperTradingService extends EventEmitter {
       const clock = shanghaiClock(this.now());
       this.initializeCapital(state, snapshot);
       this.reconcileState(state, snapshot, clock.date);
-      await this.ensurePreviousClosePlan(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange }, clock.date, traceId, true);
+      await this.ensurePreviousClosePlan(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange, limitUpRecords }, clock.date, traceId, true);
     }
     await this.audit.info('paper_trading', 'cached_overview_built', {
       traceId,
@@ -389,7 +399,7 @@ export class PaperTradingService extends EventEmitter {
         strategy_history: state.instructions.length,
       },
     });
-    return this.composeOverview(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange }, connection);
+    return this.composeOverview(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange, limitUpRecords }, connection);
   }
 
   async execute(confirmation: string, context?: PaperMarketContext, traceId?: string) {
@@ -897,11 +907,13 @@ export class PaperTradingService extends EventEmitter {
       ...activeBuys.map((instruction) => instruction.stock_code),
       ...existingSignalBuyCodes,
     ]);
+    const signalLimitUpCodes = exactLimitUpCodes(context, signalDate);
     const candidates = rankEntryCandidates(
       context.rankings,
       excludedCodes,
       Math.max(this.strategy.maxCandidates, planCount),
     )
+      .filter((candidate) => !signalLimitUpCodes.has(candidate.stock_code))
       .map((candidate, index) => ({
         ...candidate,
         rank: Number(candidate.rank) > 0 ? Number(candidate.rank) : index + 1,
@@ -1033,6 +1045,7 @@ export class PaperTradingService extends EventEmitter {
     const pendingBuys = state.instructions
       .filter((instruction) => instruction.side === 'buy' && eligible(instruction))
       .slice(0, this.strategy.maxEntriesPerDay);
+    const executionLimitUpCodes = exactLimitUpCodes(context, tradingDate);
 
     for (const instruction of pendingBuys) {
       if (occupiedCodes.has(instruction.stock_code)) {
@@ -1051,22 +1064,22 @@ export class PaperTradingService extends EventEmitter {
         });
         continue;
       }
+      if (executionLimitUpCodes.has(instruction.stock_code)) {
+        instruction.status = 'skipped';
+        instruction.completed_at = shanghaiClock(this.now()).timestamp;
+        instruction.reason = `${instruction.reason}；block_top 确认执行日涨停，无法买入`;
+        this.recordEvent(state, executionWindow, 'buy_skipped_limit_up', `${instruction.stock_code} 已在同花顺 block_top 涨停名单，跳过买入`, instruction.stock_code);
+        await this.audit.warn('strategy', 'buy_skipped_limit_up', {
+          traceId,
+          data: { instruction, trading_date: tradingDate, source: 'ths-block-top' },
+        });
+        continue;
+      }
       const quote = await this.broker.quote(instruction.stock_code, {
         traceId,
         stage: `${executionWindow}:quote`,
         source: 'paper_trading',
       });
-      if (instruction.signal_price > 0 && quote >= limitUpPrice(instruction.signal_price, instruction.stock_code, instruction.stock_name) - 0.001) {
-        instruction.status = 'skipped';
-        instruction.completed_at = shanghaiClock(this.now()).timestamp;
-        instruction.reason = `${instruction.reason}；执行时涨停无法买入`;
-        this.recordEvent(state, executionWindow, 'buy_skipped_limit_up', `${instruction.stock_code} 执行时达到涨停价，按回测规则跳过`, instruction.stock_code);
-        await this.audit.warn('strategy', 'buy_skipped_limit_up', {
-          traceId,
-          data: { instruction, quote, limit_up_price: limitUpPrice(instruction.signal_price, instruction.stock_code, instruction.stock_name) },
-        });
-        continue;
-      }
       const sizing = calculateEntrySize(availableCash, referenceCapital, quote, this.strategy);
       if (!sizing) {
         instruction.status = 'skipped';

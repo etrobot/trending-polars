@@ -2,6 +2,6 @@ node_modules/
 dist/
 coverage/
 .DS_Store
-server/data/runtime/
+server/data/
 *.log
 *.tsbuildinfo

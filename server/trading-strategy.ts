@@ -96,17 +96,6 @@ export function exitSignalReason(
   return null;
 }
 
-export function limitUpRate(code: string, name: string): number {
-  if (name.toUpperCase().includes('ST')) return 0.05;
-  if (/^(300|301|688|689)/.test(code)) return 0.2;
-  if (/^(4|8|92)/.test(code)) return 0.3;
-  return 0.1;
-}
-
-export function limitUpPrice(previousClose: number, code: string, name: string): number {
-  return round(previousClose * (1 + limitUpRate(code, name)), 2);
-}
-
 export function tradingDayDistance(fromDate: string, toDate: string, calendar: readonly string[]): number {
   const normalizedFrom = fromDate.replaceAll('-', '').slice(0, 8);
   const normalizedTo = toDate.replaceAll('-', '').slice(0, 8);
