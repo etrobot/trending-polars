@@ -1,0 +1,215 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-display: "IBM Plex Sans Condensed", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+
+  /* Binance Dark Canvas */
+  --color-canvas: #0b0e11;
+  --color-canvas-soft: #1e2329;
+  --color-surface: #1e2329;
+  --color-surface-elevated: #2b3139;
+  --color-ink: #ffffff;
+  --color-body: #eaecef;
+  --color-muted: #707a8a;
+  --color-line: #2b3139;
+  --color-line-soft: #242a30;
+
+  /* Brand — Binance Yellow */
+  --color-primary: #fcd535;
+  --color-primary-active: #f0b90b;
+  --color-on-primary: #181a20;
+  --color-coral: #fcd535;
+  --color-coral-dark: #f0b90b;
+
+  /* Accent / text highlights */
+  --color-accent-text: #fcd535;
+
+  /* Sidebar canvas */
+  --color-navy: #0b0e11;
+
+  /* Trading semantics — Chinese convention (red = up, green = down) */
+  --color-trading-up: #f6465d;
+  --color-trading-down: #0ecb81;
+  --color-green: #0ecb81;
+  --color-green-text: #0ecb81;
+  --color-red-cn: #f6465d;
+  --color-red-cn-dark: #c73e4a;
+  --color-red-text: #f6465d;
+
+  /* Info / focus */
+  --color-info: #3b82f6;
+}
+
+:root {
+  color: #eaecef;
+  background: #0b0e11;
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  background: #0b0e11;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: #0b0e11;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  font-size: 12px;
+}
+
+button,
+a {
+  -webkit-tap-highlight-color: transparent;
+}
+
+select {
+  font-size: 11px;
+}
+select option {
+  font-size: 11px;
+  color: #eaecef;
+  background: #1e2329;
+}
+
+.font-mono,
+table,
+input,
+select {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+::selection {
+  color: #181a20;
+  background: #fcd535;
+}
+
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0b0e11;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 1px solid #0b0e11;
+  background: #555555;
+}
+
+@layer components {
+  .panel {
+    @apply border border-line bg-surface;
+    border-radius: 3px;
+    box-shadow: none;
+  }
+
+  .panel-dark {
+    @apply border border-white/10 bg-navy text-white;
+    border-radius: 3px;
+    box-shadow: none;
+  }
+
+  .terminal-page {
+    @apply space-y-3;
+  }
+
+  .terminal-field {
+    @apply h-8 border border-line bg-canvas px-2.5 text-[11px] text-ink outline-none transition placeholder:text-muted focus:border-primary;
+    border-radius: 2px;
+  }
+
+  .module-header {
+    @apply flex flex-wrap items-center justify-between gap-2 border-b border-line bg-surface-elevated px-3 py-2;
+  }
+
+  .table-scroll {
+    @apply overflow-auto border border-line bg-surface;
+    border-radius: 3px;
+  }
+
+  .data-table {
+    @apply w-full border-collapse text-left text-[11px];
+    font-variant-numeric: tabular-nums lining-nums;
+  }
+
+  .data-table thead {
+    @apply sticky top-0 z-10 bg-surface-elevated;
+  }
+
+  .data-table th {
+    @apply h-7 whitespace-nowrap border-b border-r border-line px-2.5 py-1.5 font-mono text-[11px] font-semibold tracking-[0.08em] text-muted uppercase last:border-r-0;
+  }
+
+  .data-table td {
+    @apply h-8 whitespace-nowrap border-b border-r border-line-soft px-2.5 py-1.5 leading-tight text-body last:border-r-0;
+  }
+
+  .data-table tbody tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.018);
+  }
+
+  .data-table tbody tr {
+    @apply transition-colors hover:bg-[#2b3139];
+  }
+
+  .data-table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+
+  .focus-ring {
+    @apply outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-1 focus-visible:ring-offset-canvas;
+  }
+
+  .header-actions {
+    scrollbar-width: none;
+  }
+
+  .header-actions::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@keyframes soft-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+
+@keyframes enter-up {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-enter {
+  animation: enter-up 220ms cubic-bezier(.2,.75,.25,1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

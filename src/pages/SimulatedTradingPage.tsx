@@ -1,0 +1,229 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  CirclePause,
+  CirclePlay,
+  ClipboardCheck,
+  RefreshCw,
+  ShieldCheck,
+} from 'lucide-react';
+import { Modal } from '../components/Modal';
+import { PageHeaderActions } from '../components/HeaderActions';
+import { Button, EmptyState, LoadingPanel, SectionHeading } from '../components/Ui';
+import { api, formatMoney, pctColor } from '../lib/api';
+import type { AutomationState, PaperOverview, PaperPlanHistoryItem, TradingWindow } from '../types';
+
+function historyStatusTone(status: string): string {
+  if (status.includes('成交')) return 'text-green';
+  if (status.includes('不确定') || status.includes('失败')) return 'text-trading-up';
+  if (status.includes('待') || status.includes('提交中') || status.includes('已提交')) return 'text-primary';
+  return 'text-muted';
+}
+
+function PlanHistoryTable({ history }: { history: PaperPlanHistoryItem[] }) {
+  return (
+    <section className="panel overflow-hidden">
+      <div className="module-header">
+        <h2 className="font-display text-base font-semibold text-ink">策略计划历史</h2>
+        <span className="font-mono text-[11px] text-muted">{history.length} 条 · 持久化保存</span>
+      </div>
+      <div className="max-h-[420px] overflow-auto">
+        <table className="data-table min-w-[1180px]">
+          <thead><tr><th>信号日</th><th>方向</th><th>状态</th><th>代码</th><th>名称</th><th className="text-right">排名</th><th className="text-right">数量</th><th className="text-right">参考/成交价</th><th>创建时间</th><th>提交/完成时间</th><th>原因与回查状态</th></tr></thead>
+          <tbody>{history.length === 0 ? <tr><td colSpan={11}><EmptyState title="尚无策略计划历史" description="收盘决策生成的计划会持续保存在 Node.js 交易状态中，执行后仍保留最终状态；接管前已有的同花顺持仓不会被伪造成策略计划。" /></td></tr> : history.map((item) => (
+            <tr key={item.id}>
+              <td className="font-mono text-xs text-muted">{item.signal_date}</td>
+              <td className={item.side === 'buy' ? 'font-semibold text-trading-up' : 'font-semibold text-trading-down'}>{item.side === 'buy' ? '买入' : '卖出'}</td>
+              <td className={`font-mono text-xs font-semibold ${historyStatusTone(item.status)}`}>{item.status}</td>
+              <td className="font-mono text-xs text-muted">{item.stock_code}</td>
+              <td className="font-semibold text-ink">{item.stock_name}</td>
+              <td className="text-right font-mono text-xs">{item.rank ?? '—'}</td>
+              <td className="text-right font-mono text-xs">{item.quantity.toLocaleString()}</td>
+              <td className="text-right font-mono text-xs">{item.price.toFixed(2)}</td>
+              <td className="font-mono text-xs text-muted">{item.created_at}</td>
+              <td className="font-mono text-xs text-muted">{item.completed_at ?? item.submitted_at ?? '—'}</td>
+              <td className="max-w-sm whitespace-normal text-xs text-muted">{item.reason}{item.broker_status ? `；${item.broker_status}` : ''}</td>
+            </tr>
+          ))}</tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+export function SimulatedTradingPage() {
+  const [overview, setOverview] = useState<PaperOverview | null>(null);
+  const [automation, setAutomation] = useState<AutomationState | null>(null);
+  const [connecting, setConnecting] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [executeOpen, setExecuteOpen] = useState(false);
+  const [selectedWindow, setSelectedWindow] = useState<TradingWindow>('open');
+  const [confirmation, setConfirmation] = useState('');
+  const [connected, setConnected] = useState(false);
+  const refreshInFlight = useRef<Promise<void> | null>(null);
+
+  const loadBootstrap = useCallback(async () => {
+    try {
+      const result = await api<{ overview: PaperOverview; automation: AutomationState }>('/api/simulated-trading/bootstrap');
+      setOverview(result.overview);
+      setAutomation(result.automation);
+      setError('');
+    } catch (bootstrapError) {
+      setError(bootstrapError instanceof Error ? bootstrapError.message : String(bootstrapError));
+    }
+  }, []);
+
+  const refreshAccount = useCallback((): Promise<void> => {
+    if (refreshInFlight.current) return refreshInFlight.current;
+    setConnecting(true);
+    const operation = api<PaperOverview>('/api/simulated-trading/overview')
+      .then((nextOverview) => {
+        setOverview(nextOverview);
+        setError('');
+      })
+      .catch((loadError) => {
+        setError(loadError instanceof Error ? loadError.message : String(loadError));
+      })
+      .finally(() => {
+        setConnecting(false);
+        refreshInFlight.current = null;
+      });
+    refreshInFlight.current = operation;
+    return operation;
+  }, []);
+
+  useEffect(() => {
+    void loadBootstrap().finally(() => refreshAccount());
+  }, [loadBootstrap, refreshAccount]);
+
+  useEffect(() => {
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const socket = new WebSocket(`${protocol}//${window.location.host}/ws/simulated-trading`);
+    socket.onopen = () => setConnected(true);
+    socket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(String(event.data)) as { type?: string };
+        if (message.type !== 'status') void loadBootstrap();
+      } catch {
+        void loadBootstrap();
+      }
+    };
+    socket.onclose = () => setConnected(false);
+    return () => socket.close();
+  }, [loadBootstrap]);
+
+  const toggleAutomation = async () => {
+    if (!automation) return;
+    setBusy(true);
+    try {
+      const result = await api<{ automation: AutomationState }>('/api/simulated-trading/automation/toggle', { method: 'POST', body: JSON.stringify({ enabled: !automation.enabled }) });
+      setAutomation(result.automation);
+      setError('');
+    } catch (toggleError) {
+      setError(toggleError instanceof Error ? toggleError.message : String(toggleError));
+    } finally { setBusy(false); }
+  };
+
+  const pause = async () => {
+    setBusy(true);
+    try {
+      const endpoint = automation?.paused_today ? '/api/simulated-trading/automation/resume' : '/api/simulated-trading/automation/pause-today';
+      const result = await api<{ automation: AutomationState }>(endpoint, { method: 'POST' });
+      setAutomation(result.automation);
+      setError('');
+    } catch (pauseError) {
+      setError(pauseError instanceof Error ? pauseError.message : String(pauseError));
+    } finally { setBusy(false); }
+  };
+
+  const execute = async () => {
+    setBusy(true);
+    try {
+      await api('/api/simulated-trading/automation/run-window', {
+        method: 'POST',
+        body: JSON.stringify({ confirmation, window: selectedWindow }),
+      });
+      setConfirmation('');
+      setExecuteOpen(false);
+      await loadBootstrap();
+    } catch (executeError) {
+      setError(executeError instanceof Error ? executeError.message : String(executeError));
+    } finally { setBusy(false); }
+  };
+
+  const confirmWindow = (window: TradingWindow) => {
+    setSelectedWindow(window);
+    setConfirmation('');
+    setExecuteOpen(true);
+  };
+
+  const account = overview?.account;
+  const plan = overview?.plan;
+  const hasAccountSnapshot = Boolean(overview && overview.connection.status !== 'unavailable');
+  const connectionLabel = connecting ? '后台同步中' : overview?.connection.status === 'live' ? '已同步' : overview?.connection.status === 'cached' ? '上次快照' : '未连接';
+  const connectionDot = connecting ? 'bg-primary animate-pulse' : overview?.connection.status === 'live' && connected ? 'bg-green' : 'bg-muted';
+  const tradingDisabled = busy || connecting || !overview || overview.connection.status === 'unavailable';
+  return (
+    <>
+      <PageHeaderActions>
+        <span className="inline-flex h-7 shrink-0 items-center gap-1.5 bg-[#14261c] px-2 font-mono text-[11px] font-semibold text-trading-down" style={{ borderRadius: 2 }}><ShieldCheck className="h-3 w-3" />同花顺模拟</span>
+        <span title={overview?.connection.observed_at ? `账户快照：${overview.connection.observed_at}` : connected ? '状态推送在线' : '状态推送正在重连'} className="inline-flex h-7 shrink-0 items-center gap-1.5 border border-line bg-surface px-2 font-mono text-[11px] text-muted" style={{ borderRadius: 2 }}><span className={`h-1.5 w-1.5 ${connectionDot}`} />{connectionLabel}</span>
+        <Button variant="secondary" disabled={busy || !automation} onClick={() => void toggleAutomation()}>{automation?.enabled ? <CirclePause className="h-3.5 w-3.5" /> : <CirclePlay className="h-3.5 w-3.5" />}自动化：{automation?.enabled ? '开' : '关'}</Button>
+        <Button variant="ghost" disabled={busy || !automation?.enabled} onClick={() => void pause()}>{automation?.paused_today ? '恢复今日' : '暂停今日'}</Button>
+        <Button variant="secondary" disabled={connecting} onClick={() => void refreshAccount()}><RefreshCw className={`h-3.5 w-3.5 ${connecting ? 'animate-spin' : ''}`} />{connecting ? '同步中' : '刷新账户'}</Button>
+        <Button variant="ghost" disabled={tradingDisabled} onClick={() => confirmWindow('post_close')}>盘后核对</Button>
+        <Button variant="secondary" disabled={tradingDisabled} onClick={() => confirmWindow('near_close')}><ClipboardCheck className="h-3.5 w-3.5" />临收盘执行</Button>
+        <Button variant="secondary" disabled={tradingDisabled} onClick={() => confirmWindow('close')}><ClipboardCheck className="h-3.5 w-3.5" />收盘决策</Button>
+        <Button variant="primary" disabled={tradingDisabled} title="按当前报价立即执行上一收盘日生成的交易计划" onClick={() => confirmWindow('open')}><ClipboardCheck className="h-3.5 w-3.5" />立即执行</Button>
+      </PageHeaderActions>
+      <div className="terminal-page">
+      {connecting && <div className="border border-[#5d4c27] bg-[#2b2417] px-3 py-2 text-[11px] leading-4 text-primary">页面已从 Node.js 本地状态加载；同花顺账户正在后台同步，不会阻塞策略计划和历史记录显示。{overview?.connection.observed_at ? ` 当前展示 ${overview.connection.observed_at} 的上次快照。` : ''}</div>}
+      {!connecting && overview?.connection.status === 'cached' && <div className="border border-[#5d4c27] bg-[#2b2417] px-3 py-2 text-[11px] leading-4 text-primary">当前展示同花顺上次成功快照（{overview.connection.observed_at ?? '时间未知'}）。可点击“刷新账户”重新连接。</div>}
+      {error && <div className="border border-[#6b3434] bg-[#2c1919] px-3 py-2 text-[11px] leading-4 text-trading-down">{error}</div>}
+      {!overview && <LoadingPanel label="页面已就绪，正在后台连接同花顺模拟账户…" />}
+      {overview && account && plan && (
+      <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_300px]">
+        <div className="space-y-3">
+          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base font-semibold text-ink">持仓</h2><span className="font-mono text-[11px] text-muted">{hasAccountSnapshot ? `${account.positions.length} 只` : '等待同步'}</span></div><div className="overflow-auto"><table className="data-table min-w-[920px]"><thead><tr><th>代码</th><th>名称</th><th>入场日</th><th className="text-right">交易日</th><th className="text-right">持仓</th><th className="text-right">可卖</th><th className="text-right">成本</th><th className="text-right">现价</th><th className="text-right">盈亏额</th><th className="text-right">盈亏率</th><th className="text-right">市值</th></tr></thead><tbody>{account.positions.length === 0 ? <tr><td colSpan={11}><EmptyState title={hasAccountSnapshot ? '暂无持仓' : '等待同花顺账户快照'} description={hasAccountSnapshot ? undefined : '页面和策略历史已可查看，账户数据将在后台连接完成后更新。'} /></td></tr> : account.positions.map((position) => <tr key={position.stock_code}><td className="font-mono text-xs text-muted">{position.stock_code}</td><td className="font-semibold text-ink">{position.stock_name}</td><td className="font-mono text-xs text-muted">{position.entry_date || '—'}</td><td className="text-right font-mono text-xs">{position.hold_days ?? '—'}</td><td className="text-right font-mono text-xs">{position.shares.toLocaleString()}</td><td className="text-right font-mono text-xs">{position.available_shares.toLocaleString()}</td><td className="text-right font-mono text-xs">{position.cost_price.toFixed(2)}</td><td className="text-right font-mono text-xs">{position.current_price.toFixed(2)}</td><td className={`text-right font-mono text-xs font-semibold ${pctColor(position.pnl_amount)}`}>{position.pnl_amount > 0 ? '+' : ''}{formatMoney(position.pnl_amount)}</td><td className={`text-right font-mono text-xs font-semibold ${pctColor(position.pnl_pct)}`}>{position.pnl_pct > 0 ? '+' : ''}{position.pnl_pct.toFixed(2)}%</td><td className="text-right font-mono text-xs font-semibold text-ink">{formatMoney(position.market_value)}</td></tr>)}</tbody></table></div></section>
+
+          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base font-semibold text-ink">当前策略指令</h2><span className="font-mono text-[11px] text-muted">最近收盘生成 · 自动按开盘 / 临收盘窗口执行</span></div><div className="overflow-auto"><table className="data-table min-w-[1040px]"><thead><tr><th>方向</th><th>状态</th><th>信号日</th><th className="text-right">排名</th><th>窗口</th><th>代码</th><th>名称</th><th className="text-right">数量</th><th className="text-right">参考价</th><th className="text-right">预计金额</th><th>原因</th></tr></thead><tbody>{plan.orders.length === 0 ? <tr><td colSpan={11}><EmptyState title="暂无待执行指令" description="当前没有活动指令；交易日收盘后会按排行榜、持仓上限和退出条件生成下一交易日计划。" /></td></tr> : plan.orders.map((order) => <tr key={order.id}><td className={order.side === 'buy' ? 'font-semibold text-trading-up' : 'font-semibold text-trading-down'}>{order.side === 'buy' ? '买入' : '卖出'}</td><td className="font-mono text-xs text-muted">{order.status}</td><td className="font-mono text-xs text-muted">{order.signal_date ?? '—'}</td><td className="text-right font-mono text-xs">{order.rank ?? '—'}</td><td className="text-xs text-muted">{order.window}</td><td className="font-mono text-xs text-muted">{order.stock_code}</td><td className="font-semibold text-ink">{order.stock_name}</td><td className="text-right font-mono text-xs">{order.quantity.toLocaleString()}</td><td className="text-right font-mono text-xs">{order.price.toFixed(2)}</td><td className="text-right font-mono text-xs">{formatMoney(order.amount)}</td><td className="max-w-xs whitespace-normal text-xs text-muted">{order.reason}</td></tr>)}</tbody></table></div>{plan.skipped.length > 0 && <div className="border-t border-[#5d4c27] bg-[#2b2417] px-3 py-2 text-[11px] leading-4 text-primary">{plan.skipped.join(' ')}</div>}</section>
+
+          <PlanHistoryTable history={plan.history} />
+
+          <section><SectionHeading title="当日委托" /><div className="table-scroll"><table className="data-table min-w-[720px]"><thead><tr><th>方向</th><th>代码</th><th>名称</th><th className="text-right">委托价</th><th className="text-right">委托量</th><th>状态</th><th>窗口</th></tr></thead><tbody>{account.orders.length === 0 ? <tr><td colSpan={7}><EmptyState title="暂无委托记录" /></td></tr> : account.orders.map((order) => <tr key={order.id}><td className={order.side === 'buy' ? 'font-semibold text-trading-up' : 'font-semibold text-trading-down'}>{order.side === 'buy' ? '买入' : '卖出'}</td><td className="font-mono text-xs text-muted">{order.stock_code}</td><td className="font-semibold text-ink">{order.stock_name}</td><td className="text-right font-mono text-xs">{order.price.toFixed(2)}</td><td className="text-right font-mono text-xs">{order.quantity.toLocaleString()}</td><td className="text-xs text-muted">{order.status}</td><td className="text-xs text-muted">{order.window}</td></tr>)}</tbody></table></div></section>
+        </div>
+
+        <aside className="space-y-3">
+          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base font-semibold text-ink">账户</h2><span className="font-mono text-[11px] text-muted">{plan.ranking_date}</span></div><div className="divide-y divide-line-soft">{[
+            ['总资产', hasAccountSnapshot ? formatMoney(account.total_assets) : '—', 'text-ink'],
+            ['可用资金', hasAccountSnapshot ? formatMoney(account.available_cash) : '—', 'text-ink'],
+            ['持仓盈亏', hasAccountSnapshot ? formatMoney(account.pnl_summary.amount) : '—', hasAccountSnapshot ? pctColor(account.pnl_summary.amount) : 'text-muted'],
+            ['盈亏率', hasAccountSnapshot ? `${account.pnl_summary.pct >= 0 ? '+' : ''}${account.pnl_summary.pct.toFixed(2)}%` : '—', hasAccountSnapshot ? pctColor(account.pnl_summary.pct) : 'text-muted'],
+            ['当前仓位', hasAccountSnapshot ? `${account.current_position_pct.toFixed(1)}%` : '—', 'text-ink'],
+            ['资金上限', `${plan.target_position_pct}%`, 'text-primary'],
+            ['待执行指令', String(plan.orders.length), 'text-ink'],
+          ].map(([label, value, valueClass]) => <div key={label} className="flex items-center justify-between gap-3 px-3 py-2.5"><span className="text-[11px] text-muted">{label}</span><span className={`font-mono text-[11px] font-semibold ${valueClass}`}>{value}</span></div>)}</div></section>
+
+          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base font-semibold text-ink">策略</h2></div><table className="data-table"><tbody>{[
+            ['资金使用上限', `${plan.target_position_pct}%`],
+            ['单票仓位', `${plan.position_size_pct}%`],
+            ['持仓上限', `${plan.max_positions} 只`],
+            ['市场情绪', plan.sentiment === 'hot' ? '热' : plan.sentiment === 'normal' ? '中性' : '冷'],
+            ['待执行指令', `${plan.orders.length} 个`],
+            ['历史计划', `${plan.history.length} 条`],
+            ['策略日期', plan.ranking_date],
+            ['自动执行', automation?.next_window ?? '—'],
+          ].map(([label, value]) => <tr key={label}><td className="text-muted">{label}</td><td className="text-right font-mono font-semibold text-ink">{value}</td></tr>)}</tbody></table></section>
+
+          <section className="panel p-3.5"><h2 className="font-display text-base font-semibold text-ink">风控</h2><div className="mt-3 space-y-2">{[['成交时序', '行情好买开盘 / 卖临收盘；行情弱相反'], ['单票上限', `基准资金 ${plan.position_size_pct}%`], ['持仓上限', `${plan.max_positions} 只`], ['每日新增', `≤ ${plan.max_entries_per_day} 只`], ['退出规则', `-5 / +15 / ${plan.max_hold_days}d`], ['执行工具', '同花顺 AppleScript']].map(([label, detail]) => <div key={label} className="flex items-center justify-between border-b border-line-soft pb-1.5 text-[11px] last:border-0 last:pb-0"><span className="text-muted">{label}</span><span className="font-mono text-ink">{detail}</span></div>)}</div></section>
+        </aside>
+      </section>
+      )}
+
+      <Modal open={executeOpen} onClose={() => setExecuteOpen(false)} title={selectedWindow === 'open' ? '确认立即执行交易计划' : selectedWindow === 'near_close' ? '确认运行临收盘执行' : selectedWindow === 'close' ? '确认运行收盘决策' : '确认运行盘后核对'} description={selectedWindow === 'open' ? '立即按当前报价执行最近收盘日生成的待处理计划；自动化仍会按行情状态分别在开盘或临收盘运行。' : 'Node.js 交易核心会运行所选策略窗口；AppleScript 仅查询和操作同花顺“模拟练习”。'}>
+        <div className="space-y-3"><div className="border border-[#5d4c27] bg-[#2b2417] p-3 text-[11px] leading-4 text-primary">为避免误触，请输入 <strong>SIMULATED</strong>。脚本只允许操作明确标记为“模拟练习”的窗口，不会连接真实券商。</div><input autoFocus className="terminal-field focus-ring w-full font-mono uppercase" placeholder="SIMULATED" value={confirmation} onChange={(event) => setConfirmation(event.target.value.toUpperCase())} /><div className="flex justify-end gap-2"><Button variant="secondary" onClick={() => setExecuteOpen(false)}>取消</Button><Button variant="danger" disabled={busy || confirmation !== 'SIMULATED'} onClick={() => void execute()}>确认执行</Button></div></div>
+      </Modal>
+      </div>
+    </>
+  );
+}
