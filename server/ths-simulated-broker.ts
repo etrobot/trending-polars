@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import type { PaperOrder, PaperPosition } from '../src/types.js';
 import { NOOP_AUDIT_LOGGER, type AuditLoggerLike } from './audit-log.js';
 import { round } from './format.js';
+import { fetchAdjustedKlines } from './historical-market.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_THS_SCRIPT = path.resolve(MODULE_DIR, '..', 'scripts', 'ths_order_dry_run.applescript');
@@ -366,19 +367,43 @@ export class ThsSimulatedBroker implements SimulatedBroker {
       return this.reportOperationFailure(Promise.reject(new ThsSimulatedBrokerError('股票代码必须是6位数字')), 'quote_failed', context, { stock_code: stockCode });
     }
     const operation = this.exclusive(async () => {
-      const output = await this.loggedCommand(['quote', stockCode], context);
-      requireSimulationMarker(output);
-      const match = output.match(new RegExp(`^QUOTE\\|${stockCode}\\|([^\\r\\n]+)$`, 'm'));
-      const price = match ? toNumber(match[1]) : null;
-      if (price == null || price <= 0) {
-        throw new ThsSimulatedBrokerError(`未能读取 ${stockCode} 的模拟交易实时价格`);
+      // 先尝试同花顺模拟交易 UI 实时报价
+      try {
+        const output = await this.loggedCommand(['quote', stockCode], context);
+        requireSimulationMarker(output);
+        const match = output.match(new RegExp(`^QUOTE\\|${stockCode}\\|([^\\r\\n]+)$`, 'm'));
+        const price = match ? toNumber(match[1]) : null;
+        if (price != null && price > 0) {
+          const quote = round(price, 4);
+          await this.audit.info('ths_broker', 'quote_read', {
+            traceId: context.traceId,
+            data: { stage: context.stage, stock_code: stockCode, price: quote, source: 'ths_applescript' },
+          });
+          return quote;
+        }
+        await this.audit.warn('ths_broker', 'quote_fallback_start', {
+          traceId: context.traceId,
+          data: { stock_code: stockCode, reason: 'ths_price_unavailable', stage: context.stage },
+        });
+      } catch (thError) {
+        await this.audit.warn('ths_broker', 'quote_fallback_start', {
+          traceId: context.traceId,
+          data: { stock_code: stockCode, reason: 'ths_applescript_failed', error: String(thError), stage: context.stage },
+        });
       }
-      const quote = round(price, 4);
+      // 回退到 K 线接口获取最新收盘价
+      const prefix = stockCode.startsWith('6') ? 'sh' : 'sz';
+      const { klines, source } = await fetchAdjustedKlines(`${prefix}${stockCode}`, 5);
+      if (klines.length === 0) {
+        throw new ThsSimulatedBrokerError(`未能读取 ${stockCode} 的实时价格（同花顺模拟交易和 K 线接口均失败）`);
+      }
+      const latestBar = klines.at(-1)!;
+      const price = round(latestBar.close, 4);
       await this.audit.info('ths_broker', 'quote_read', {
         traceId: context.traceId,
-        data: { stage: context.stage, stock_code: stockCode, price: quote },
+        data: { stage: context.stage, stock_code: stockCode, price, source: `kline_${source}`, kline_date: latestBar.date },
       });
-      return quote;
+      return price;
     });
     return this.reportOperationFailure(operation, 'quote_failed', context, { stock_code: stockCode });
   }

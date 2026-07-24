@@ -64,6 +64,7 @@ on cancelSimulatedOrder(orderSide, orderCode, orderQuantity)
             set simulationWindow to my findSimulationWindow(it)
             if simulationWindow is missing value then error "未找到同花顺模拟交易窗口"
             if not my elementContainsText(simulationWindow, "模拟练习") then error "撤单前无法确认模拟交易状态"
+            my refreshSimulationConnection(simulationWindow)
             my navigateTo(simulationWindow, "orders")
             delay 0.6
 
@@ -132,6 +133,7 @@ on readSimulatedQuote(orderCode)
             my ensureWindowAvailable(it)
             set simulationWindow to my findSimulationWindow(it)
             if simulationWindow is missing value then error "未找到同花顺模拟交易窗口"
+            my refreshSimulationConnection(simulationWindow)
             my navigateTo(simulationWindow, "buy")
             delay 0.4
             set orderFields to my allTextFields(simulationWindow)
@@ -160,6 +162,7 @@ on takeSnapshot(snapshotKind)
             my ensureWindowAvailable(it)
             set simulationWindow to my findSimulationWindow(it)
             if simulationWindow is missing value then error "未找到包含“模拟练习”的窗口，已停止"
+            my refreshSimulationConnection(simulationWindow)
             my navigateTo(simulationWindow, snapshotKind)
             delay 0.6
             if not my elementContainsText(simulationWindow, "模拟练习") then error "查询前无法确认模拟交易状态，已停止"
@@ -193,6 +196,7 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
             if simulationWindow is missing value then error "未找到同花顺模拟交易窗口，已取消下单"
             if not my elementContainsText(simulationWindow, "模拟练习") then error "当前窗口不是同花顺模拟交易，已取消下单"
 
+            my refreshSimulationConnection(simulationWindow)
             my navigateTo(simulationWindow, orderSide)
             delay 0.5
 
@@ -270,6 +274,7 @@ on verifyOrder(orderSide, orderCode, orderPrice, orderQuantity)
             my ensureWindowAvailable(it)
             set simulationWindow to my findSimulationWindow(it)
             if simulationWindow is missing value then error "未找到同花顺模拟交易窗口"
+            my refreshSimulationConnection(simulationWindow)
             set verifyResult to my verifyOrderInWindow(simulationWindow, orderSide, orderCode, orderPrice, orderQuantity)
             my restoreForegroundApp(previousApp)
             return verifyResult
@@ -316,6 +321,63 @@ on navigateTo(simulationWindow, destination)
 
     error "无法切换到模拟交易页面：" & destination
 end navigateTo
+
+on refreshSimulationConnection(simulationWindow)
+    -- 点击模拟练习标签页右侧的刷新图标，确保会话处于已连接状态。
+    -- 该无名按钮位于"模拟"和"股票"两个标签之间，同行(y=75附近)。
+    tell application "System Events"
+        set simTab to missing value
+        set tabY to 0
+        set tabX to 0
+        try
+            repeat with b in buttons of simulationWindow
+                try
+                    set n to name of b as text
+                    if n is "模拟" then
+                        set simTab to b
+                        set tabPos to position of b
+                        set tabX to item 1 of tabPos
+                        set tabY to item 2 of tabPos
+                        exit repeat
+                    end if
+                end try
+            end repeat
+        end try
+        if simTab is missing value then return
+        repeat with b in buttons of simulationWindow
+            try
+                set n to name of b as text
+                set bPos to position of b
+                set bX to item 1 of bPos
+                set bY to item 2 of bPos
+                -- 无名按钮、同行、在"模拟"右侧且不超过"股票"位置
+                if n is "" and bY = tabY and bX > tabX and bX < tabX + 200 then
+                    my pressControl(b)
+                    delay 1.5
+                    return
+                end if
+            end try
+        end repeat
+        -- 部分按钮的 name 可能无值（missing value），尝试用另一方式匹配
+        repeat with b in buttons of simulationWindow
+            try
+                set n to name of b as text
+            on error
+                set n to ""
+            end try
+            try
+                set bPos to position of b
+                set bX to item 1 of bPos
+                set bY to item 2 of bPos
+                if n is "" and bY = tabY and bX > tabX and bX < tabX + 200 then
+                    my pressControl(b)
+                    delay 1.5
+                    return
+                end if
+            end try
+        end repeat
+    end tell
+end refreshSimulationConnection
 
 on ensureWindowAvailable(appProcess)
     -- count of windows 在页面切换/窗口刚出现/辅助功能树尚未就绪时可能瞬时返回 0，
