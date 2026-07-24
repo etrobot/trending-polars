@@ -144,7 +144,7 @@ describe('node:sqlite data store', () => {
     expect(status.foreign_keys).toBe(true);
     expect(status.busy_timeout_ms).toBe(5000);
     expect(status.synchronous).toBe('normal');
-    expect(status.schema_version).toBe(14);
+    expect(status.schema_version).toBe(17);
     expect(status.tables).toEqual(expect.arrayContaining([
       'stock_info',
       'sector_info',
@@ -314,7 +314,7 @@ describe('node:sqlite data store', () => {
     const loaded = await store.getHistoricalMarket();
     expect(loaded).toMatchObject({ as_of_date: '20260723', requested_days: 5, failed_stocks: 0 });
     expect(loaded?.stocks[0].bars).toHaveLength(3);
-    expect(loaded?.limit_up_records).toEqual([{ date: '20260723', stock_code: '600000' }]);
+    expect(loaded?.limit_up_records).toEqual([{ date: '20260723', stock_code: '600000', sector_code: '881145' }]);
     expect(await store.getIndexTradingDays('sh000001')).toEqual(['20260721', '20260722', '20260723']);
     expect(await store.loadAllDailyPrices()).toHaveLength(3);
     expect(await store.getAllStockPriceCoverage('20260721', '20260723')).toEqual([

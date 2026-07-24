@@ -98,6 +98,7 @@ function exactLimitUpCodes(context: PaperMarketContext, date: string): Set<strin
     .map((record) => record.stock_code));
 }
 
+
 function displayDate(value: string): string {
   const date = compactDate(value);
   return `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`;
@@ -388,6 +389,7 @@ export class PaperTradingService extends EventEmitter {
       this.initializeCapital(state, snapshot);
       this.reconcileState(state, snapshot, clock.date);
       await this.ensurePreviousClosePlan(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange, limitUpRecords }, clock.date, traceId, true);
+      await this.ensureSameDayCloseSignals(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange, limitUpRecords }, clock, traceId, true);
     }
     await this.audit.info('paper_trading', 'cached_overview_built', {
       traceId,
@@ -581,6 +583,7 @@ export class PaperTradingService extends EventEmitter {
     this.initializeCapital(state, snapshot);
     this.reconcileState(state, snapshot, clock.date);
     await this.ensurePreviousClosePlan(state, snapshot, context, clock.date, traceId);
+    await this.ensureSameDayCloseSignals(state, snapshot, context, clock, traceId);
     await this.persist(state);
     await this.audit.info('paper_trading', 'overview_built', {
       traceId,
@@ -667,6 +670,30 @@ export class PaperTradingService extends EventEmitter {
         skipped,
       },
     };
+  }
+
+  /**
+   * 收盘后（15:00+）如果排行截面日期就是当天且尚未生成信号，主动生成收盘计划。
+   * 解决自动化关闭时 overview 不产生计划的问题。
+   */
+  private async ensureSameDayCloseSignals(
+    state: PaperTradingRuntimeState,
+    snapshot: SimulatedAccountSnapshot,
+    context: PaperMarketContext,
+    clock: ReturnType<typeof shanghaiClock>,
+    traceId: string,
+    preview = false,
+  ): Promise<PaperStrategyInstruction[]> {
+    const signalDate = compactDate(context.rankingDate);
+    if (signalDate !== clock.date) return [];
+    if (clock.minute < 15 * 60) return [];
+    if (state.last_signal_date === signalDate) return [];
+    if (this.isWindowCompleted(state, clock.date, 'close')) return [];
+    const generated = await this.generateCloseSignals(state, snapshot, context, clock.date, traceId);
+    if (!preview && generated.length > 0) {
+      this.markWindowCompleted(state, clock.date, 'close');
+    }
+    return state.instructions.filter((instruction) => instruction.signal_date === signalDate);
   }
 
   private async generateCloseSignals(
@@ -906,13 +933,11 @@ export class PaperTradingService extends EventEmitter {
       ...activeBuys.map((instruction) => instruction.stock_code),
       ...existingSignalBuyCodes,
     ]);
-    const signalLimitUpCodes = exactLimitUpCodes(context, signalDate);
     const candidates = rankEntryCandidates(
       context.rankings,
       excludedCodes,
       Math.max(this.strategy.maxCandidates, planCount),
     )
-      .filter((candidate) => !signalLimitUpCodes.has(candidate.stock_code))
       .map((candidate, index) => ({
         ...candidate,
         rank: Number(candidate.rank) > 0 ? Number(candidate.rank) : index + 1,

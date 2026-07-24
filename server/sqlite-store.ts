@@ -5,12 +5,14 @@ import type {
   AnalysisData,
   BlockAnalysis,
   LimitUpStock,
+  PaperStrategyInstruction,
   RankingResponse,
   RankingRow,
   StrategyAction,
 } from '../src/types.js';
 import type {
   HistoricalBar,
+  HistoricalBlockSeries,
   HistoricalIndexSeries,
   HistoricalMarketData,
   HistoricalStockSeries,
@@ -24,7 +26,7 @@ import {
   type TrendAxis,
 } from './scoring-engine.js';
 
-const SCHEMA_VERSION = 14;
+const SCHEMA_VERSION = 17;
 
 export interface LimitUpRecord {
   date: string;
@@ -88,6 +90,17 @@ function isoDate(value: unknown): string {
   if (!compact) return '';
   return `${compact.slice(0, 4)}-${compact.slice(4, 6)}-${compact.slice(6, 8)}`;
 }
+
+const STATE_NAMES: Record<number, string> = {
+  0: '数据不足',
+  1: '主线主升',
+  2: '高位滞涨',
+  3: '首次回调',
+  4: '箱体震荡',
+  5: '缩量无序',
+  6: '阴跌不止',
+  7: '恐慌暴跌',
+};
 
 function finiteNumber(value: unknown): number | null {
   if (value == null || value === '') return null;
@@ -199,9 +212,7 @@ export class SqliteStore {
       CREATE TABLE IF NOT EXISTS limit_up_record (
         date TEXT NOT NULL,
         stock_code TEXT NOT NULL REFERENCES stock_info(code) ON UPDATE CASCADE,
-        stock_name TEXT NOT NULL,
         sector_code TEXT NOT NULL REFERENCES sector_info(code) ON UPDATE CASCADE,
-        sector_name TEXT NOT NULL,
         continue_num INTEGER NOT NULL CHECK (continue_num BETWEEN 1 AND 15),
         reason_type TEXT NOT NULL DEFAULT '',
         sector_change REAL NOT NULL DEFAULT 0,
@@ -241,11 +252,26 @@ export class SqliteStore {
         PRIMARY KEY (symbol, date)
       ) WITHOUT ROWID;
 
+      CREATE TABLE IF NOT EXISTS block_daily_price (
+        block_code TEXT NOT NULL REFERENCES sector_info(code) ON UPDATE CASCADE,
+        block_name TEXT NOT NULL,
+        date TEXT NOT NULL,
+        open REAL NOT NULL,
+        close REAL NOT NULL,
+        high REAL NOT NULL,
+        low REAL NOT NULL,
+        volume REAL NOT NULL DEFAULT 0,
+        amount REAL NOT NULL DEFAULT 0,
+        change_rate REAL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (block_code, date)
+      ) WITHOUT ROWID;
+
       CREATE TABLE IF NOT EXISTS sector_trend_daily (
         date TEXT NOT NULL,
         sector_code TEXT NOT NULL REFERENCES sector_info(code) ON UPDATE CASCADE,
         sector_name TEXT NOT NULL,
-        state_id INTEGER NOT NULL CHECK (state_id BETWEEN 1 AND 7),
+        state_id INTEGER NOT NULL CHECK (state_id BETWEEN 0 AND 7),
         state_name TEXT NOT NULL,
         trend TEXT NOT NULL DEFAULT '',
         latest REAL,
@@ -329,6 +355,25 @@ export class SqliteStore {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS paper_instruction (
+        id TEXT PRIMARY KEY,
+        side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
+        stock_code TEXT NOT NULL REFERENCES stock_info(code) ON UPDATE CASCADE,
+        signal_date TEXT NOT NULL,
+        signal_price REAL NOT NULL,
+        quantity INTEGER NOT NULL,
+        rank INTEGER,
+        strategy_label TEXT NOT NULL DEFAULT '',
+        reason TEXT NOT NULL DEFAULT '',
+        execution_window TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        submitted_at TEXT,
+        completed_at TEXT,
+        broker_status TEXT,
+        execution_price REAL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_limit_up_date
         ON limit_up_record(date);
       CREATE INDEX IF NOT EXISTS idx_limit_up_sector
@@ -337,6 +382,8 @@ export class SqliteStore {
         ON stock_daily_price(stock_code, date);
       CREATE INDEX IF NOT EXISTS idx_index_price_symbol_date
         ON index_daily_price(symbol, date);
+      CREATE INDEX IF NOT EXISTS idx_block_price_code_date
+        ON block_daily_price(block_code, date);
       CREATE INDEX IF NOT EXISTS idx_sector_trend_date
         ON sector_trend_daily(date);
       CREATE INDEX IF NOT EXISTS idx_ranking_factor_total
@@ -344,8 +391,54 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS idx_stock_ranking_date_score
         ON stock_ranking(date, total_score DESC);
 
-      PRAGMA user_version = ${SCHEMA_VERSION};
+      `);
+    this.migrateV15();
+    this.migrateV16();
+    this.database.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+  }
+
+  /** v16→17: 允许 state_id 为 0（数据不足），配合 CHECK 约束从 BETWEEN 1 AND 7 改为 0 AND 7。 */
+  private migrateV16(): void {
+    const version = this.database.prepare('PRAGMA user_version').get() as { user_version: number } | undefined;
+    if (Number(version?.user_version ?? 0) >= 17) return;
+    this.database.exec(`
+      CREATE TABLE sector_trend_daily_new (
+        date TEXT NOT NULL,
+        sector_code TEXT NOT NULL REFERENCES sector_info(code) ON UPDATE CASCADE,
+        sector_name TEXT NOT NULL,
+        state_id INTEGER NOT NULL CHECK (state_id BETWEEN 0 AND 7),
+        state_name TEXT NOT NULL,
+        trend TEXT NOT NULL DEFAULT '',
+        latest REAL,
+        ma5 REAL,
+        ma20 REAL,
+        near_high TEXT NOT NULL DEFAULT '',
+        volume_trend TEXT NOT NULL DEFAULT '',
+        strategy_action TEXT NOT NULL DEFAULT '',
+        strategy_label TEXT NOT NULL DEFAULT '',
+        strategy_position TEXT NOT NULL DEFAULT '',
+        computed_at TEXT NOT NULL,
+        PRIMARY KEY (date, sector_code)
+      ) WITHOUT ROWID;
+      INSERT INTO sector_trend_daily_new SELECT * FROM sector_trend_daily;
+      DROP TABLE sector_trend_daily;
+      ALTER TABLE sector_trend_daily_new RENAME TO sector_trend_daily;
+      -- 修复历史脏数据：state_name 与 state_id 不匹配的行
+      UPDATE sector_trend_daily SET state_id = 0 WHERE state_name = '数据不足' AND state_id != 0;
+      PRAGMA user_version = 17;
     `);
+  }
+
+  /** v15: 移除 limit_up_record 中的冗余名称列，改由 JOIN info 表获取。 */
+  private migrateV15(): void {
+    const columns = this.database.prepare(`PRAGMA table_info(limit_up_record)`).all() as Array<{ name: string }>;
+    const names = new Set(columns.map((c) => c.name));
+    if (names.has('stock_name')) {
+      this.database.exec(`ALTER TABLE limit_up_record DROP COLUMN stock_name`);
+    }
+    if (names.has('sector_name')) {
+      this.database.exec(`ALTER TABLE limit_up_record DROP COLUMN sector_name`);
+    }
   }
 
   private transaction<T>(work: () => T): T {
@@ -394,13 +487,11 @@ export class SqliteStore {
       this.database.prepare('DELETE FROM sector_trend_daily WHERE date = ?').run(date);
       const insertLimitUp = this.database.prepare(`
         INSERT INTO limit_up_record (
-          date, stock_code, stock_name, sector_code, sector_name,
+          date, stock_code, sector_code,
           continue_num, reason_type, sector_change, latest, change_rate, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(date, stock_code) DO UPDATE SET
-          stock_name = excluded.stock_name,
           sector_code = excluded.sector_code,
-          sector_name = excluded.sector_name,
           continue_num = excluded.continue_num,
           reason_type = excluded.reason_type,
           sector_change = excluded.sector_change,
@@ -435,13 +526,14 @@ export class SqliteStore {
         const sectorName = textValue(block.name).trim();
         if (!sectorCode || !sectorName) continue;
         this.upsertSectorInfo(sectorCode, sectorName, computedAt);
-        const stateId = Math.min(7, Math.max(1, Math.trunc(numberValue(block.trend?.state_id, 5))));
+        const stateId = Math.min(7, Math.max(0, Math.trunc(numberValue(block.trend?.state_id, 5))));
+        const stateName = STATE_NAMES[stateId] ?? textValue(block.trend?.state_name);
         insertTrend.run(
           date,
           sectorCode,
           sectorName,
           stateId,
-          textValue(block.trend?.state_name),
+          stateName,
           textValue(block.trend?.trend),
           finiteNumber(block.trend?.latest),
           finiteNumber(block.trend?.ma5),
@@ -463,9 +555,7 @@ export class SqliteStore {
           insertLimitUp.run(
             date,
             stockCode,
-            stockName,
             sectorCode,
-            sectorName,
             continueNum,
             textValue(stock.reason_type ?? stock.reason_info),
             numberValue(block.block_info?.change),
@@ -588,11 +678,14 @@ export class SqliteStore {
     const date = compactDate(value);
     if (!date) return [];
     return this.database.prepare(`
-      SELECT date, stock_code, stock_name, sector_code, sector_name,
-             continue_num, reason_type, sector_change, latest, change_rate
-      FROM limit_up_record
-      WHERE date = ?
-      ORDER BY continue_num DESC, stock_code ASC
+      SELECT r.date, r.stock_code, si.name AS stock_name,
+             r.sector_code, sci.name AS sector_name,
+             r.continue_num, r.reason_type, r.sector_change, r.latest, r.change_rate
+      FROM limit_up_record r
+      JOIN stock_info si ON si.code = r.stock_code
+      JOIN sector_info sci ON sci.code = r.sector_code
+      WHERE r.date = ?
+      ORDER BY r.continue_num DESC, r.stock_code ASC
     `).all(date).map((row) => ({
       date: textValue(row.date),
       stock_code: textValue(row.stock_code),
@@ -611,12 +704,13 @@ export class SqliteStore {
     const date = compactDate(value);
     if (!date) return [];
     return this.database.prepare(`
-      SELECT sector_code, sector_name, COUNT(*) AS limit_up_count,
-             MAX(continue_num) AS max_continue
-      FROM limit_up_record
-      WHERE date = ?
-      GROUP BY sector_code, sector_name
-      ORDER BY limit_up_count DESC, sector_code ASC
+      SELECT r.sector_code, sci.name AS sector_name,
+             COUNT(*) AS limit_up_count, MAX(r.continue_num) AS max_continue
+      FROM limit_up_record r
+      JOIN sector_info sci ON sci.code = r.sector_code
+      WHERE r.date = ?
+      GROUP BY r.sector_code
+      ORDER BY limit_up_count DESC, r.sector_code ASC
     `).all(date).map((row) => ({
       sector_code: textValue(row.sector_code),
       sector_name: textValue(row.sector_name),
@@ -633,6 +727,34 @@ export class SqliteStore {
     `).all().map((row) => ({
       date: textValue(row.date),
       stock_code: textValue(row.stock_code),
+    }));
+  }
+
+  /** 加载日期范围内的涨停记录（含板块代码），用于回测时跳过重复的 block_top 网络请求。 */
+  loadLimitUpRecordsForDateRange(fromDate: string, toDate: string): HistoricalLimitUpRecord[] {
+    const from = compactDate(fromDate);
+    const to = compactDate(toDate);
+    if (!from || !to) return [];
+    return this.database.prepare(`
+      SELECT r.date, r.stock_code, si.name AS stock_name,
+             r.sector_code, sci.name AS sector_name,
+             r.continue_num, r.reason_type, r.sector_change, r.latest, r.change_rate
+      FROM limit_up_record r
+      JOIN stock_info si ON si.code = r.stock_code
+      JOIN sector_info sci ON sci.code = r.sector_code
+      WHERE r.date BETWEEN ? AND ?
+      ORDER BY r.date ASC, r.stock_code ASC
+    `).all(from, to).map((row) => ({
+      date: textValue(row.date),
+      stock_code: textValue(row.stock_code),
+      stock_name: textValue(row.stock_name),
+      sector_code: textValue(row.sector_code),
+      sector_name: textValue(row.sector_name),
+      continue_num: numberValue(row.continue_num),
+      reason_type: textValue(row.reason_type),
+      sector_change: numberValue(row.sector_change),
+      latest: finiteNumber(row.latest),
+      change_rate: finiteNumber(row.change_rate),
     }));
   }
 
@@ -1096,6 +1218,68 @@ export class SqliteStore {
     `).all(symbol).map((row) => compactDate(row.date)).filter(Boolean);
   }
 
+  private upsertBlockPricesWithinTransaction(blockCode: string, blockName: string, klines: KLineData[], timestamp: string): number {
+    if (!/^\d{6}$/.test(blockCode)) return 0;
+    this.upsertSectorInfo(blockCode, blockName || blockCode, timestamp);
+    const statement = this.database.prepare(`
+      INSERT INTO block_daily_price (
+        block_code, block_name, date, open, close, high, low,
+        volume, amount, change_rate, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(block_code, date) DO UPDATE SET
+        block_name = excluded.block_name,
+        open = excluded.open,
+        close = excluded.close,
+        high = excluded.high,
+        low = excluded.low,
+        volume = excluded.volume,
+        amount = excluded.amount,
+        change_rate = excluded.change_rate,
+        created_at = excluded.created_at
+    `);
+    let count = 0;
+    for (const kline of klines) {
+      const date = isoDate(kline.date);
+      if (!date || ![kline.open, kline.close, kline.high, kline.low].every((v) => Number.isFinite(v) && v > 0)) continue;
+      statement.run(
+        blockCode,
+        blockName || blockCode,
+        date,
+        kline.open,
+        kline.close,
+        kline.high,
+        kline.low,
+        Number.isFinite(kline.volume) ? kline.volume : 0,
+        Number.isFinite(kline.amount) ? kline.amount : 0,
+        finiteNumber(kline.changeRate),
+        timestamp,
+      );
+      count += 1;
+    }
+    return count;
+  }
+
+  upsertBlockPrices(blockCode: string, blockName: string, klines: KLineData[]): number {
+    const timestamp = formatDateTime();
+    return this.transaction(() => this.upsertBlockPricesWithinTransaction(blockCode, blockName, klines, timestamp));
+  }
+
+  getBlockPrices(blockCode: string, limit = 250): KLineData[] {
+    if (!/^\d{6}$/.test(blockCode)) return [];
+    const boundedLimit = Math.min(1000, Math.max(1, Math.trunc(limit)));
+    return this.database.prepare(`
+      SELECT date, open, close, high, low, volume, amount, change_rate
+      FROM (
+        SELECT date, open, close, high, low, volume, amount, change_rate
+        FROM block_daily_price
+        WHERE block_code = ?
+        ORDER BY date DESC
+        LIMIT ?
+      )
+      ORDER BY date ASC
+    `).all(blockCode, boundedLimit).map((row) => rowToKline(row));
+  }
+
   getAllStockPriceCoverage(dateFrom: string, dateTo: string): DailyPriceCoverage[] {
     const from = isoDate(dateFrom);
     const to = isoDate(dateTo);
@@ -1167,6 +1351,20 @@ export class SqliteStore {
         this.upsertIndexPricesWithinTransaction(symbol, index.index_name, klines, timestamp);
         indexSymbols.push(symbol);
       }
+      for (const block of data.blocks ?? []) {
+        if (!/^\d{6}$/.test(block.block_code)) continue;
+        const klines = block.bars.map((bar) => ({
+          date: bar[0],
+          open: bar[1],
+          close: bar[2],
+          high: bar[3],
+          low: bar[4],
+          volume: bar[5],
+          amount: bar[6],
+          changeRate: bar[7],
+        }));
+        this.upsertBlockPricesWithinTransaction(block.block_code, block.block_name, klines, timestamp);
+      }
       this.database.prepare(`
         INSERT INTO historical_snapshot (
           singleton, schema_version, source, generated_at, as_of_date,
@@ -1200,6 +1398,39 @@ export class SqliteStore {
         data.failed_stocks,
         timestamp,
       );
+      // 持久化历史涨停记录（不覆盖已有记录）
+      if (data.limit_up_records?.length) {
+        const insertLimitUpHistory = this.database.prepare(`
+          INSERT INTO limit_up_record (
+            date, stock_code, sector_code,
+            continue_num, reason_type, sector_change, latest, change_rate, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(date, stock_code) DO UPDATE SET
+            sector_code = CASE WHEN limit_up_record.sector_code = 'UNKNOWN' THEN excluded.sector_code ELSE limit_up_record.sector_code END,
+            continue_num = excluded.continue_num,
+            reason_type = CASE WHEN limit_up_record.reason_type = '' THEN excluded.reason_type ELSE limit_up_record.reason_type END,
+            sector_change = excluded.sector_change,
+            latest = excluded.latest,
+            change_rate = excluded.change_rate
+        `);
+        for (const record of data.limit_up_records) {
+          const stockCode = record.stock_code;
+          const sectorCode = record.sector_code || 'UNKNOWN';
+          this.upsertStockInfo(stockCode, record.stock_name || stockCode, timestamp);
+          this.upsertSectorInfo(sectorCode, record.sector_name || sectorCode, timestamp);
+          insertLimitUpHistory.run(
+            compactDate(record.date),
+            stockCode,
+            sectorCode,
+            Math.min(15, Math.max(1, Math.trunc(record.continue_num ?? 1))),
+            record.reason_type ?? '',
+            record.sector_change ?? 0,
+            record.latest ?? null,
+            record.change_rate ?? null,
+            timestamp,
+          );
+        }
+      }
     });
   }
 
@@ -1269,14 +1500,45 @@ export class SqliteStore {
     const firstCompactDate = compactDate(calendar[0] ?? snapshot.as_of_date);
     const lastCompactDate = compactDate(snapshot.as_of_date);
     const limitUpRecords = this.database.prepare(`
-      SELECT date, stock_code
+      SELECT date, stock_code, sector_code
       FROM limit_up_record
       WHERE date BETWEEN ? AND ?
       ORDER BY date ASC, stock_code ASC
     `).all(firstCompactDate, lastCompactDate).map((row) => ({
       date: textValue(row.date),
       stock_code: textValue(row.stock_code),
+      sector_code: textValue(row.sector_code),
     }));
+    // 加载板块K线（从 limit_up_record 中获取出现过的板块代码）
+    const blockCodes = this.database.prepare(`
+      SELECT DISTINCT sector_code FROM limit_up_record
+      WHERE date BETWEEN ? AND ? AND sector_code != 'UNKNOWN'
+    `).all(firstCompactDate, lastCompactDate).map((row) => textValue(row.sector_code));
+    const blocks: HistoricalBlockSeries[] = [];
+    for (const blockCode of blockCodes) {
+      const rows = this.database.prepare(`
+        SELECT block_code, block_name, date, open, close, high, low,
+               volume, amount, change_rate
+        FROM block_daily_price
+        WHERE block_code = ? AND date BETWEEN ? AND ?
+        ORDER BY date ASC
+      `).all(blockCode, firstDate, lastDate);
+      if (!rows.length) continue;
+      blocks.push({
+        block_code: blockCode,
+        block_name: textValue(rows[0].block_name, blockCode),
+        bars: rows.map((row): HistoricalBar => [
+          compactDate(row.date),
+          numberValue(row.open),
+          numberValue(row.close),
+          numberValue(row.high),
+          numberValue(row.low),
+          numberValue(row.volume),
+          numberValue(row.amount),
+          numberValue(row.change_rate),
+        ]),
+      });
+    }
     return {
       schema_version: 1,
       source,
@@ -1288,9 +1550,75 @@ export class SqliteStore {
       calendar,
       stocks,
       indices,
+      blocks: blocks.length ? blocks : undefined,
       limit_up_records: limitUpRecords,
       failed_stocks: numberValue(snapshot.failed_stocks),
     };
+  }
+
+  loadInstructions(): PaperStrategyInstruction[] {
+    return this.database.prepare(`
+      SELECT i.id, i.side, i.stock_code, si.name AS stock_name,
+             i.signal_date, i.signal_price, i.quantity, i.rank,
+             i.strategy_label, i.reason, i.execution_window,
+             i.status, i.created_at, i.submitted_at, i.completed_at,
+             i.broker_status, i.execution_price
+      FROM paper_instruction i
+      JOIN stock_info si ON si.code = i.stock_code
+      ORDER BY i.created_at ASC
+    `).all().map((row) => ({
+      id: textValue(row.id),
+      side: textValue(row.side) as 'buy' | 'sell',
+      stock_code: textValue(row.stock_code),
+      stock_name: textValue(row.stock_name),
+      signal_date: textValue(row.signal_date),
+      signal_price: numberValue(row.signal_price),
+      quantity: numberValue(row.quantity),
+      ...(row.rank != null ? { rank: numberValue(row.rank) } : {}),
+      ...(textValue(row.strategy_label) ? { strategy_label: textValue(row.strategy_label) } : {}),
+      reason: textValue(row.reason),
+      ...(row.execution_window != null ? { execution_window: textValue(row.execution_window) as 'open' | 'near_close' } : {}),
+      status: textValue(row.status) as PaperStrategyInstruction['status'],
+      created_at: textValue(row.created_at),
+      ...(row.submitted_at != null ? { submitted_at: textValue(row.submitted_at) } : {}),
+      ...(row.completed_at != null ? { completed_at: textValue(row.completed_at) } : {}),
+      ...(row.broker_status != null ? { broker_status: textValue(row.broker_status) } : {}),
+      ...(row.execution_price != null ? { execution_price: numberValue(row.execution_price) } : {}),
+    }));
+  }
+
+  saveInstructions(instructions: PaperStrategyInstruction[]): void {
+    this.transaction(() => {
+      this.database.prepare('DELETE FROM paper_instruction').run();
+      const insert = this.database.prepare(`
+        INSERT INTO paper_instruction (
+          id, side, stock_code, signal_date, signal_price, quantity,
+          rank, strategy_label, reason, execution_window,
+          status, created_at, submitted_at, completed_at, broker_status, execution_price
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const inst of instructions) {
+        this.upsertStockInfo(inst.stock_code, inst.stock_name || inst.stock_code, inst.created_at);
+        insert.run(
+          inst.id,
+          inst.side,
+          inst.stock_code,
+          inst.signal_date,
+          inst.signal_price,
+          inst.quantity,
+          inst.rank ?? null,
+          inst.strategy_label ?? '',
+          inst.reason ?? '',
+          inst.execution_window ?? null,
+          inst.status,
+          inst.created_at,
+          inst.submitted_at ?? null,
+          inst.completed_at ?? null,
+          inst.broker_status ?? null,
+          inst.execution_price ?? null,
+        );
+      }
+    });
   }
 
   storageStatus(): {

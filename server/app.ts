@@ -6,6 +6,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import type { AnalysisData, BlockAnalysis, IndexAnalysis, LimitUpStock, RankingRow } from '../src/types.js';
 import { AuditLogger, guardDetachedPromise, type AuditLevel } from './audit-log.js';
 import { historicalCrossSectionRankings, runPolarsBacktest } from './backtest-engine.js';
+import { fetchSohuIndexKlines, buildBenchmarkCurve } from './benchmark.js';
 import { DataStore } from './data-store.js';
 import { compactDate, formatDateTime, round } from './format.js';
 import {
@@ -343,10 +344,19 @@ export function createApp(services: Partial<AppServices> = {}) {
     }
 
     options.progress?.(3, `覆盖不足，开始获取 ${requestedDate} 前 ${options.days} 日个股行情`);
+    // 尝试加载已有的涨停记录和板块 K 线，避免重复请求网络数据
+    const requestedDays = Math.min(60, Math.max(5, Math.trunc(options.days)));
+    const tradingDays = history?.calendar?.slice(-requestedDays) ?? [];
+    const existingLimitUpRecords = tradingDays.length > 0
+      ? await store.loadLimitUpRecordsForDateRange(tradingDays[0], tradingDays.at(-1) ?? requestedDate)
+      : [];
+    const existingBlockSeries = history?.blocks?.length ? history.blocks : undefined;
     const collection = (async () => {
       const result = await collectHistoricalMarketData(options.rankings, {
         days: options.days,
         asOfDate: requestedDate,
+        existingLimitUpRecords,
+        existingBlockSeries,
         cancelled: options.cancelled,
         audit,
         traceId: options.traceId,
@@ -755,6 +765,22 @@ export function createApp(services: Partial<AppServices> = {}) {
   app.post('/api/tasks/:taskId/cancel', (request, response) => {
     response.json({ success: tasks.cancel(request.params.taskId), task_id: request.params.taskId });
   });
+
+  app.get('/api/benchmark', asyncHandler(async (request, response) => {
+    const dates = String(request.query.dates ?? '').split(',').filter(Boolean);
+    const initialCapital = Number(request.query.initial_capital) || 100_000;
+    if (!dates.length) {
+      response.status(400).json({ error: '需要 dates 参数（逗号分隔的日期列表）' });
+      return;
+    }
+    const { klines, source } = await fetchSohuIndexKlines();
+    if (!klines.length) {
+      response.status(502).json({ error: '基准指数数据不可用', source });
+      return;
+    }
+    const curve = buildBenchmarkCurve(klines, dates, initialCapital);
+    response.json({ curve: curve.map((p) => ({ date: p.date, total: p.value })), name: '上证380', source });
+  }));
 
   app.post('/api/backtest/collect', asyncHandler(async (request, response) => {
     const days = numberParam(request.query.days, 20, 5, 60);

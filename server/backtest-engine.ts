@@ -1,5 +1,6 @@
 import pl from 'nodejs-polars';
 import type { BacktestResult, BacktestTrade, EquityPoint, RankingRow } from '../src/types.js';
+import { computeBacktestScores } from './backtest-scoring.js';
 import { compactDate, formatDateTime, round } from './format.js';
 import type { HistoricalMarketData } from './historical-market.js';
 import { prepareSeries, scoreStock, type PreparedSeries } from './scoring-engine.js';
@@ -159,10 +160,13 @@ export function runPolarsBacktest(
   const dates = history.calendar.filter((date) => date <= history.as_of_date).slice(-days);
   if (dates.length < 2) throw new Error('历史数据不足，至少需要两个交易日');
 
-  const prepared = history.stocks.map(prepareSeries);
-  const seriesByCode = new Map(prepared.map((series) => [series.stockCode, series]));
+  // ---- Vectorized score pre-computation (single Polars pass) ----
   const exactLimitUpDates = limitUpDatesByCode(history);
   const exactLimitUpCodes = limitUpCodesByDate(history);
+  const scoreMap = computeBacktestScores(history, dates, exactLimitUpDates);
+
+  const prepared = history.stocks.map(prepareSeries);
+  const seriesByCode = new Map(prepared.map((series) => [series.stockCode, series]));
   const positions = new Map<string, Position>();
   const pendingExits = new Map<string, string>();
   const lastKnownClose = new Map<string, number>();
@@ -264,7 +268,8 @@ export function runPolarsBacktest(
     if (dateIndex < dates.length - 1) {
       const heldOrOrdered = new Set([...positions.keys(), ...pendingEntries.map((order) => order.stockCode)]);
       const availableSlots = Math.max(0, strategy.maxPositions - positions.size);
-      pendingEntries = candidatesAtDate(prepared, date, exactLimitUpDates)
+      const dayScores = scoreMap.get(date) ?? [];
+      pendingEntries = rankEntryCandidates(dayScores, new Set(), DEFAULT_T1_STRATEGY.maxCandidates)
         .filter((candidate) => !heldOrOrdered.has(candidate.stock_code))
         .slice(0, Math.min(strategy.maxEntriesPerDay, availableSlots))
         .map((candidate) => ({

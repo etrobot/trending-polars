@@ -190,7 +190,7 @@ describe('Trending Polars API', () => {
       foreign_keys: true,
       busy_timeout_ms: 5000,
       synchronous: 'normal',
-      schema_version: 14,
+      schema_version: 17,
       tables: expect.arrayContaining(['limit_up_record', 'stock_daily_price', 'ranking_factor']),
     });
     const analysis = await http.get('/api/analysis').expect(200);

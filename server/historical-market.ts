@@ -25,9 +25,23 @@ export interface HistoricalIndexSeries {
   bars: HistoricalBar[];
 }
 
+export interface HistoricalBlockSeries {
+  block_code: string;
+  block_name: string;
+  bars: HistoricalBar[];
+}
+
 export interface HistoricalLimitUpRecord {
   date: string;
   stock_code: string;
+  stock_name?: string;
+  sector_code?: string;
+  sector_name?: string;
+  continue_num?: number;
+  reason_type?: string;
+  sector_change?: number;
+  latest?: number | null;
+  change_rate?: number | null;
 }
 
 export interface HistoricalMarketData {
@@ -41,6 +55,8 @@ export interface HistoricalMarketData {
   calendar: string[];
   stocks: HistoricalStockSeries[];
   indices?: HistoricalIndexSeries[];
+  /** 同花顺板块指数日线（用于回测滚动计算板块趋势）。 */
+  blocks?: HistoricalBlockSeries[];
   /** 同花顺 block_top 的权威涨停事实；不得从日涨幅反推。 */
   limit_up_records?: HistoricalLimitUpRecord[];
   failed_stocks: number;
@@ -73,6 +89,10 @@ interface CollectionOptions {
   cancelled?: () => boolean;
   audit?: AuditLoggerLike;
   traceId?: string;
+  /** 已有的涨停记录，如果提供则跳过 block_top 网络请求。 */
+  existingLimitUpRecords?: HistoricalLimitUpRecord[];
+  /** 已有的板块指数日线，如果提供则跳过板块 K 线网络请求。 */
+  existingBlockSeries?: HistoricalBlockSeries[];
 }
 
 export const HISTORICAL_WARMUP_DAYS = 70;
@@ -773,6 +793,120 @@ export async function collectHistoricalMarketData(
     throw new Error(`历史行情覆盖不足：成功 ${stocks.length}/${universe.length}，请稍后重试`);
   }
 
+  // ---- 采集日期范围内每天的 block_top 涨停记录 ----
+  // 如果调用方已传入了现有记录（来自 SQLite），则跳过网络请求。
+  const limitUpDates = calendar.slice(-requestedDays);
+  const limitUpRecords: HistoricalLimitUpRecord[] = [];
+  let limitUpDaysCollected = 0;
+  let limitUpDaysFailed = 0;
+  if (options.existingLimitUpRecords?.length) {
+    // 过滤出属于回测日期范围的已有记录
+    const dateSet = new Set(limitUpDates);
+    const sectorCodesSeen = new Set<string>();
+    for (const record of options.existingLimitUpRecords) {
+      if (!dateSet.has(record.date)) continue;
+      if (record.sector_code && /^\d{6}$/.test(record.sector_code)) sectorCodesSeen.add(record.sector_code);
+      limitUpRecords.push(record);
+      limitUpDaysCollected += 1;
+    }
+    await audit.info('market_data', 'limit_up_skip_fetch', {
+      traceId: options.traceId,
+      data: { dates_requested: limitUpDates.length, records_loaded: limitUpRecords.length, dates_with_data: limitUpDaysCollected },
+    });
+  } else {
+    for (let i = 0; i < limitUpDates.length; i += 1) {
+      if (options.cancelled?.()) break;
+      const date = limitUpDates[i];
+      try {
+        const { blocks } = await fetchBlockTop(date);
+        if (blocks.length) {
+          for (const block of blocks) {
+            for (const stock of block.stock_list) {
+              if (!/^\d{6}$/.test(stock.code)) continue;
+              limitUpRecords.push({
+                date,
+                stock_code: stock.code,
+                stock_name: stock.name || stock.code,
+                sector_code: block.code,
+                sector_name: block.name,
+                continue_num: stock.continue_num,
+                reason_type: stock.reason_type,
+                sector_change: block.change,
+                latest: stock.latest,
+                change_rate: stock.change_rate,
+              });
+            }
+          }
+          limitUpDaysCollected += 1;
+        } else {
+          limitUpDaysFailed += 1;
+        }
+      } catch {
+        limitUpDaysFailed += 1;
+      }
+      options.progress?.(universe.length + i + 1, universe.length + limitUpDates.length, `采集涨停记录 ${i + 1}/${limitUpDates.length}`);
+    }
+  }
+  await audit.info('market_data', 'limit_up_collection_done', {
+    traceId: options.traceId,
+    data: { dates_requested: limitUpDates.length, days_collected: limitUpDaysCollected, days_failed: limitUpDaysFailed, records: limitUpRecords.length },
+  });
+
+  // ---- 采集出现过的板块指数日线（用于回测滚动计算板块趋势） ----
+  // 如果调用方已传入了现有板块 K 线，则跳过网络请求。
+  const sectorCodes = limitUpRecords.length
+    ? [...new Map(limitUpRecords.map((r) => [r.sector_code, r.sector_name])).entries()]
+      .filter(([code]) => code && /^\d{6}$/.test(code)) as Array<[string, string | undefined]>
+    : [];
+  const blockSeries: HistoricalBlockSeries[] = [];
+  let blocksCollected = 0;
+  if (options.existingBlockSeries?.length) {
+    const existingByCode = new Map(options.existingBlockSeries.map((b) => [b.block_code, b]));
+    for (const [code] of sectorCodes) {
+      const existing = existingByCode.get(code);
+      if (existing) {
+        blockSeries.push(existing);
+        blocksCollected += 1;
+      }
+    }
+    await audit.info('market_data', 'block_kline_skip_fetch', {
+      traceId: options.traceId,
+      data: { sectors_total: sectorCodes.length, blocks_loaded: blocksCollected },
+    });
+  } else {
+    for (let i = 0; i < sectorCodes.length; i += 1) {
+      if (options.cancelled?.()) break;
+      const [code, name] = sectorCodes[i];
+      try {
+        const { klines } = await fetchBlockKlines(code, '01', 250);
+        if (klines.length >= 20) {
+          blockSeries.push({
+            block_code: code,
+            block_name: name || code,
+            bars: klines.map((k): HistoricalBar => [
+              compactDate(k.date),
+              k.open,
+              k.close,
+              k.high,
+              k.low,
+              k.volume,
+              k.amount,
+              k.changeRate ?? 0,
+            ]),
+          });
+          blocksCollected += 1;
+        }
+      } catch {
+        // 单个板块失败不影响整体
+      }
+      options.progress?.(universe.length + limitUpDates.length + i + 1, universe.length + limitUpDates.length + sectorCodes.length, `采集板块K线 ${i + 1}/${sectorCodes.length}`);
+    }
+  }
+  await audit.info('market_data', 'block_kline_collection_done', {
+    traceId: options.traceId,
+    data: { sectors_total: sectorCodes.length, blocks_collected: blocksCollected },
+  });
+
   const result: HistoricalMarketData = {
     schema_version: 1,
     source: 'multi-source-qfq',
@@ -784,6 +918,8 @@ export async function collectHistoricalMarketData(
     calendar,
     stocks: stocks.sort((left, right) => left.stock_code.localeCompare(right.stock_code)),
     indices: [{ symbol: 'sh000001', index_name: '上证指数', bars: calendarBars }],
+    blocks: blockSeries.length ? blockSeries : undefined,
+    limit_up_records: limitUpRecords.length ? limitUpRecords : undefined,
     failed_stocks: failedStocks,
   };
   await audit.info('market_data', 'collection_completed', {

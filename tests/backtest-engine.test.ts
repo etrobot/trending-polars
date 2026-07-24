@@ -63,7 +63,7 @@ describe('historical backtest timing', () => {
     ]));
 
     const confirmed = structuredClone(priceOnly);
-    confirmed.limit_up_records = [{ date: firstBuy.date, stock_code: firstBuy.stock_code }];
+    confirmed.limit_up_records = [{ date: firstBuy.date, stock_code: firstBuy.stock_code, sector_code: '000000' }];
     const confirmedResult = runPolarsBacktest(confirmed, { days: 10, maxHoldDays: 3 });
     expect(confirmedResult.trades).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ action: '买入', stock_code: firstBuy.stock_code, date: firstBuy.date }),

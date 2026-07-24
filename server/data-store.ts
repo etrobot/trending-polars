@@ -262,6 +262,10 @@ export class DataStore {
     return this.sqlite.loadAllLimitUpCodes();
   }
 
+  async loadLimitUpRecordsForDateRange(fromDate: string, toDate: string) {
+    return this.sqlite.loadLimitUpRecordsForDateRange(fromDate, toDate);
+  }
+
   async getSectorTrendsForDate(date: string): Promise<SectorTrendRecord[]> {
     return this.sqlite.getSectorTrendsForDate(date);
   }
@@ -321,10 +325,19 @@ export class DataStore {
   async getPaperTradingState(): Promise<PaperTradingRuntimeState | null> {
     const runtimePath = path.join(this.runtime, 'paper-trading-state.json');
     if (!(await exists(runtimePath))) return null;
-    return readJson<PaperTradingRuntimeState>(runtimePath);
+    const state = await readJson<PaperTradingRuntimeState>(runtimePath);
+    // instructions 权威来源为 SQLite；首次读取时自动迁移 JSON 中的旧数据
+    const dbInstructions = this.sqlite.loadInstructions();
+    if (dbInstructions.length) {
+      state.instructions = dbInstructions;
+    } else if (state.instructions?.length) {
+      this.sqlite.saveInstructions(state.instructions);
+    }
+    return state;
   }
 
   savePaperTradingState(state: PaperTradingRuntimeState): Promise<void> {
+    this.sqlite.saveInstructions(state.instructions ?? []);
     return writeJson(path.join(this.runtime, 'paper-trading-state.json'), state);
   }
 

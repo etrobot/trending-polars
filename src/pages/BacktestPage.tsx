@@ -13,7 +13,7 @@ import { Modal } from '../components/Modal';
 import { Button, EmptyState, LoadingPanel, SectionHeading } from '../components/Ui';
 import { useTaskResult, useTasks } from '../context/TasksContext';
 import { api, formatMoney, pctColor } from '../lib/api';
-import type { BacktestListItem, BacktestResult, BacktestTrade, TaskSnapshot } from '../types';
+import type { BacktestListItem, BacktestResult, BacktestTrade, EquityPoint, TaskSnapshot } from '../types';
 
 function curveFromTrades(result: BacktestResult) {
   if (result.equity_curve?.length) return result.equity_curve;
@@ -126,6 +126,18 @@ export function BacktestPage() {
 
   const curve = useMemo(() => result ? curveFromTrades(result) : [], [result]);
 
+  const [benchmark, setBenchmark] = useState<EquityPoint[] | null>(null);
+  useEffect(() => {
+    if (!curve.length) { setBenchmark(null); return; }
+    setBenchmark(null);
+    const dates = curve.map((p) => p.date).join(',');
+    const initialCapital = curve[0].total;
+    fetch(`/api/benchmark?dates=${dates}&initial_capital=${initialCapital}`)
+      .then((res) => res.ok ? res.json() : Promise.reject(new Error(String(res.status))))
+      .then((data) => { if (data.curve?.length) setBenchmark(data.curve); })
+      .catch(() => {/* benchmark 可选，失败不阻塞 */});
+  }, [curve]);
+
   const headerActions = <>
     <Button variant="secondary" onClick={() => setHistoryOpen(true)}><Clock3 className="h-3.5 w-3.5" />历史记录</Button>
     <Button variant="ghost" disabled={loading} onClick={() => void loadHistory()}><RefreshCw className="h-3.5 w-3.5" />刷新</Button>
@@ -146,8 +158,8 @@ export function BacktestPage() {
         <>
         <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_260px_260px]">
           <div className="panel p-3.5">
-            <div className="mb-2 flex flex-wrap items-end justify-between gap-3 border-b border-line pb-2"><div><h2 className="font-display text-base text-ink">策略净值</h2>{result.engine_version && <div className="mt-0.5 font-mono text-[10px] text-muted">真实日线 · 收盘信号 / 次日开盘成交 · 含交易成本</div>}</div><div className="font-mono text-[11px] text-muted">{result.date_range}</div></div>
-            <EquityCurve data={curve} />
+            <div className="mb-2 flex flex-wrap items-end justify-between gap-3 border-b border-line pb-2"><h2 className="font-display text-base text-ink">回测走势（{days}天）</h2><div className="font-mono text-[11px] text-muted">{result.date_range}</div></div>
+            <EquityCurve data={curve} benchmark={benchmark ?? undefined} />
           </div>
 
           <section className="panel overflow-hidden">
