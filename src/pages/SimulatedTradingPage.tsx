@@ -173,7 +173,7 @@ export function SimulatedTradingPage() {
   const account = overview?.account;
   const plan = overview?.plan;
   const hasAccountSnapshot = Boolean(overview && overview.connection.status !== 'unavailable' && (overview.account.positions.length > 0 || overview.connection.status === 'live'));
-  const connectionLabel = connecting ? (hasAccountSnapshot ? '后台同步中' : '连接中') : overview?.connection.status === 'live' ? `已同步(${overview.connection.observed_at?.slice(5, 16).replace('-', '/') ?? ''})` : overview?.connection.status === 'cached' ? (hasAccountSnapshot ? '上次快照' : '未同步') : '未连接';
+  const connectionLabel = connecting ? (hasAccountSnapshot ? `上次同步(${overview?.connection.observed_at?.slice(5, 16).replace('-', '/') ?? ''})` : '连接中') : overview?.connection.status === 'live' ? `已同步(${overview.connection.observed_at?.slice(5, 16).replace('-', '/') ?? ''})` : overview?.connection.status === 'cached' ? (hasAccountSnapshot ? '上次快照' : '未同步') : '未连接';
   const connectionDot = connecting ? 'bg-primary animate-pulse' : overview?.connection.status === 'live' && connected ? 'bg-green' : 'bg-muted';
   const tradingDisabled = busy || connecting || !overview || overview.connection.status === 'unavailable';
 
