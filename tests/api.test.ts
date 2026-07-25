@@ -332,7 +332,7 @@ describe('Trending Polars API', () => {
       expect(calls.length).toBeGreaterThan(beforeRanking);
 
       const beforeBacktest = calls.length;
-      const backtestStarted = await workflowHttp.post('/api/backtest/run?days=60&date=20260723').expect(202);
+      const backtestStarted = await workflowHttp.post('/api/backtest/run?mode=random&days=60&strategy_count=8&max_hold_days=5&max_positions=8&position_size_pct=12&take_profit_pct=15&stop_loss_pct=5&date=20260723').expect(202);
       const backtestTask = await waitForTaskFrom(workflowHttp, backtestStarted.body.task_id);
       expect(backtestTask.status).toBe('completed');
       expect(backtestTask.result).toMatchObject({ collected: true, run_id: expect.any(String) });
@@ -344,14 +344,54 @@ describe('Trending Polars API', () => {
     }
   });
 
-  it('runs a Polars-backed backtest and exposes its ledger', async () => {
-    const started = await http.post('/api/backtest/run?days=10&max_hold_days=3&date=20260722').expect(202);
+  it('runs randomized backtests as separate saved runs', async () => {
+    const started = await http.post('/api/backtest/run?mode=random&days=10&strategy_count=6&max_hold_days=3&max_positions=5&position_size_pct=10&take_profit_pct=15&stop_loss_pct=5&date=20260722').expect(202);
+    const task = await waitForTask(started.body.task_id);
+    expect(task.status).toBe('completed');
+    expect(task.result.run_ids).toHaveLength(6);
+    expect(task.message).toContain('6 组随机组合回测');
+    const list = await http.get('/api/backtest/list').expect(200);
+    const saved = list.body.filter((item: { run_id: string }) => task.result.run_ids.includes(item.run_id));
+    expect(saved).toHaveLength(6);
+    expect(saved.find((item: { combo_index: number }) => item.combo_index === 1)).toMatchObject({
+      mode: 'random',
+      combo_index: 1,
+      strategy_count: 6,
+    });
+    const runId = task.result.run_ids[0];
+    const result = await http.get(`/api/backtest/${runId}`).expect(200);
+    expect(result.body.trades.length).toBeGreaterThan(0);
+    expect(result.body.summary.total_trades).toBe(result.body.trades.length);
+    expect(result.body.config).toMatchObject({
+      mode: 'random',
+      days: 10,
+      strategy_count: 6,
+      combo_index: 1,
+      max_hold_days_upper: 3,
+      max_positions_upper: 5,
+      position_size_upper_pct: 10,
+      take_profit_upper_pct: 15,
+      stop_loss_upper_pct: 5,
+    });
+  });
+
+  it('runs a current-scheme backtest with exact parameters', async () => {
+    const started = await http.post('/api/backtest/run?mode=current&days=10&max_hold_days=3&max_positions=5&position_size_pct=10&take_profit_pct=15&stop_loss_pct=5&date=20260722').expect(202);
     const task = await waitForTask(started.body.task_id);
     expect(task.status).toBe('completed');
     const runId = task.result.run_id;
     const result = await http.get(`/api/backtest/${runId}`).expect(200);
     expect(result.body.trades.length).toBeGreaterThan(0);
-    expect(result.body.summary.total_trades).toBe(result.body.trades.length);
+    expect(result.body.config).toMatchObject({
+      mode: 'current',
+      days: 10,
+      strategy_count: 1,
+      max_hold_days: 3,
+      max_positions: 5,
+      position_size_pct: 10,
+      take_profit_pct: 15,
+      stop_loss_pct: -5,
+    });
   });
 
   it('serves the simulated-trading page bootstrap without waiting for or querying Tonghuashun', async () => {

@@ -207,6 +207,13 @@ export interface BacktestListItem {
   win_rate: number;
   max_holdings: number;
   date_range: string;
+  mode?: string;
+  combo_index?: number;
+  strategy_count?: number;
+  batch_run_id?: string;
+  position_size_pct?: number;
+  max_hold_days?: number;
+  max_positions?: number;
 }
 
 export interface PaperPosition {

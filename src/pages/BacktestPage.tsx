@@ -30,49 +30,103 @@ function tradeAction(action: BacktestTrade['action']) {
   return action === '买入' ? 'text-trading-up' : 'text-trading-down';
 }
 
+function historyItemTitle(item: BacktestListItem) {
+  if (item.mode === 'random' && (item.strategy_count ?? 1) > 1) {
+    return `随机组合 ${item.combo_index}/${item.strategy_count}`;
+  }
+  return item.mode === 'current' ? '当前方案' : '随机组合';
+}
+
+function historyItemDetail(item: BacktestListItem) {
+  const parts = [
+    item.position_size_pct ? <>仓位<span className="text-ink">{item.position_size_pct}%</span></> : null,
+    item.max_positions ? <>持仓<span className="text-ink">{item.max_positions} 只</span></> : null,
+    item.max_hold_days ? <>持有<span className="text-ink">{item.max_hold_days} 天</span></> : null,
+    item.date_range ? <span className="text-ink">{item.date_range}</span> : null,
+    <><span className="text-ink">{item.total_trades}</span> 笔</>,
+    <>胜率<span className="text-ink">{item.win_rate}%</span></>,
+  ].filter(Boolean);
+  return <>{parts.map((p, i) => i === 0 ? p : <><span className="mx-1 text-muted">·</span>{p}</>)}</>;
+}
+
 export function BacktestPage() {
   const { setPanelOpen } = useTasks();
   const [history, setHistory] = useState<BacktestListItem[]>([]);
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [runTaskId, setRunTaskId] = useState<string | null>(null);
   const [collectTaskId, setCollectTaskId] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [days, setDays] = useState(20);
+  const [strategyCount, setStrategyCount] = useState(3);
+  const [positionSizePct, setPositionSizePct] = useState(10);
+  const [maxPositions, setMaxPositions] = useState(10);
   const [maxHoldDays, setMaxHoldDays] = useState(5);
+  const [takeProfitPct, setTakeProfitPct] = useState(15);
+  const [stopLossPct, setStopLossPct] = useState(5);
+
+  const loadHistoryList = useCallback(async () => {
+    const items = await api<BacktestListItem[]>('/api/backtest/list');
+    console.log('[backtest] history list loaded', items.length, items.slice(0, 5).map((item) => item.run_id));
+    setHistory(items);
+    return items;
+  }, []);
 
   const loadHistory = useCallback(async () => {
-    const items = await api<BacktestListItem[]>('/api/backtest/list');
-    setHistory(items);
+    const items = await loadHistoryList();
     if (!result && items[0]) {
       const latest = await api<BacktestResult>(`/api/backtest/${items[0].run_id}`);
       setResult(latest);
     }
-  }, [result]);
+  }, [loadHistoryList, result]);
 
   useEffect(() => {
     void loadHistory().catch((loadError) => setError(loadError instanceof Error ? loadError.message : String(loadError))).finally(() => setLoading(false));
   }, [loadHistory]);
+
+  useEffect(() => {
+    if (!historyOpen) return;
+    void loadHistoryList().catch((loadError) => setError(loadError instanceof Error ? loadError.message : String(loadError)));
+  }, [historyOpen, loadHistoryList]);
 
   const onRunDone = useCallback(async (task: TaskSnapshot) => {
     setRunTaskId(null);
     setRunning(false);
     if (task.status !== 'completed') {
       setError(task.message || '回测未完成');
+      setNotice('');
       return;
     }
     try {
       const detail = await api<TaskSnapshot>(`/api/tasks/${task.id}`);
-      const runId = (detail.result as { run_id?: string } | undefined)?.run_id;
-      if (runId) setResult(await api<BacktestResult>(`/api/backtest/${runId}`));
-      await loadHistory();
+      const payload = detail.result as { run_id?: string; run_ids?: string[]; message?: string } | undefined;
+      const runIds = payload?.run_ids?.length
+        ? payload.run_ids
+        : payload?.run_id
+          ? [payload.run_id]
+          : [];
+      console.log('[backtest] task completed', { run_ids: runIds, message: task.message ?? payload?.message });
+      await loadHistoryList();
+      setError('');
+      if (runIds.length > 1) {
+        setResult(await api<BacktestResult>(`/api/backtest/${runIds[0]}`));
+        setNotice(`已生成 ${runIds.length} 条回测记录，可在历史记录中逐条查看（当前展示第 1 组）`);
+        setHistoryOpen(true);
+      } else if (runIds.length) {
+        setResult(await api<BacktestResult>(`/api/backtest/${runIds[0]}`));
+        setNotice('');
+      } else {
+        setNotice(payload?.message ?? task.message ?? '回测已完成');
+      }
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
+      setNotice('');
     }
-  }, [loadHistory]);
+  }, [loadHistoryList]);
   useTaskResult(runTaskId, onRunDone);
 
   const onCollectDone = useCallback((task: TaskSnapshot) => {
@@ -81,12 +135,24 @@ export function BacktestPage() {
   }, []);
   useTaskResult(collectTaskId, onCollectDone);
 
-  const run = async () => {
+  const run = async (mode: 'current' | 'random') => {
     setSettingsOpen(false);
     setRunning(true);
     setError('');
+    setNotice('');
     try {
-      const response = await api<{ task_id: string }>(`/api/backtest/run?days=${days}&max_hold_days=${maxHoldDays}`, { method: 'POST' });
+      const params = new URLSearchParams({
+        mode,
+        days: String(days),
+        strategy_count: String(strategyCount),
+        position_size_pct: String(positionSizePct),
+        max_positions: String(maxPositions),
+        max_hold_days: String(maxHoldDays),
+        take_profit_pct: String(takeProfitPct),
+        stop_loss_pct: String(stopLossPct),
+      });
+      console.log('[backtest] start run', Object.fromEntries(params.entries()));
+      const response = await api<{ task_id: string }>(`/api/backtest/run?${params.toString()}`, { method: 'POST' });
       setRunTaskId(response.task_id);
       setPanelOpen(true);
     } catch (runError) {
@@ -125,6 +191,9 @@ export function BacktestPage() {
   };
 
   const curve = useMemo(() => result ? curveFromTrades(result) : [], [result]);
+  const resultDays = Number(result?.config.days ?? days);
+  const resultMode = String(result?.config?.mode ?? 'random');
+  const configNumber = (key: string) => Number(result?.config?.[key] ?? 0);
 
   const [benchmark, setBenchmark] = useState<EquityPoint[] | null>(null);
   useEffect(() => {
@@ -138,8 +207,14 @@ export function BacktestPage() {
       .catch(() => {/* benchmark 可选，失败不阻塞 */});
   }, [curve]);
 
+  const openHistory = () => {
+    void loadHistoryList()
+      .then(() => setHistoryOpen(true))
+      .catch((loadError) => setError(loadError instanceof Error ? loadError.message : String(loadError)));
+  };
+
   const headerActions = <>
-    <Button variant="secondary" onClick={() => setHistoryOpen(true)}><Clock3 className="h-3.5 w-3.5" />历史记录</Button>
+    <Button variant="secondary" onClick={openHistory}><Clock3 className="h-3.5 w-3.5" />历史记录{history.length ? ` (${history.length})` : ''}</Button>
     <Button variant="ghost" disabled={loading} onClick={() => void loadHistory()}><RefreshCw className="h-3.5 w-3.5" />刷新</Button>
     <Button variant="primary" disabled={running} onClick={() => setSettingsOpen(true)}><Play className="h-3.5 w-3.5" />{running ? '回测进行中' : '运行回测'}</Button>
   </>;
@@ -151,6 +226,7 @@ export function BacktestPage() {
       <PageHeaderActions>{headerActions}</PageHeaderActions>
       <div className="terminal-page">
       {error && <div className="border border-accent-red-soft bg-accent-red-soft px-3 py-2 font-mono text-[11px] text-trading-up">{error}</div>}
+      {notice && <div className="border border-line bg-surface-elevated px-3 py-2 font-mono text-[11px] text-ink">{notice}</div>}
 
       {!result ? (
         <div className="panel"><EmptyState title="还没有可展示的回测" description="先运行一次策略回测，系统会自动构建可复现的历史截面。" /></div>
@@ -158,7 +234,7 @@ export function BacktestPage() {
         <>
         <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_260px_260px]">
           <div className="panel p-3.5">
-            <div className="mb-2 flex flex-wrap items-end justify-between gap-3 border-b border-line pb-2"><h2 className="font-display text-base text-ink">回测走势（{days}天）</h2><div className="font-mono text-[11px] text-muted">{result.date_range}</div></div>
+            <div className="mb-2 flex flex-wrap items-end justify-between gap-3 border-b border-line pb-2"><h2 className="font-display text-base text-ink">回测走势（{resultDays}天）</h2><div className="font-mono text-[11px] text-muted">{result.date_range}</div></div>
             <EquityCurve data={curve} benchmark={benchmark ?? undefined} />
           </div>
 
@@ -178,7 +254,21 @@ export function BacktestPage() {
             </div>
           </section>
 
-          <section className="panel p-3.5"><h2 className="font-display text-base text-ink">参数</h2><div className="mt-3 space-y-2">{[['仓位比例', `${result.config.position_size_pct}% / 单票`], ['最大持仓', `${result.config.max_hold_days} 个交易日`], ['每日新增', `≤ ${result.config.max_positions_per_day} 只`], ['止损 / 止盈', `${result.config.stop_loss_pct}% / +${result.config.take_profit_pct}%`], ['候选池', `前 ${result.config.max_candidates} 名`], ...(result.engine_version ? [['成交假设', 'T+1 开盘 + 滑点税费']] : [])].map(([label, value]) => <div key={label} className="flex items-center justify-between gap-3 border-b border-line-soft pb-2 font-mono text-[11px]"><span className="text-muted">{label}</span><span className="text-right text-ink">{value}</span></div>)}</div><div className="mt-4 flex items-center gap-2 font-mono text-[11px] text-muted"><CalendarRange className="h-3 w-3" />{result.timestamp}</div></section>
+          <section className="panel p-3.5"><h2 className="font-display text-base text-ink">参数</h2><div className="mt-3 space-y-2">{[
+            ['回测模式', resultMode === 'current' ? '当前方案' : '随机组合'],
+            ...(resultMode === 'random' ? [
+              ['策略组合个数', `${configNumber('strategy_count')} 组`],
+              ['当前组合', `第 ${configNumber('combo_index')} / ${configNumber('strategy_count')} 组`],
+            ] : []),
+            ['单票仓位', `${configNumber('position_size_pct')}%`],
+            ['持仓个数', `${configNumber('max_positions')} 只`],
+            ['个股持仓天数', `${configNumber('max_hold_days')} 天`],
+            ['止损', `${configNumber('stop_loss_pct')}%`],
+            ['止盈', `+${configNumber('take_profit_pct')}%`],
+            ['每日新增', `≤ ${configNumber('max_positions_per_day')} 只`],
+            ['候选池', `前 ${configNumber('max_candidates')} 名`],
+            ...(result.engine_version ? [['成交假设', 'T+1 开盘 + 滑点税费']] : []),
+          ].map(([label, value]) => <div key={label} className="flex items-center justify-between gap-3 border-b border-line-soft pb-2 font-mono text-[11px]"><span className="text-muted">{label}</span><span className="text-right text-ink">{value}</span></div>)}</div><div className="mt-4 flex items-center gap-2 font-mono text-[11px] text-muted"><CalendarRange className="h-3 w-3" />{result.timestamp}</div></section>
         </section>
 
         <section>
@@ -188,12 +278,30 @@ export function BacktestPage() {
         </>
       )}
 
-      <Modal open={settingsOpen} onClose={() => setSettingsOpen(false)} title="回测设置" description="选择时间范围与持仓上限，开始一次可复现的策略模拟。">
-        <div className="space-y-4"><label className="block"><span className="font-mono text-[11px] text-muted">回测区间</span><div className="mt-2 flex items-center gap-3"><input type="range" min="5" max="60" step="5" value={days} onChange={(event) => setDays(Number(event.target.value))} className="w-full accent-primary" /><span className="w-11 border border-line bg-surface px-2 py-1.5 text-center font-mono text-[11px]">{days}</span></div><span className="mt-1 block text-[11px] text-muted">最近 {days} 个交易日</span></label><label className="block"><span className="font-mono text-[11px] text-muted">最大持仓日</span><div className="mt-2 flex items-center gap-3"><input type="range" min="1" max="20" value={maxHoldDays} onChange={(event) => setMaxHoldDays(Number(event.target.value))} className="w-full accent-primary" /><span className="w-11 border border-line bg-surface px-2 py-1.5 text-center font-mono text-[11px]">{maxHoldDays}</span></div><span className="mt-1 block text-[11px] text-muted">超过持仓日数后在下一交易日开盘退出</span></label><div className="bg-surface-elevated p-3 text-[11px] leading-4 text-muted">规则：仅用信号日及以前行情计算排名，次日开盘成交；止损 -5% · 止盈 +15% · 单票 10%，并计入滑点、佣金与印花税。</div><div className="flex justify-end gap-2"><Button variant="secondary" onClick={() => void collect()}>采集真实历史日线</Button><Button variant="primary" onClick={() => void run()}><Play className="h-3.5 w-3.5" />开始回测</Button></div></div>
+      <Modal open={settingsOpen} onClose={() => setSettingsOpen(false)} title="回测设置" description="回测天数与策略组合个数为固定值；其余参数：当前方案按原值使用，随机组合则作为取参上限。">
+        <div className="space-y-4">
+          <label className="block"><span className="font-mono text-[11px] text-muted">回测天数（固定）</span><input type="number" min="5" max="60" step="5" value={days} onChange={(event) => setDays(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+          <label className="block"><span className="font-mono text-[11px] text-muted">策略组合个数（固定，仅随机组合使用）</span><input type="number" min="1" max="200" step="1" value={strategyCount} onChange={(event) => setStrategyCount(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="block"><span className="font-mono text-[11px] text-muted">单票仓位（%）（当前取值 / 随机上限）</span><input type="number" min="1" max="100" value={positionSizePct} onChange={(event) => setPositionSizePct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+            <label className="block"><span className="font-mono text-[11px] text-muted">持仓个数（当前取值 / 随机上限）</span><input type="number" min="1" max="20" value={maxPositions} onChange={(event) => setMaxPositions(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+            <label className="block"><span className="font-mono text-[11px] text-muted">个股持仓天数（当前取值 / 随机上限）</span><input type="number" min="1" max="60" value={maxHoldDays} onChange={(event) => setMaxHoldDays(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+            <label className="block"><span className="font-mono text-[11px] text-muted">止盈（%）（当前取值 / 随机上限）</span><input type="number" min="1" max="60" value={takeProfitPct} onChange={(event) => setTakeProfitPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+            <label className="block sm:col-span-2"><span className="font-mono text-[11px] text-muted">止损（%）（当前取值 / 随机上限）</span><input type="number" min="1" max="30" value={stopLossPct} onChange={(event) => setStopLossPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+          </div>
+          <div className="bg-surface-elevated p-3 text-[11px] leading-4 text-muted">
+            回测当前方案：直接使用上方参数原值跑 1 组结果。回测随机组合：在上限内随机取参，分别跑 {strategyCount} 组独立回测，可在历史记录中逐条查看。
+          </div>
+          <div className="flex flex-wrap justify-end gap-2">
+            <Button variant="secondary" onClick={() => void collect()}>采集真实历史日线</Button>
+            <Button variant="secondary" disabled={running} onClick={() => void run('current')}><Play className="h-3.5 w-3.5" />回测当前方案</Button>
+            <Button variant="primary" disabled={running} onClick={() => void run('random')}><Play className="h-3.5 w-3.5" />回测随机组合</Button>
+          </div>
+        </div>
       </Modal>
 
-      <Modal open={historyOpen} onClose={() => setHistoryOpen(false)} title="回测历史" description="选择一条记录查看完整的净值与交易账本。" width="max-w-xl">
-        <div className="divide-y divide-line-soft border border-line bg-surface">{history.length === 0 ? <EmptyState title="暂无历史记录" /> : history.map((item) => <div key={item.run_id} className="flex items-center gap-3 p-3"><button className="focus-ring min-w-0 flex-1 text-left" onClick={() => void loadRun(item.run_id)}><div className="flex items-center justify-between gap-3"><span className="font-mono text-[11px] text-ink">{item.timestamp}</span><span className={`font-mono text-[11px] ${pctColor(item.total_return_pct)}`}>{item.total_return_pct > 0 ? '+' : ''}{item.total_return_pct.toFixed(2)}%</span></div><div className="mt-1 text-[11px] text-muted">{item.date_range} · {item.total_trades} 笔 · 胜率 {item.win_rate}%</div></button><button className="focus-ring border border-transparent p-1.5 text-muted hover:border-accent-red-soft hover:bg-accent-red-soft hover:text-trading-up" onClick={() => void deleteRun(item.run_id)} aria-label="删除回测"><Trash2 className="h-3.5 w-3.5" /></button><ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted" /></div>)}</div>
+      <Modal open={historyOpen} onClose={() => setHistoryOpen(false)} title="回测历史" description={`共 ${history.length} 条记录。随机组合批次会分别保存，可按组合序号切换查看。`} width="max-w-xl">
+        <div className="divide-y divide-line-soft border border-line bg-surface">{history.length === 0 ? <EmptyState title="暂无历史记录" /> : history.map((item) => <div key={item.run_id} className="flex items-center gap-3 p-3"><button className="focus-ring min-w-0 flex-1 text-left" onClick={() => void loadRun(item.run_id)}><div className="flex items-center justify-between gap-3"><div className="min-w-0"><div className="font-mono text-[11px] text-ink">{historyItemTitle(item)}</div><div className="mt-0.5 font-mono text-[10px] text-muted">{item.timestamp} · {item.run_id}</div></div><span className={`shrink-0 font-mono text-[11px] ${pctColor(item.total_return_pct)}`}>{item.total_return_pct > 0 ? '+' : ''}{item.total_return_pct.toFixed(2)}%</span></div><div className="mt-1 text-[11px] text-muted">{historyItemDetail(item)}</div></button><button className="focus-ring border border-transparent p-1.5 text-muted hover:border-accent-red-soft hover:bg-accent-red-soft hover:text-trading-up" onClick={() => void deleteRun(item.run_id)} aria-label="删除回测"><Trash2 className="h-3.5 w-3.5" /></button><ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted" /></div>)}</div>
       </Modal>
       </div>
     </>

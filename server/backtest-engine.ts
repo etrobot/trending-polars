@@ -32,6 +32,49 @@ interface EntryOrder {
   signalDate: string;
 }
 
+interface BacktestContext {
+  dates: string[];
+  prepared: PreparedSeries[];
+  seriesByCode: Map<string, PreparedSeries>;
+  exactLimitUpCodes: Map<string, Set<string>>;
+  scoreMap: ReturnType<typeof computeBacktestScores>;
+}
+
+interface SimulatedBacktest {
+  cash: number;
+  trades: BacktestTrade[];
+  equityCurve: EquityPoint[];
+  maxHoldings: number;
+}
+
+interface BacktestSummarySnapshot {
+  finalCapital: number;
+  totalReturn: number;
+  totalReturnPct: number;
+  totalTrades: number;
+  buyCount: number;
+  sellCount: number;
+  winCount: number;
+  winRate: number;
+  expireCount: number;
+  maxHoldings: number;
+  maxDrawdownPct: number;
+}
+
+interface BacktestRunMeta {
+  mode: 'current' | 'random';
+  batchSize?: number;
+  comboIndex?: number;
+  batchRunId?: string;
+  bounds?: {
+    maxHoldDays: number;
+    maxPositions: number;
+    stopLossPct: number;
+    takeProfitPct: number;
+    positionSizePct: number;
+  };
+}
+
 const INITIAL_CAPITAL = 100_000;
 
 function limitUpDatesByCode(history: HistoricalMarketData): Map<string, Set<string>> {
@@ -150,23 +193,22 @@ function sellPosition(
   };
 }
 
-export function runPolarsBacktest(
-  history: HistoricalMarketData,
-  options: { days: number; maxHoldDays: number },
-): BacktestResult {
-  const days = Math.min(60, Math.max(5, Math.trunc(options.days || 20)));
-  const maxHoldDays = Math.max(1, Math.trunc(options.maxHoldDays || 5));
-  const strategy = createT1StrategyConfig({ maxHoldDays });
+function buildBacktestContext(history: HistoricalMarketData, days: number): BacktestContext {
   const dates = history.calendar.filter((date) => date <= history.as_of_date).slice(-days);
   if (dates.length < 2) throw new Error('历史数据不足，至少需要两个交易日');
-
-  // ---- Vectorized score pre-computation (single Polars pass) ----
   const exactLimitUpDates = limitUpDatesByCode(history);
-  const exactLimitUpCodes = limitUpCodesByDate(history);
-  const scoreMap = computeBacktestScores(history, dates, exactLimitUpDates);
-
   const prepared = history.stocks.map(prepareSeries);
-  const seriesByCode = new Map(prepared.map((series) => [series.stockCode, series]));
+  return {
+    dates,
+    exactLimitUpCodes: limitUpCodesByDate(history),
+    scoreMap: computeBacktestScores(history, dates, exactLimitUpDates),
+    prepared,
+    seriesByCode: new Map(prepared.map((series) => [series.stockCode, series] as const)),
+  };
+}
+
+function simulateBacktest(context: BacktestContext, strategy: ReturnType<typeof createT1StrategyConfig>): SimulatedBacktest {
+  const { dates, prepared, seriesByCode, exactLimitUpCodes, scoreMap } = context;
   const positions = new Map<string, Position>();
   const pendingExits = new Map<string, string>();
   const lastKnownClose = new Map<string, number>();
@@ -209,33 +251,32 @@ export function runPolarsBacktest(
 
       const fillPrice = round(bar.open * (1 + strategy.slippageRate), 3);
       const sizing = calculateEntrySize(cash, INITIAL_CAPITAL, fillPrice, strategy);
-      if (sizing) {
-          cash = round(cash - sizing.totalCost, 2);
-          positions.set(order.stockCode, {
-            stockCode: order.stockCode,
-            stockName: order.stockName,
-            buyPrice: fillPrice,
-            buyDate: date,
-            buyIndex: dateIndex,
-            shares: sizing.shares,
-            grossAmount: sizing.grossAmount,
-            totalCost: sizing.totalCost,
-          });
-          trades.push({
-            date,
-            stock_code: order.stockCode,
-            stock_name: order.stockName,
-            action: '买入',
-            price: fillPrice,
-            shares: sizing.shares,
-            amount: sizing.grossAmount,
-            position_pct: round(sizing.grossAmount / INITIAL_CAPITAL * 100, 1),
-            hold_days: 0,
-            pnl_pct: 0,
-            pnl_amount: 0,
-            reason: `信号日${order.signalDate} 排名#${order.rank} ${order.strategyLabel} 次日开盘`,
-          });
-      }
+      if (!sizing) continue;
+      cash = round(cash - sizing.totalCost, 2);
+      positions.set(order.stockCode, {
+        stockCode: order.stockCode,
+        stockName: order.stockName,
+        buyPrice: fillPrice,
+        buyDate: date,
+        buyIndex: dateIndex,
+        shares: sizing.shares,
+        grossAmount: sizing.grossAmount,
+        totalCost: sizing.totalCost,
+      });
+      trades.push({
+        date,
+        stock_code: order.stockCode,
+        stock_name: order.stockName,
+        action: '买入',
+        price: fillPrice,
+        shares: sizing.shares,
+        amount: sizing.grossAmount,
+        position_pct: round(sizing.grossAmount / INITIAL_CAPITAL * 100, 1),
+        hold_days: 0,
+        pnl_pct: 0,
+        pnl_amount: 0,
+        reason: `信号日${order.signalDate} 排名#${order.rank} ${order.strategyLabel} 次日开盘`,
+      });
     }
     maxHoldings = Math.max(maxHoldings, positions.size);
 
@@ -297,57 +338,246 @@ export function runPolarsBacktest(
 
   trades.sort((left, right) => left.date.localeCompare(right.date)
     || (left.action === right.action ? 0 : left.action === '买入' ? -1 : 1));
-  const sellTrades = trades.filter((trade) => trade.action === '卖出');
+
+  return { cash, trades, equityCurve, maxHoldings };
+}
+
+function summarizeSimulation(simulation: SimulatedBacktest): BacktestSummarySnapshot {
+  const sellTrades = simulation.trades.filter((trade) => trade.action === '卖出');
   const sellFrame = pl.DataFrame(sellTrades.map((trade) => ({
     pnl_pct: Number(trade.pnl_pct),
     pnl_amount: Number(trade.pnl_amount ?? 0),
     hold_days: Number(trade.hold_days),
   })));
-  const totalReturn = round(cash - INITIAL_CAPITAL, 2);
+  const totalReturn = round(simulation.cash - INITIAL_CAPITAL, 2);
   const winCount = sellFrame.height ? sellFrame.filter(pl.col('pnl_amount').gt(0)).height : 0;
+  return {
+    finalCapital: round(simulation.cash, 2),
+    totalReturn,
+    totalReturnPct: round(totalReturn / INITIAL_CAPITAL * 100, 2),
+    totalTrades: simulation.trades.length,
+    buyCount: simulation.trades.length - sellTrades.length,
+    sellCount: sellTrades.length,
+    winCount,
+    winRate: sellTrades.length ? round(winCount / sellTrades.length * 100, 1) : 0,
+    expireCount: sellTrades.filter((trade) => trade.reason.startsWith('持仓满')).length,
+    maxHoldings: simulation.maxHoldings,
+    maxDrawdownPct: drawdownPercent(simulation.equityCurve.map((point) => point.total)),
+  };
+}
+
+function normalizeStopLossPct(value: number | undefined): number {
+  const raw = value ?? DEFAULT_T1_STRATEGY.stopLossPct;
+  return -Math.max(1, Math.abs(Math.trunc(raw)));
+}
+
+function buildResult(
+  history: HistoricalMarketData,
+  context: BacktestContext,
+  strategy: ReturnType<typeof createT1StrategyConfig>,
+  simulation: SimulatedBacktest,
+  meta?: BacktestRunMeta,
+): BacktestResult {
   const timestamp = formatDateTime();
-  const runId = `${compactDate().slice(0, 8)}_${compactDate().slice(8)}`;
+  const baseRunId = meta?.batchRunId ?? `${compactDate().slice(0, 8)}_${compactDate().slice(8)}`;
+  const runId = meta?.comboIndex != null && (meta.batchSize ?? 1) > 1
+    ? `${baseRunId}_${String(meta.comboIndex).padStart(3, '0')}`
+    : baseRunId;
+  const summary = summarizeSimulation(simulation);
+  const finalDate = context.dates.at(-1)!;
+  const mode = meta?.mode ?? 'current';
+  const methodologyPrefix = mode === 'random'
+    ? `在上限范围内随机取参的第 ${meta?.comboIndex ?? 1}/${meta?.batchSize ?? 1} 组策略组合；`
+    : '按当前方案参数直接回测；';
+
+  console.log('[backtest] buildResult', {
+    mode,
+    run_id: runId,
+    combo_index: meta?.comboIndex ?? 1,
+    batch_size: meta?.batchSize ?? 1,
+    max_hold_days: strategy.maxHoldDays,
+    max_positions: strategy.maxPositions,
+    position_size_pct: strategy.positionSizePct,
+    take_profit_pct: strategy.takeProfitPct,
+    stop_loss_pct: strategy.stopLossPct,
+    total_return_pct: summary.totalReturnPct,
+    trades: summary.totalTrades,
+  });
 
   return {
     run_id: runId,
     timestamp,
-    date_range: `${dates[0]} → ${finalDate}`,
-    max_hold_days: maxHoldDays,
-    engine_version: 'historical-t1-v2',
+    date_range: `${context.dates[0]} → ${finalDate}`,
+    max_hold_days: strategy.maxHoldDays,
+    engine_version: mode === 'random' ? 'historical-t1-v3' : 'historical-t1-v2',
     data_source: history.source,
-    methodology: '当日收盘生成信号，下一交易日开盘成交；涨停事实仅使用同花顺 block_top 记录，不从涨跌幅或理论涨停价反推；个股与宽基/中证指数日线按腾讯→新浪→东方财富顺序获取前复权数据，并计入滑点、佣金与卖出印花税。',
+    methodology: `${methodologyPrefix}当日收盘生成信号，下一交易日开盘成交；涨停事实仅使用同花顺 block_top 记录，不从涨跌幅或理论涨停价反推；个股与宽基/中证指数日线按腾讯→新浪→东方财富顺序获取前复权数据，并计入滑点、佣金与卖出印花税。`,
     bias_notes: [
       '股票池来自当前可用排行快照，仍可能存在幸存者偏差；交易信号和成交价格不使用未来行情。',
       '缺少 block_top 记录的日期视为“涨停状态未知”，不会用价格幅度补判。',
     ],
     summary: {
       initial_capital: INITIAL_CAPITAL,
-      final_capital: round(cash, 2),
-      total_return: totalReturn,
-      total_return_pct: round(totalReturn / INITIAL_CAPITAL * 100, 2),
-      total_trades: trades.length,
-      buy_count: trades.length - sellTrades.length,
-      sell_count: sellTrades.length,
-      win_count: winCount,
-      win_rate: sellTrades.length ? round(winCount / sellTrades.length * 100, 1) : 0,
-      expire_count: sellTrades.filter((trade) => trade.reason.startsWith('持仓满')).length,
-      max_holdings: maxHoldings,
-      max_drawdown_pct: drawdownPercent(equityCurve.map((point) => point.total)),
+      final_capital: summary.finalCapital,
+      total_return: summary.totalReturn,
+      total_return_pct: summary.totalReturnPct,
+      total_trades: summary.totalTrades,
+      buy_count: summary.buyCount,
+      sell_count: summary.sellCount,
+      win_count: summary.winCount,
+      win_rate: summary.winRate,
+      expire_count: summary.expireCount,
+      max_holdings: summary.maxHoldings,
+      max_drawdown_pct: summary.maxDrawdownPct,
     },
     config: {
+      mode,
       initial_capital: INITIAL_CAPITAL,
-      max_hold_days: maxHoldDays,
+      days: context.dates.length,
+      strategy_count: meta?.batchSize ?? 1,
+      combo_index: meta?.comboIndex ?? 1,
+      batch_run_id: meta?.batchRunId ?? baseRunId,
+      max_hold_days: strategy.maxHoldDays,
       max_positions: strategy.maxPositions,
       stop_loss_pct: strategy.stopLossPct,
       take_profit_pct: strategy.takeProfitPct,
       max_positions_per_day: strategy.maxEntriesPerDay,
       position_size_pct: strategy.positionSizePct,
       max_candidates: strategy.maxCandidates,
+      max_hold_days_upper: meta?.bounds?.maxHoldDays ?? strategy.maxHoldDays,
+      max_positions_upper: meta?.bounds?.maxPositions ?? strategy.maxPositions,
+      stop_loss_upper_pct: meta?.bounds?.stopLossPct ?? Math.abs(strategy.stopLossPct),
+      take_profit_upper_pct: meta?.bounds?.takeProfitPct ?? strategy.takeProfitPct,
+      position_size_upper_pct: meta?.bounds?.positionSizePct ?? strategy.positionSizePct,
       slippage_bps: strategy.slippageRate * 10_000,
       commission_bps: strategy.commissionRate * 10_000,
       stamp_tax_bps: strategy.stampTaxRate * 10_000,
     },
-    trades,
-    equity_curve: equityCurve,
+    trades: simulation.trades,
+    equity_curve: simulation.equityCurve,
   };
+}
+
+export function runPolarsBacktest(
+  history: HistoricalMarketData,
+  options: {
+    days: number;
+    maxHoldDays: number;
+    maxPositions?: number;
+    stopLossPct?: number;
+    takeProfitPct?: number;
+    positionSizePct?: number;
+  },
+): BacktestResult {
+  const days = Math.min(60, Math.max(5, Math.trunc(options.days || 20)));
+  const strategy = createT1StrategyConfig({
+    maxHoldDays: Math.max(1, Math.trunc(options.maxHoldDays || 5)),
+    maxPositions: Math.max(1, Math.trunc(options.maxPositions ?? DEFAULT_T1_STRATEGY.maxPositions)),
+    stopLossPct: normalizeStopLossPct(options.stopLossPct),
+    takeProfitPct: Math.max(1, Math.trunc(options.takeProfitPct ?? DEFAULT_T1_STRATEGY.takeProfitPct)),
+    positionSizePct: Math.max(1, Math.trunc(options.positionSizePct ?? DEFAULT_T1_STRATEGY.positionSizePct)),
+  });
+  console.log('[backtest] runPolarsBacktest current scheme', {
+    days,
+    maxHoldDays: strategy.maxHoldDays,
+    maxPositions: strategy.maxPositions,
+    positionSizePct: strategy.positionSizePct,
+    takeProfitPct: strategy.takeProfitPct,
+    stopLossPct: strategy.stopLossPct,
+  });
+  const context = buildBacktestContext(history, days);
+  const simulation = simulateBacktest(context, strategy);
+  return buildResult(history, context, strategy, simulation, {
+    mode: 'current',
+    batchSize: 1,
+    comboIndex: 1,
+  });
+}
+
+function hashString(input: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function createRng(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6D2B79F5) >>> 0;
+    let value = Math.imul(state ^ (state >>> 15), 1 | state);
+    value ^= value + Math.imul(value ^ (value >>> 7), 61 | value);
+    return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function randomInt(rng: () => number, min: number, max: number): number {
+  return Math.floor(rng() * (max - min + 1)) + min;
+}
+
+export function runRandomizedBacktest(
+  history: HistoricalMarketData,
+  options: {
+    days: number;
+    strategyCount: number;
+    maxHoldDaysUpper: number;
+    maxPositionsUpper: number;
+    stopLossPctUpper: number;
+    takeProfitPctUpper: number;
+    positionSizePctUpper: number;
+  },
+): BacktestResult[] {
+  const days = Math.min(60, Math.max(5, Math.trunc(options.days || 20)));
+  const strategyCount = Math.min(200, Math.max(1, Math.trunc(options.strategyCount || 20)));
+  const bounds = {
+    maxHoldDays: Math.min(60, Math.max(1, Math.trunc(options.maxHoldDaysUpper || DEFAULT_T1_STRATEGY.maxHoldDays))),
+    maxPositions: Math.min(20, Math.max(1, Math.trunc(options.maxPositionsUpper || DEFAULT_T1_STRATEGY.maxPositions))),
+    stopLossPct: Math.min(30, Math.max(1, Math.trunc(options.stopLossPctUpper || Math.abs(DEFAULT_T1_STRATEGY.stopLossPct)))),
+    takeProfitPct: Math.min(60, Math.max(1, Math.trunc(options.takeProfitPctUpper || DEFAULT_T1_STRATEGY.takeProfitPct))),
+    positionSizePct: Math.min(100, Math.max(1, Math.trunc(options.positionSizePctUpper || DEFAULT_T1_STRATEGY.positionSizePct))),
+  };
+  console.log('[backtest] runRandomizedBacktest start', { days, strategyCount, bounds });
+  const context = buildBacktestContext(history, days);
+  const batchRunId = `${compactDate().slice(0, 8)}_${compactDate().slice(8)}`;
+  const seed = hashString([
+    history.as_of_date,
+    history.stocks.length,
+    days,
+    strategyCount,
+    bounds.maxHoldDays,
+    bounds.maxPositions,
+    bounds.stopLossPct,
+    bounds.takeProfitPct,
+    bounds.positionSizePct,
+  ].join('|'));
+  const rng = createRng(seed);
+  const results: BacktestResult[] = [];
+
+  for (let index = 0; index < strategyCount; index += 1) {
+    const strategy = createT1StrategyConfig({
+      maxHoldDays: randomInt(rng, 1, bounds.maxHoldDays),
+      maxPositions: randomInt(rng, 1, bounds.maxPositions),
+      stopLossPct: -randomInt(rng, 1, bounds.stopLossPct),
+      takeProfitPct: randomInt(rng, 1, bounds.takeProfitPct),
+      positionSizePct: randomInt(rng, 1, bounds.positionSizePct),
+    });
+    const simulation = simulateBacktest(context, strategy);
+    results.push(buildResult(history, context, strategy, simulation, {
+      mode: 'random',
+      batchSize: strategyCount,
+      comboIndex: index + 1,
+      batchRunId,
+      bounds,
+    }));
+    console.log('[backtest] random combo done', {
+      combo_index: index + 1,
+      batch_size: strategyCount,
+      total_return_pct: results.at(-1)?.summary.total_return_pct,
+      run_id: results.at(-1)?.run_id,
+    });
+  }
+
+  return results;
 }

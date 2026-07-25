@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import type { AnalysisData, BlockAnalysis, IndexAnalysis, LimitUpStock, RankingRow } from '../src/types.js';
 import { AuditLogger, guardDetachedPromise, type AuditLevel } from './audit-log.js';
-import { historicalCrossSectionRankings, runPolarsBacktest } from './backtest-engine.js';
+import { historicalCrossSectionRankings, runPolarsBacktest, runRandomizedBacktest } from './backtest-engine.js';
 import { fetchSohuIndexKlines, buildBenchmarkCurve } from './benchmark.js';
 import { DataStore } from './data-store.js';
 import { compactDate, formatDateTime, round } from './format.js';
@@ -812,10 +812,19 @@ export function createApp(services: Partial<AppServices> = {}) {
   }));
 
   app.post('/api/backtest/run', asyncHandler(async (request, response) => {
+    const mode = String(request.query.mode ?? 'random') === 'current' ? 'current' : 'random';
     const days = numberParam(request.query.days, 20, 5, 60);
+    const strategyCount = numberParam(request.query.strategy_count, 20, 1, 200);
     const maxHoldDays = numberParam(request.query.max_hold_days, 5, 1, 60);
+    const maxPositions = numberParam(request.query.max_positions, 10, 1, 20);
+    const positionSizePct = numberParam(request.query.position_size_pct, 10, 1, 100);
+    const takeProfitPct = numberParam(request.query.take_profit_pct, 15, 1, 60);
+    const stopLossPct = numberParam(request.query.stop_loss_pct, 5, 1, 30);
     const requestedDate = marketDateParam(request.query.date);
-    const task = tasks.start('backtest_run', `运行 ${days} 日策略回测`, async ({ progress, cancelled, traceId }) => {
+    const taskLabel = mode === 'current'
+      ? `运行 ${days} 日当前方案回测`
+      : `运行 ${days} 日随机组合回测（${strategyCount} 组）`;
+    const task = tasks.start('backtest_run', taskLabel, async ({ progress, cancelled, traceId }) => {
       const source = await store.getRankingUniverse();
       if (!source.rankings.length) throw new Error('当前股票池为空，无法运行回测');
       const prepared = await ensureHistoricalCoverage({
@@ -828,29 +837,86 @@ export function createApp(services: Partial<AppServices> = {}) {
       });
       if (cancelled()) return null;
       const history = prepared.history;
+      console.log('[backtest] /api/backtest/run', {
+        mode,
+        days,
+        strategy_count: strategyCount,
+        max_hold_days: maxHoldDays,
+        max_positions: maxPositions,
+        position_size_pct: positionSizePct,
+        take_profit_pct: takeProfitPct,
+        stop_loss_pct: stopLossPct,
+        history_as_of_date: history.as_of_date,
+        stocks: history.stocks.length,
+      });
       await audit.info('backtest', 'run_started', {
         traceId,
-        data: { days, max_hold_days: maxHoldDays, history_as_of_date: history.as_of_date, stocks: history.stocks.length },
-      });
-      progress(62, '按当日收盘生成信号，次日开盘成交');
-      const result = runPolarsBacktest(history, { days, maxHoldDays });
-      progress(88, '汇总含交易成本的收益、胜率与回撤');
-      await store.saveBacktest(result);
-      await audit.info('backtest', 'run_completed', {
-        traceId,
         data: {
-          run_id: result.run_id,
-          summary: result.summary,
-          config: result.config,
-          trades: result.trades,
-          output_path: path.join(store.runtime, 'backtests', `${result.run_id}.json`),
+          mode,
+          days,
+          strategy_count: strategyCount,
+          max_hold_days: maxHoldDays,
+          max_positions: maxPositions,
+          position_size_pct: positionSizePct,
+          take_profit_pct: takeProfitPct,
+          stop_loss_pct: stopLossPct,
+          history_as_of_date: history.as_of_date,
+          stocks: history.stocks.length,
         },
       });
+      progress(
+        62,
+        mode === 'current'
+          ? '按当前方案参数执行回测'
+          : `随机生成并回测 ${strategyCount} 组参数组合`,
+      );
+      const results = mode === 'current'
+        ? [runPolarsBacktest(history, {
+          days,
+          maxHoldDays,
+          maxPositions,
+          positionSizePct,
+          takeProfitPct,
+          stopLossPct,
+        })]
+        : runRandomizedBacktest(history, {
+          days,
+          strategyCount,
+          maxHoldDaysUpper: maxHoldDays,
+          maxPositionsUpper: maxPositions,
+          positionSizePctUpper: positionSizePct,
+          takeProfitPctUpper: takeProfitPct,
+          stopLossPctUpper: stopLossPct,
+        });
+      progress(88, mode === 'current' ? '汇总含交易成本的收益、胜率与回撤' : `汇总 ${results.length} 组回测结果`);
+      for (let index = 0; index < results.length; index += 1) {
+        const result = results[index];
+        if (mode === 'random') {
+          progress(88 + (index / Math.max(results.length, 1)) * 10, `保存第 ${index + 1}/${results.length} 组回测`);
+        }
+        await store.saveBacktest(result);
+        await audit.info('backtest', 'run_completed', {
+          traceId,
+          data: {
+            run_id: result.run_id,
+            combo_index: result.config.combo_index,
+            batch_size: result.config.strategy_count,
+            summary: result.summary,
+            config: result.config,
+            trades: result.trades,
+            output_path: path.join(store.runtime, 'backtests', `${result.run_id}.json`),
+          },
+        });
+      }
+      const primary = results[0];
       return {
-        run_id: result.run_id,
-        summary: result.summary,
+        run_id: primary.run_id,
+        run_ids: results.map((item) => item.run_id),
+        summary: primary.summary,
         collected: prepared.collected,
-        message: `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成 ${result.date_range} 回测`,
+        message: mode === 'random'
+          ? `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成 ${results.length} 组随机组合回测（${primary.date_range}）`
+          : `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成 ${primary.date_range} 回测`,
       };
     });
     response.status(202).json({ task_id: task.id, status: 'started', message: '回测任务已启动' });

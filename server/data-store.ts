@@ -362,7 +362,7 @@ export class DataStore {
       byId.set(result.run_id, result);
     }
     return [...byId.values()]
-      .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp) || b.run_id.localeCompare(a.run_id))
       .map((result) => ({
         run_id: result.run_id,
         timestamp: result.timestamp,
@@ -371,6 +371,13 @@ export class DataStore {
         win_rate: result.summary?.win_rate ?? 0,
         max_holdings: result.summary?.max_holdings ?? 0,
         date_range: result.date_range ?? '',
+        mode: String(result.config?.mode ?? 'current'),
+        combo_index: Number(result.config?.combo_index ?? 1),
+        strategy_count: Number(result.config?.strategy_count ?? 1),
+        batch_run_id: String(result.config?.batch_run_id ?? result.run_id),
+        position_size_pct: Number(result.config?.position_size_pct ?? 0),
+        max_hold_days: Number(result.config?.max_hold_days ?? 0),
+        max_positions: Number(result.config?.max_positions ?? 0),
       }));
   }
 
