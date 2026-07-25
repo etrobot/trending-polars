@@ -347,11 +347,11 @@ on refreshSimulationConnection(simulationWindow)
         repeat with b in buttons of simulationWindow
             try
                 set n to name of b as text
-                set bPos to position of b
-                set bX to item 1 of bPos
-                set bY to item 2 of bPos
+                set btnPos to position of b
+                set btnX to item 1 of btnPos
+                set btnY to item 2 of btnPos
                 -- 无名按钮、同行、在"模拟"右侧且不超过"股票"位置
-                if n is "" and bY = tabY and bX > tabX and bX < tabX + 200 then
+                if n is "" and btnY = tabY and btnX > tabX and btnX < tabX + 200 then
                     my pressControl(b)
                     delay 1.5
                     return
@@ -366,10 +366,10 @@ on refreshSimulationConnection(simulationWindow)
                 set n to ""
             end try
             try
-                set bPos to position of b
-                set bX to item 1 of bPos
-                set bY to item 2 of bPos
-                if n is "" and bY = tabY and bX > tabX and bX < tabX + 200 then
+                set btnPos to position of b
+                set btnX to item 1 of btnPos
+                set btnY to item 2 of btnPos
+                if n is "" and btnY = tabY and btnX > tabX and btnX < tabX + 200 then
                     my pressControl(b)
                     delay 1.5
                     return
