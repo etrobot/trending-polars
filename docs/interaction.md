@@ -286,9 +286,14 @@ POST /api/ranking/compute            # 校验/补采需求日期行情后异步�
 # ==== 回测 ====
 POST /api/backtest/collect?days=20   # 采集历史数据
 POST /api/backtest/run?days=20       # 校验/补采所需区间后运行回测
+POST /api/backtest/optimize?days=20  # 两阶段参数优化（scoreStock + 回测参数）
+                                      # 任务进度通过 WebSocket（type=task_progress）推送
+                                      # 完成后从 /api/tasks/:taskId.result 读取 OptimizedParams / validation
 GET /api/backtest/list               # 回测列表
 GET /api/backtest/:runId             # 回测详情
-DELETE /api/backtest/:runId          # 删除回测
+DELETE /api/backtest/:runId          # 删除回测（支持前端勾选批量并发 DELETE）
+# 应用参数：前端使用任务 result.optimized，结果本身可由优化详情 modal 直接回填
+
 
 # ==== 基准指数对照 ====
 GET /api/benchmark?dates=20260701,20260702,20260703&initial_capital=100000  # 基准指数净值曲线（上证380）

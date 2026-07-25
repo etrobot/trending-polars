@@ -56,7 +56,8 @@
 | 向量化回测评分 | `server/backtest-scoring.ts` | 单次 Polars 遍历计算全量股票×日期评分矩阵，替代逐日逐股 scoreStock 循环 |
 | 基准指数对照 | `server/benchmark.ts` | 从搜狐获取指数日线，归一化生成与回测叠加的 benchmark 净值曲线 |
 | 交易策略 | `server/trading-strategy.ts` | 参数配置、选股过滤、仓位计算、止盈止损；不负责涨停判定 |
-| 回测引擎 | `server/backtest-engine.ts` | 历史回测、日内循环、评分驱动 |
+| 回测引擎 | `server/backtest-engine.ts` | 历史回测、日内循环、评分驱动；导出 `prepareBacktestContext` / `quickSimulateBacktest` 供参数优化复用 |
+| 参数优化 | `server/backtest-param-optimizer.ts` | 两阶段优化：先校准 scoreStock 评分参数，再网格搜索回测交易参数，目标为完整回测收益 |
 | 模拟交易 | `server/paper-trading.ts` | 交易计划、执行、调度、监控 |
 | 同花顺桥接 | `server/ths-simulated-broker.ts` | AppleScript 调用、持仓解析 |
 | 审计日志 | `server/audit-log.ts` | JSONL 日志、查询、轮转 |

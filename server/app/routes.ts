@@ -4,10 +4,12 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import type { AnalysisData } from '../../src/types.js';
 import { guardDetachedPromise, type AuditLevel, type AuditLoggerLike } from '../audit-log.js';
 import { runPolarsBacktest, runRandomizedBacktest, sectorTrendLookupMap } from '../backtest-engine.js';
+import { optimizeStrategyParams } from '../backtest-param-optimizer.js';
 import { fetchSohuIndexKlines, buildBenchmarkCurve } from '../benchmark.js';
 import { compactDate, formatDateTime, round } from '../format.js';
 import { fetchAdjustedKlines, fetchBlockKlines, type BlockKlinePeriod } from '../historical-market.js';
 import { queryRankings } from '../polars-engine.js';
+import { normalizeScoreStockConfig } from '../scoring-engine.js';
 import type { TaskRegistry } from '../tasks.js';
 import { ThsSimulatedBrokerError } from '../ths-simulated-broker.js';
 import { MarketService, analysisWithStats, priceRows, averageRankingChange } from './market-service.js';
@@ -31,6 +33,29 @@ function numberParam(value: unknown, fallback: number, min: number, max: number)
 function marketDateParam(value: unknown, fallback = compactDate().slice(0, 8)): string {
   const normalized = String(value ?? '').replace(/\D/g, '').slice(0, 8);
   return /^\d{8}$/.test(normalized) ? normalized : fallback;
+}
+
+function parseScoringConfig(value: unknown): ReturnType<typeof normalizeScoreStockConfig> | undefined {
+  if (value == null) return undefined;
+  let raw: unknown = value;
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return undefined;
+    try {
+      raw = JSON.parse(trimmed);
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof raw !== 'object' || raw == null) return undefined;
+  return normalizeScoreStockConfig(raw as Parameters<typeof normalizeScoreStockConfig>[0]);
+}
+
+function readScoringConfig(request: Request): ReturnType<typeof normalizeScoreStockConfig> | undefined {
+  const fromQuery = parseScoringConfig((request.query as Record<string, unknown>).scoring_config);
+  if (fromQuery) return fromQuery;
+  const body = (request.body ?? {}) as { scoring_config?: unknown };
+  return parseScoringConfig(body.scoring_config);
 }
 
 const INDEX_NAMES: Record<string, string> = {
@@ -428,6 +453,7 @@ export function registerRoutes(
           ? '按当前方案参数执行回测'
           : `随机生成并回测 ${strategyCount} 组参数组合`,
       );
+      const scoringConfig = readScoringConfig(request);
       const results = mode === 'current'
         ? [runPolarsBacktest(history, {
           days,
@@ -440,6 +466,7 @@ export function registerRoutes(
           volumePriceWeightPct,
           distanceFromLowWeightPct,
           volatilityTrendWeightPct: volatilityWeightPct,
+          scoringConfig,
         })]
         : runRandomizedBacktest(history, {
           days,
@@ -453,6 +480,7 @@ export function registerRoutes(
           volumePriceWeightPctUpper: volumePriceWeightPct,
           distanceFromLowWeightPctUpper: distanceFromLowWeightPct,
           volatilityTrendWeightPctUpper: volatilityWeightPct,
+          scoringConfig,
         });
       progress(88, mode === 'current' ? '汇总含交易成本的收益、胜率与回撤' : `汇总 ${results.length} 组回测结果`);
       for (let index = 0; index < results.length; index += 1) {
@@ -486,6 +514,48 @@ export function registerRoutes(
       };
     });
     response.status(202).json({ task_id: task.id, status: 'started', message: '回测任务已启动' });
+  }));
+
+  app.post('/api/backtest/optimize', asyncHandler(async (request, response) => {
+    const days = numberParam(request.query.days, 20, 5, 60);
+    const requestedDate = marketDateParam(request.query.date);
+    const taskLabel = `参数优化（近 ${days} 日距60日低点表现）`;
+    const task = tasks.start('backtest_optimize', taskLabel, async ({ progress, cancelled, traceId }) => {
+      const source = await store.getRankingUniverse();
+      if (!source.rankings.length) throw new Error('当前股票池为空，无法运行参数优化');
+      const prepared = await marketService.ensureHistoricalCoverage({
+        rankings: source.rankings,
+        days,
+        asOfDate: requestedDate,
+        traceId,
+        cancelled,
+        progress: (value, message) => progress(value * 0.55, message),
+      });
+      if (cancelled()) return null;
+      const history = prepared.history;
+      console.log('[backtest] /api/backtest/optimize', {
+        days,
+        history_as_of_date: history.as_of_date,
+        stocks: history.stocks.length,
+      });
+      await audit.info('backtest', 'optimize_started', {
+        traceId,
+        data: { days, history_as_of_date: history.as_of_date, stocks: history.stocks.length },
+      });
+      progress(58, '阶段1：优化 scoreStock 评分参数（距低点分档 + 趋势）');
+      const result = optimizeStrategyParams(history, { days });
+      progress(90, '阶段2：固定评分配置，网格搜索回测交易参数');
+      await audit.info('backtest', 'optimize_completed', {
+        traceId,
+        data: { days, scoring: result.scoring, optimized: result.optimized, validation: result.validation },
+      });
+      return {
+        ...result,
+        collected: prepared.collected,
+        message: `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成参数优化（${history.as_of_date} 前 ${days} 日）`,
+      };
+    });
+    response.status(202).json({ task_id: task.id, status: 'started', message: '参数优化任务已启动' });
   }));
 
   app.get('/api/backtest/list', asyncHandler(async (_request, response) => {
@@ -541,7 +611,11 @@ export function registerRoutes(
 
   app.get('/api/simulated-trading/overview', asyncHandler(async (_request, response) => {
     const traceId = String(response.locals.traceId);
-    const context = await marketService.loadPaperContext(false, traceId);
+    const history = await store.getHistoricalMarket();
+    const calendar = history?.calendar ?? [];
+    const context = paper.isAccountSyncOnlyNow(calendar)
+      ? await marketService.loadPaperContextFromStore(traceId)
+      : await marketService.loadPaperContext(false, traceId);
     response.json(await paper.overview(
       context.analysis,
       context.rankingDate,

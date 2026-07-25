@@ -2,7 +2,7 @@ import pl from 'nodejs-polars';
 import type { RankingRow } from '../src/types.js';
 import { round } from './format.js';
 import type { HistoricalBlockSeries, HistoricalMarketData } from './historical-market.js';
-import { classifyMarketState, volatilityTrendScore, type Bar, type TrendAxis, type VolatilityClass } from './scoring-engine.js';
+import { classifyMarketState, volatilityTrendScore, type Bar, type ScoreStockConfig, type TrendAxis, type VolatilityClass, DEFAULT_SCORE_STOCK_CONFIG } from './scoring-engine.js';
 
 // ---------------------------------------------------------------------------
 // Vectorized backtest scoring: computes the full (stock × date) score matrix
@@ -101,8 +101,11 @@ export function computeBacktestScores(
   history: HistoricalMarketData,
   dates: string[],
   limitUpDatesByCode: Map<string, Set<string>>,
+  scoringConfig: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
 ): Map<string, RankingRow[]> {
   const dateSet = new Set(dates);
+  const { distanceFromLow, trend, volatilityTrend } = scoringConfig;
+  const distanceTiers = [...distanceFromLow.tiers].sort((left, right) => left.maxPct - right.maxPct);
 
   // ---- 0. Pre-compute rolling sector trend states ----
   const sectorStateByDate = computeSectorStates(history.blocks ?? [], dates);
@@ -248,18 +251,17 @@ export function computeBacktestScores(
   );
 
   // ---- 6. Dimension 1: Trend score (0-40) ----
-  // Sector bonus: states 1-3 (up) → +4, states 6-7 (down) → -4, else 0
   frame = frame.withColumns(
-    pl.col('trend_strength').mul(400).clip(-12, 12).alias('trend_bonus'),
+    pl.col('trend_strength').mul(trend.trendBonusMultiplier).clip(-trend.trendBonusCap, trend.trendBonusCap).alias('trend_bonus'),
     pl.when(pl.col('sector_state_id').eq(pl.lit(8))
-      .or(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3)))).then(pl.lit(4))
-      .when(pl.col('sector_state_id').gtEq(6)).then(pl.lit(-4))
+      .or(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3)))).then(pl.lit(trend.sectorUpBonus))
+      .when(pl.col('sector_state_id').gtEq(6)).then(pl.lit(trend.sectorDownBonus))
       .otherwise(pl.lit(0))
       .alias('sector_bonus'),
   ).withColumns(
-    pl.when(pl.col('alignment').eq(pl.lit('bullish'))).then(pl.lit(28))
-      .when(pl.col('alignment').eq(pl.lit('bearish'))).then(pl.lit(0))
-      .otherwise(pl.lit(14))
+    pl.when(pl.col('alignment').eq(pl.lit('bullish'))).then(pl.lit(trend.bullishAlignment))
+      .when(pl.col('alignment').eq(pl.lit('bearish'))).then(pl.lit(trend.bearishAlignment))
+      .otherwise(pl.lit(trend.tangledAlignment))
       .add(pl.col('trend_bonus'))
       .add(pl.col('sector_bonus'))
       .clip(0, 40)
@@ -315,30 +317,22 @@ export function computeBacktestScores(
   );
 
   // ---- 8. Dimension 3: Distance-from-60d-low score (0-20) ----
+  let positionScoreExpr = pl.when(pl.col('distance_from_low_pct').lt(0)).then(pl.lit(distanceFromLow.atLowScore));
+  let positionLabelExpr = pl.when(pl.col('distance_from_low_pct').lt(0)).then(pl.lit(distanceTiers[0]?.label ?? '贴近低点'));
+  for (const tier of distanceTiers) {
+    positionScoreExpr = positionScoreExpr.when(pl.col('distance_from_low_pct').lt(tier.maxPct)).then(pl.lit(tier.score));
+    positionLabelExpr = positionLabelExpr.when(pl.col('distance_from_low_pct').lt(tier.maxPct)).then(pl.lit(tier.label));
+  }
   frame = frame.withColumns(
-    pl.when(pl.col('distance_from_low_pct').lt(0)).then(pl.lit(2))
-      .when(pl.col('distance_from_low_pct').lt(5)).then(pl.lit(4))
-      .when(pl.col('distance_from_low_pct').lt(15)).then(pl.lit(10))
-      .when(pl.col('distance_from_low_pct').lt(30)).then(pl.lit(18))
-      .when(pl.col('distance_from_low_pct').lt(50)).then(pl.lit(20))
-      .when(pl.col('distance_from_low_pct').lt(80)).then(pl.lit(14))
-      .otherwise(pl.lit(8))
-      .alias('position_score'),
-    pl.when(pl.col('distance_from_low_pct').lt(0)).then(pl.lit('贴近低点'))
-      .when(pl.col('distance_from_low_pct').lt(5)).then(pl.lit('贴近低点'))
-      .when(pl.col('distance_from_low_pct').lt(15)).then(pl.lit('刚离低点'))
-      .when(pl.col('distance_from_low_pct').lt(30)).then(pl.lit('启动确认'))
-      .when(pl.col('distance_from_low_pct').lt(50)).then(pl.lit('趋势上行'))
-      .when(pl.col('distance_from_low_pct').lt(80)).then(pl.lit('远离低点'))
-      .otherwise(pl.lit('高位延伸'))
-      .alias('position_label'),
+    positionScoreExpr.otherwise(pl.lit(distanceFromLow.extendedScore)).alias('position_score'),
+    positionLabelExpr.otherwise(pl.lit(distanceFromLow.extendedLabel)).alias('position_label'),
   );
 
   // ---- 9. Dimension 4: Volatility-trend score (0-15) ----
   // trend_axis: prefer sector state_id when available, fallback to alignment
   frame = frame.withColumns(
-    pl.when(pl.col('limit_up_count_20d').gtEq(3)).then(pl.lit('high'))
-      .when(pl.col('limit_up_count_20d').gtEq(1)).then(pl.lit('medium'))
+    pl.when(pl.col('limit_up_count_20d').gtEq(volatilityTrend.limitUp.highMinLimitUps)).then(pl.lit('high'))
+      .when(pl.col('limit_up_count_20d').gtEq(volatilityTrend.limitUp.mediumMinLimitUps)).then(pl.lit('medium'))
       .otherwise(pl.lit('low'))
       .alias('volatility_class'),
     pl.when(pl.col('sector_state_id').eq(pl.lit(8))
@@ -351,19 +345,19 @@ export function computeBacktestScores(
       .alias('trend_axis'),
   );
 
-  // Cross matrix: volatility × trend_axis
+  const matrix = volatilityTrend.matrix;
   frame = frame.withColumns(
     pl.when(pl.col('volatility_class').eq(pl.lit('high')))
-      .then(pl.when(pl.col('trend_axis').eq(pl.lit('up'))).then(pl.lit(15))
-        .when(pl.col('trend_axis').eq(pl.lit('range'))).then(pl.lit(8))
-        .otherwise(pl.lit(1)))
+      .then(pl.when(pl.col('trend_axis').eq(pl.lit('up'))).then(pl.lit(matrix.high.up))
+        .when(pl.col('trend_axis').eq(pl.lit('range'))).then(pl.lit(matrix.high.range))
+        .otherwise(pl.lit(matrix.high.down)))
       .when(pl.col('volatility_class').eq(pl.lit('medium')))
-      .then(pl.when(pl.col('trend_axis').eq(pl.lit('up'))).then(pl.lit(12))
-        .when(pl.col('trend_axis').eq(pl.lit('range'))).then(pl.lit(6))
-        .otherwise(pl.lit(3)))
-      .otherwise(pl.when(pl.col('trend_axis').eq(pl.lit('up'))).then(pl.lit(8))
-        .when(pl.col('trend_axis').eq(pl.lit('range'))).then(pl.lit(4))
-        .otherwise(pl.lit(5)))
+      .then(pl.when(pl.col('trend_axis').eq(pl.lit('up'))).then(pl.lit(matrix.medium.up))
+        .when(pl.col('trend_axis').eq(pl.lit('range'))).then(pl.lit(matrix.medium.range))
+        .otherwise(pl.lit(matrix.medium.down)))
+      .otherwise(pl.when(pl.col('trend_axis').eq(pl.lit('up'))).then(pl.lit(matrix.low.up))
+        .when(pl.col('trend_axis').eq(pl.lit('range'))).then(pl.lit(matrix.low.range))
+        .otherwise(pl.lit(matrix.low.down)))
       .alias('volatility_trend_score'),
   );
 

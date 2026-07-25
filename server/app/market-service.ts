@@ -487,6 +487,33 @@ export class MarketService {
     return sectorTrendsByCode;
   }
 
+  async loadPaperContextFromStore(traceId: string = randomUUID()) {
+    const [analysis, ranking, history] = await Promise.all([
+      this.store.getAnalysis(),
+      this.store.getRanking(),
+      this.store.getHistoricalMarket(),
+    ]);
+    const marketAverageChange = averageRankingChange(ranking.rankings);
+    const limitUpRecords = (await this.store.getLimitUpByDate(ranking.date))
+      .map((record) => ({ date: record.date, stock_code: record.stock_code }));
+    await this.audit.info('paper_trading', 'context_loaded_from_store', {
+      traceId,
+      data: {
+        ranking_date: ranking.date,
+        rankings: ranking.rankings.length,
+        calendar_days: history?.calendar?.length ?? 0,
+      },
+    });
+    return {
+      analysis: analysisWithStats(analysis),
+      rankingDate: ranking.date,
+      rankings: ranking.rankings,
+      calendar: history?.calendar ?? [],
+      marketAverageChange,
+      limitUpRecords,
+    };
+  }
+
   async loadPaperContext(refreshForClose = false, traceId: string = randomUUID()) {
     const [initialAnalysis, ranking] = await Promise.all([
       this.store.getAnalysis(),

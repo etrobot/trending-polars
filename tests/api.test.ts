@@ -35,6 +35,16 @@ class FakeSimulatedBroker implements SimulatedBroker {
     };
   }
 
+  async snapshotAccountOnly(): Promise<SimulatedAccountSnapshot> {
+    this.snapshotCalls += 1;
+    return {
+      availableCash: this.account.availableCash,
+      totalAssets: this.account.totalAssets,
+      positions: this.account.positions.map((position) => ({ ...position })),
+      orders: [],
+    };
+  }
+
   async quote(): Promise<number> {
     return 10;
   }

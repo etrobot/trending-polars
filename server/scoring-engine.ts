@@ -161,6 +161,101 @@ export function volumePriceScore(bars: Bar[], endIndex: number): VolumePriceScor
   return { score: 10, label: '量价均衡' };
 }
 
+// ---- scoreStock 可配置参数（供参数优化与回测复用）---------------------------
+
+export interface DistanceFromLowTier {
+  label: string;
+  maxPct: number;
+  score: number;
+}
+
+export interface DistanceFromLowConfig {
+  atLowScore: number;
+  extendedScore: number;
+  extendedLabel: string;
+  tiers: DistanceFromLowTier[];
+}
+
+export interface TrendScoreConfig {
+  bullishAlignment: number;
+  tangledAlignment: number;
+  bearishAlignment: number;
+  trendBonusMultiplier: number;
+  trendBonusCap: number;
+  trendStrengthThreshold: number;
+  sectorUpBonus: number;
+  sectorDownBonus: number;
+}
+
+export interface VolatilityLimitUpConfig {
+  highMinLimitUps: number;
+  mediumMinLimitUps: number;
+}
+
+export interface VolatilityTrendConfig {
+  limitUp: VolatilityLimitUpConfig;
+  matrix: Record<VolatilityClass, Record<TrendAxis, number>>;
+}
+
+export interface ScoreStockConfig {
+  distanceFromLow: DistanceFromLowConfig;
+  trend: TrendScoreConfig;
+  volatilityTrend: VolatilityTrendConfig;
+}
+
+export const DEFAULT_SCORE_STOCK_CONFIG: Readonly<ScoreStockConfig> = Object.freeze({
+  distanceFromLow: {
+    atLowScore: 2,
+    extendedScore: 8,
+    extendedLabel: '高位延伸',
+    tiers: [
+      { label: '贴近低点', maxPct: 5, score: 4 },
+      { label: '刚离低点', maxPct: 15, score: 10 },
+      { label: '启动确认', maxPct: 30, score: 18 },
+      { label: '趋势上行', maxPct: 50, score: 20 },
+      { label: '远离低点', maxPct: 80, score: 14 },
+    ],
+  },
+  trend: {
+    bullishAlignment: 28,
+    tangledAlignment: 14,
+    bearishAlignment: 0,
+    trendBonusMultiplier: 400,
+    trendBonusCap: 12,
+    trendStrengthThreshold: 0.003,
+    sectorUpBonus: 4,
+    sectorDownBonus: -4,
+  },
+  volatilityTrend: {
+    limitUp: { highMinLimitUps: 3, mediumMinLimitUps: 1 },
+    matrix: {
+      high: { up: 15, range: 8, down: 1 },
+      medium: { up: 12, range: 6, down: 3 },
+      low: { up: 8, range: 4, down: 5 },
+    },
+  },
+});
+
+export function normalizeScoreStockConfig(overrides?: Partial<ScoreStockConfig>): ScoreStockConfig {
+  if (!overrides) return { ...DEFAULT_SCORE_STOCK_CONFIG, distanceFromLow: { ...DEFAULT_SCORE_STOCK_CONFIG.distanceFromLow, tiers: [...DEFAULT_SCORE_STOCK_CONFIG.distanceFromLow.tiers] }, trend: { ...DEFAULT_SCORE_STOCK_CONFIG.trend }, volatilityTrend: { limitUp: { ...DEFAULT_SCORE_STOCK_CONFIG.volatilityTrend.limitUp }, matrix: { ...DEFAULT_SCORE_STOCK_CONFIG.volatilityTrend.matrix } } };
+  return {
+    distanceFromLow: {
+      ...DEFAULT_SCORE_STOCK_CONFIG.distanceFromLow,
+      ...overrides.distanceFromLow,
+      tiers: overrides.distanceFromLow?.tiers ?? [...DEFAULT_SCORE_STOCK_CONFIG.distanceFromLow.tiers],
+    },
+    trend: { ...DEFAULT_SCORE_STOCK_CONFIG.trend, ...overrides.trend },
+    volatilityTrend: {
+      limitUp: { ...DEFAULT_SCORE_STOCK_CONFIG.volatilityTrend.limitUp, ...overrides.volatilityTrend?.limitUp },
+      matrix: overrides.volatilityTrend?.matrix ?? { ...DEFAULT_SCORE_STOCK_CONFIG.volatilityTrend.matrix },
+    },
+  };
+}
+
+function sortedDistanceTiers(tiers: DistanceFromLowTier[]): DistanceFromLowTier[] {
+  return [...tiers].sort((left, right) => left.maxPct - right.maxPct);
+}
+
 // ---- 维度 4：波动率-趋势适配评分（0-15）------------------------------------
 
 /** 统计最近 lookback 个交易日的权威涨停记录，只接受同花顺 block_top 日期集合。 */
@@ -179,21 +274,74 @@ export function limitUpCount(
   return count;
 }
 
-export function volatilityClassOf(limitUpCount20d: number): VolatilityClass {
-  if (limitUpCount20d >= 3) return 'high';
-  if (limitUpCount20d >= 1) return 'medium';
+export function volatilityClassOf(
+  limitUpCount20d: number,
+  config: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
+): VolatilityClass {
+  const { limitUp } = config.volatilityTrend;
+  if (limitUpCount20d >= limitUp.highMinLimitUps) return 'high';
+  if (limitUpCount20d >= limitUp.mediumMinLimitUps) return 'medium';
   return 'low';
 }
 
-// 交叉评分矩阵（ref-doc §4.2 维度 4）：行＝波动率，列＝板块趋势。
-const VOLATILITY_TREND_MATRIX: Record<VolatilityClass, Record<TrendAxis, number>> = {
-  high: { up: 15, range: 8, down: 1 },
-  medium: { up: 12, range: 6, down: 3 },
-  low: { up: 8, range: 4, down: 5 },
-};
+function trendScoreFromParts(
+  alignment: Alignment,
+  strength: number,
+  sectorTrend: TrendAxis | undefined,
+  config: ScoreStockConfig,
+): number {
+  const { trend } = config;
+  const alignmentScore = alignment === 'bullish'
+    ? trend.bullishAlignment
+    : alignment === 'bearish'
+      ? trend.bearishAlignment
+      : trend.tangledAlignment;
+  const trendBonus = strength > trend.trendStrengthThreshold
+    ? Math.min(trend.trendBonusCap, strength * trend.trendBonusMultiplier)
+    : strength < -trend.trendStrengthThreshold
+      ? Math.max(-trend.trendBonusCap, strength * trend.trendBonusMultiplier)
+      : 0;
+  const sectorBonus = sectorTrend === 'up'
+    ? trend.sectorUpBonus
+    : sectorTrend === 'down'
+      ? trend.sectorDownBonus
+      : 0;
+  return Math.max(0, Math.min(40, alignmentScore + trendBonus + sectorBonus));
+}
 
-export function volatilityTrendScore(volatility: VolatilityClass, trend: TrendAxis): number {
-  return VOLATILITY_TREND_MATRIX[volatility][trend];
+/** 用给定 scoreStock 配置合成四维分（供参数优化快速评估）。 */
+export function composeDimensionScores(
+  input: {
+    distanceFromLowPct: number;
+    alignment: Alignment;
+    trendStrength: number;
+    volumePriceScore: number;
+    limitUpCount20d: number;
+    sectorTrend?: TrendAxis;
+  },
+  config: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
+) {
+  const trendAxis = input.sectorTrend ?? alignmentToTrendAxis(input.alignment);
+  const trendScore = round(trendScoreFromParts(input.alignment, input.trendStrength, input.sectorTrend, config), 1);
+  const fromLow = distanceFromLowScore(input.distanceFromLowPct, config);
+  const volatility = volatilityClassOf(input.limitUpCount20d, config);
+  const volatilityScore = volatilityTrendScore(volatility, trendAxis, config);
+  const totalScore = round(trendScore + input.volumePriceScore + fromLow.score + volatilityScore, 1);
+  return {
+    trendScore,
+    positionScore: fromLow.score,
+    positionLabel: fromLow.label,
+    volatilityScore,
+    totalScore,
+  };
+}
+
+export function volatilityTrendScore(
+  volatility: VolatilityClass,
+  trend: TrendAxis,
+  config: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
+): number {
+  return config.volatilityTrend.matrix[volatility][trend];
 }
 
 function alignmentToTrendAxis(alignment: Alignment): TrendAxis {
@@ -213,16 +361,23 @@ export interface DistanceFromLowScore {
  * 距60日低点涨幅 → 位置分。
  * 过低（贴底）与过高（延伸）均降分；15–50% 为启动确认/趋势上行的甜点区。
  */
-export function distanceFromLowScore(distanceFromLowPct: number): DistanceFromLowScore {
+export function distanceFromLowScore(
+  distanceFromLowPct: number,
+  config: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
+): DistanceFromLowScore {
+  const { distanceFromLow } = config;
+  const tiers = sortedDistanceTiers(distanceFromLow.tiers);
   if (!Number.isFinite(distanceFromLowPct) || distanceFromLowPct < 0) {
-    return { score: 2, label: '贴近低点' };
+    return { score: distanceFromLow.atLowScore, label: tiers[0]?.label ?? '贴近低点' };
   }
-  if (distanceFromLowPct < 5) return { score: 4, label: '贴近低点' };
-  if (distanceFromLowPct < 15) return { score: 10, label: '刚离低点' };
-  if (distanceFromLowPct < 30) return { score: 18, label: '启动确认' };
-  if (distanceFromLowPct < 50) return { score: 20, label: '趋势上行' };
-  if (distanceFromLowPct < 80) return { score: 14, label: '远离低点' };
-  return { score: 8, label: '高位延伸' };
+  for (const tier of tiers) {
+    if (distanceFromLowPct < tier.maxPct) return { score: tier.score, label: tier.label };
+  }
+  return { score: distanceFromLow.extendedScore, label: distanceFromLow.extendedLabel };
+}
+
+export function distanceTierForPct(distanceFromLowPct: number, config: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG) {
+  return distanceFromLowScore(distanceFromLowPct, config);
 }
 
 /** 打分时可传入板块趋势上下文，用于维度 1 板块加分与维度 4 的趋势轴。 */
@@ -240,7 +395,12 @@ export interface SectorContext {
  * 个股四维评分：K线趋势(40) + 价量配合(25) + 距60日低点(20) + 波动率-趋势适配(15)。
  * 仅使用 date 当日及之前的 K 线，无未来数据。
  */
-export function scoreStock(series: PreparedSeries, date: string, sector?: SectorContext): RankingRow | null {
+export function scoreStock(
+  series: PreparedSeries,
+  date: string,
+  sector?: SectorContext,
+  config: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
+): RankingRow | null {
   const endIndex = series.indexByDate.get(date);
   if (endIndex == null || endIndex < 19) return null;
   const latest = series.bars[endIndex];
@@ -254,28 +414,14 @@ export function scoreStock(series: PreparedSeries, date: string, sector?: Sector
   const distanceFromLowPct = low60 > 0 ? round((latest.close - low60) / low60 * 100, 2) : 0;
   const strength = trendStrength(series.bars, endIndex);
   const alignment = alignmentOf(ma5, ma10, ma20, ma60);
-
-  // 维度 1：K线趋势评分（均线排列基础分 + 趋势强度加分 + 板块上升加分）
-  const alignmentScore = alignment === 'bullish' ? 28 : alignment === 'bearish' ? 0 : 14;
-  const trendBonus = strength > 0.003
-    ? Math.min(12, strength * 400)
-    : strength < -0.003
-      ? Math.max(-12, strength * 400)
-      : 0;
-  const sectorBonus = sector?.trend === 'up' ? 4 : sector?.trend === 'down' ? -4 : 0;
-  const trendScore = Math.max(0, Math.min(40, alignmentScore + trendBonus + sectorBonus));
-
-  // 维度 2：价量配合评分
-  const volumePrice = volumePriceScore(series.bars, endIndex);
-
-  // 维度 3：距60日低点评分
-  const fromLow = distanceFromLowScore(distanceFromLowPct);
-
-  // 维度 4：波动率-趋势适配评分
-  const limitUps = limitUpCount(series.bars, endIndex, sector?.limitUpDates ?? new Set());
-  const volatility = volatilityClassOf(limitUps);
   const trendAxis = sector?.trend ?? alignmentToTrendAxis(alignment);
-  const volatilityTrend = volatilityTrendScore(volatility, trendAxis);
+
+  const trendScore = trendScoreFromParts(alignment, strength, sector?.trend, config);
+  const volumePrice = volumePriceScore(series.bars, endIndex);
+  const fromLow = distanceFromLowScore(distanceFromLowPct, config);
+  const limitUps = limitUpCount(series.bars, endIndex, sector?.limitUpDates ?? new Set());
+  const volatility = volatilityClassOf(limitUps, config);
+  const volatilityTrend = volatilityTrendScore(volatility, trendAxis, config);
 
   const totalScore = round(trendScore + volumePrice.score + fromLow.score + volatilityTrend, 1);
 

@@ -28,6 +28,13 @@ export default defineConfig({
         ws: true,
       },
     },
+    /**
+     * Exclude docs/ from the Vite watcher so that editing markdown files
+     * in docs/ does not trigger re-compilation or break HMR.
+     */
+    watch: {
+      ignored: ['docs/**'],
+    },
   },
   build: {
     sourcemap: true,

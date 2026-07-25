@@ -6,12 +6,13 @@ import {
   Clock3,
   Play,
   RefreshCw,
+  SlidersHorizontal,
   Trash2,
 } from 'lucide-react';
 import { EquityCurve } from '../components/Charts';
 import { PageHeaderActions } from '../components/HeaderActions';
 import { Modal } from '../components/Modal';
-import { Button, EmptyState, LoadingPanel, SectionHeading } from '../components/Ui';
+import { Button, EmptyState, LoadingPanel, Pagination, SectionHeading } from '../components/Ui';
 import { useTaskResult, useTasks } from '../context/TasksContext';
 import { api, formatMoney, pctColor } from '../lib/api';
 import type { BacktestListItem, BacktestResult, BacktestTrade, EquityPoint, TaskSnapshot } from '../types';
@@ -31,11 +32,125 @@ function tradeAction(action: BacktestTrade['action']) {
   return action === '买入' ? 'text-trading-up' : 'text-trading-down';
 }
 
+const HISTORY_PAGE_SIZE = 15;
+
 function historyItemTitle(item: BacktestListItem) {
   if (item.mode === 'random' && (item.strategy_count ?? 1) > 1) {
     return `随机组合 ${item.combo_index}/${item.strategy_count}`;
   }
   return item.mode === 'current' ? '当前方案' : '随机组合';
+}
+
+interface ScoreStockConfigView {
+  distanceFromLow: {
+    atLowScore: number;
+    extendedScore: number;
+    tiers: Array<{ label: string; maxPct: number; score: number }>;
+  };
+  trend: {
+    bullishAlignment: number;
+    tangledAlignment: number;
+    bearishAlignment: number;
+    trendBonusMultiplier: number;
+    trendBonusCap: number;
+  };
+}
+
+const DEFAULT_SCORE_STOCK_CONFIG: ScoreStockConfigView = {
+  distanceFromLow: {
+    atLowScore: 2,
+    extendedScore: 8,
+    tiers: [
+      { label: '贴近低点', maxPct: 5, score: 4 },
+      { label: '刚离低点', maxPct: 15, score: 10 },
+      { label: '启动确认', maxPct: 30, score: 18 },
+      { label: '趋势上行', maxPct: 50, score: 20 },
+      { label: '远离低点', maxPct: 80, score: 14 },
+    ],
+  },
+  trend: {
+    bullishAlignment: 28,
+    tangledAlignment: 14,
+    bearishAlignment: 0,
+    trendBonusMultiplier: 400,
+    trendBonusCap: 12,
+  },
+};
+
+function isScoreStockConfigView(value: unknown): value is ScoreStockConfigView {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as ScoreStockConfigView;
+  return Array.isArray(candidate.distanceFromLow?.tiers) && Boolean(candidate.trend);
+}
+
+function resolveScoringConfig(applied: unknown, optimized: OptimizeResult | null): ScoreStockConfigView {
+  if (isScoreStockConfigView(applied)) return applied;
+  if (optimized?.scoring.config) return optimized.scoring.config;
+  return DEFAULT_SCORE_STOCK_CONFIG;
+}
+
+function formatScorePts(value: number | undefined | null) {
+  return value == null || Number.isNaN(value) ? '-' : `${value} 分`;
+}
+
+interface OptimizeResult {
+  days: number;
+  scoring: {
+    config: ScoreStockConfigView;
+    scoreCorrelation: number;
+    topBottomSpreadPct: number;
+    distanceBucketStats: Array<{
+      label: string;
+      sampleCount: number;
+      avgForwardReturnPct: number;
+      winRatePct: number;
+      positionScore: number;
+    }>;
+    sweetSpotLabels: string[];
+  };
+  optimized: {
+    maxHoldDays: number;
+    maxPositions: number;
+    positionSizePct: number;
+    takeProfitPct: number;
+    stopLossPct: number;
+    trendWeightPct: number;
+    volumePriceWeightPct: number;
+    distanceFromLowWeightPct: number;
+    volatilityWeightPct: number;
+  };
+  validation: {
+    totalReturnPct: number;
+    winRate: number;
+    maxDrawdownPct: number;
+    totalTrades: number;
+  };
+  baseline: {
+    params: OptimizeResult['optimized'];
+    validation: OptimizeResult['validation'];
+  };
+  beatBaseline: boolean;
+  methodology: string;
+  message?: string;
+}
+
+const OPTIMIZE_RESULT_STORAGE_KEY = 'backtest-optimize-result';
+
+function loadStoredOptimizeResult(): OptimizeResult | null {
+  try {
+    const raw = sessionStorage.getItem(OPTIMIZE_RESULT_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as OptimizeResult;
+    if (!parsed?.optimized) return null;
+    return parsed;
+  } catch (error) {
+    console.warn('[backtest] failed to load stored optimize result', error);
+    return null;
+  }
+}
+
+function storeOptimizeResult(result: OptimizeResult) {
+  sessionStorage.setItem(OPTIMIZE_RESULT_STORAGE_KEY, JSON.stringify(result));
 }
 
 export function BacktestPage() {
@@ -47,9 +162,15 @@ export function BacktestPage() {
   const [notice, setNotice] = useState('');
   const [runTaskId, setRunTaskId] = useState<string | null>(null);
   const [collectTaskId, setCollectTaskId] = useState<string | null>(null);
+  const [optimizeTaskId, setOptimizeTaskId] = useState<string | null>(null);
+  const [appliedMessage, setAppliedMessage] = useState('');
   const [running, setRunning] = useState(false);
+  const [optimizing, setOptimizing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [optimizeOpen, setOptimizeOpen] = useState(false);
+  const [optimizeResult, setOptimizeResult] = useState<OptimizeResult | null>(() => loadStoredOptimizeResult());
+  const [appliedScoringConfig, setAppliedScoringConfig] = useState<ScoreStockConfigView | null>(null);
   const [days, setDays] = useState(60);
   const [strategyCount, setStrategyCount] = useState(3);
   const [positionSizePct, setPositionSizePct] = useState(20);
@@ -63,6 +184,8 @@ export function BacktestPage() {
   const [volatilityWeightPct, setVolatilityWeightPct] = useState(100);
   const [sortColumn, setSortColumn] = useState<'win_rate' | 'total_return_pct' | null>(null);
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
+  const [historyPage, setHistoryPage] = useState(1);
+  const [selectedRunIds, setSelectedRunIds] = useState<Set<string>>(() => new Set());
 
   const sortedHistory = useMemo(() => {
     if (!sortColumn) return history;
@@ -72,6 +195,17 @@ export function BacktestPage() {
       return sortDirection === 'asc' ? valA - valB : valB - valA;
     });
   }, [history, sortColumn, sortDirection]);
+
+  const paginatedHistory = useMemo(() => {
+    const totalPages = Math.max(1, Math.ceil(sortedHistory.length / HISTORY_PAGE_SIZE));
+    const safePage = Math.min(historyPage, totalPages);
+    const offset = (safePage - 1) * HISTORY_PAGE_SIZE;
+    return {
+      items: sortedHistory.slice(offset, offset + HISTORY_PAGE_SIZE),
+      page: safePage,
+      totalPages,
+    };
+  }, [sortedHistory, historyPage]);
 
   const toggleSort = (column: 'win_rate' | 'total_return_pct') => {
     if (sortColumn === column) {
@@ -148,6 +282,30 @@ export function BacktestPage() {
   }, []);
   useTaskResult(collectTaskId, onCollectDone);
 
+  const onOptimizeDone = useCallback((task: TaskSnapshot) => {
+    setOptimizeTaskId(null);
+    setOptimizing(false);
+    if (task.status !== 'completed') {
+      setError(task.message || '参数优化未完成');
+      return;
+    }
+    void (async () => {
+      const detail = await api<TaskSnapshot>(`/api/tasks/${task.id}`);
+      const payload = detail.result as OptimizeResult | undefined;
+      if (!payload?.optimized) {
+        setError('参数优化结果为空');
+        return;
+      }
+      console.log('[backtest] optimize completed', payload);
+      setOptimizeResult(payload);
+      storeOptimizeResult(payload);
+      setOptimizeOpen(true);
+      setError('');
+      setNotice(payload.message ?? (payload.beatBaseline ? '参数优化完成，结果超越默认基线' : '优化未超越默认方案，已回退默认参数'));
+    })().catch((loadError) => setError(loadError instanceof Error ? loadError.message : String(loadError)));
+  }, []);
+  useTaskResult(optimizeTaskId, onOptimizeDone);
+
   const run = async (mode: 'current' | 'random') => {
     setSettingsOpen(false);
     setRunning(true);
@@ -168,6 +326,10 @@ export function BacktestPage() {
         distance_from_low_weight_pct: String(distanceFromLowWeightPct),
         volatility_weight_pct: String(volatilityWeightPct),
       });
+      const scoringConfigApplied = appliedScoringConfig ?? optimizeResult?.scoring.config ?? null;
+      if (scoringConfigApplied) {
+        params.set('scoring_config', JSON.stringify(scoringConfigApplied));
+      }
       console.log('[backtest] start run', Object.fromEntries(params.entries()));
       const response = await api<{ task_id: string }>(`/api/backtest/run?${params.toString()}`, { method: 'POST' });
       setRunTaskId(response.task_id);
@@ -188,6 +350,42 @@ export function BacktestPage() {
     }
   };
 
+  const optimize = async () => {
+    setOptimizing(true);
+    setError('');
+    setNotice('');
+    console.log('[backtest] start optimize', { days });
+    const response = await api<{ task_id: string }>(`/api/backtest/optimize?days=${days}`, { method: 'POST' });
+    setOptimizeTaskId(response.task_id);
+    setPanelOpen(true);
+  };
+
+  const onOptimizeClick = () => {
+    void optimize().catch((optimizeError) => {
+      setOptimizing(false);
+      setError(optimizeError instanceof Error ? optimizeError.message : String(optimizeError));
+    });
+  };
+
+  const applyOptimizedParams = () => {
+    if (!optimizeResult) return;
+    const params = optimizeResult.optimized;
+    setMaxHoldDays(params.maxHoldDays);
+    setMaxPositions(params.maxPositions);
+    setPositionSizePct(params.positionSizePct);
+    setTakeProfitPct(params.takeProfitPct);
+    setStopLossPct(params.stopLossPct);
+    setTrendWeightPct(params.trendWeightPct);
+    setVolumePriceWeightPct(params.volumePriceWeightPct);
+    setDistanceFromLowWeightPct(params.distanceFromLowWeightPct);
+    setVolatilityWeightPct(params.volatilityWeightPct);
+    setAppliedScoringConfig(optimizeResult.scoring.config);
+    setOptimizeOpen(false);
+    setSettingsOpen(true);
+    setAppliedMessage('已应用优化参数，可点击「回测当前方案」验证');
+    setNotice('已应用优化参数，可运行「回测当前方案」验证');
+  };
+
   const loadRun = async (runId: string) => {
     setHistoryOpen(false);
     setLoading(true);
@@ -204,12 +402,60 @@ export function BacktestPage() {
     if (!window.confirm('确定删除这次回测记录吗？')) return;
     await api(`/api/backtest/${runId}`, { method: 'DELETE' });
     setHistory((items) => items.filter((item) => item.run_id !== runId));
+    setSelectedRunIds((prev) => {
+      if (!prev.has(runId)) return prev;
+      const next = new Set(prev);
+      next.delete(runId);
+      return next;
+    });
     if (result?.run_id === runId) setResult(null);
+  };
+
+  const toggleSelectRun = (runId: string) => {
+    setSelectedRunIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(runId)) next.delete(runId);
+      else next.add(runId);
+      return next;
+    });
+  };
+
+  const toggleSelectPage = () => {
+    const pageIds = paginatedHistory.items.map((item) => item.run_id);
+    const allSelected = pageIds.length > 0 && pageIds.every((runId) => selectedRunIds.has(runId));
+    setSelectedRunIds((prev) => {
+      const next = new Set(prev);
+      if (allSelected) pageIds.forEach((runId) => next.delete(runId));
+      else pageIds.forEach((runId) => next.add(runId));
+      return next;
+    });
+  };
+
+  const deleteSelectedRuns = async () => {
+    if (selectedRunIds.size === 0) return;
+    if (!window.confirm(`确定删除选中的 ${selectedRunIds.size} 条回测记录吗？`)) return;
+    const runIds = [...selectedRunIds];
+    console.log('[backtest] batch delete', runIds);
+    await Promise.all(runIds.map((runId) => api(`/api/backtest/${runId}`, { method: 'DELETE' })));
+    const deleted = new Set(runIds);
+    setHistory((items) => items.filter((item) => !deleted.has(item.run_id)));
+    if (result && deleted.has(result.run_id)) setResult(null);
+    setSelectedRunIds(new Set());
+  };
+
+  const closeHistoryModal = () => {
+    setHistoryOpen(false);
+    setSelectedRunIds(new Set());
+    setHistoryPage(1);
   };
 
   const curve = useMemo(() => result ? curveFromTrades(result) : [], [result]);
   const resultDays = Number(result?.config.days ?? days);
   const configNumber = (key: string) => Number(result?.config?.[key] ?? 0);
+  const displayScoringConfig = useMemo(
+    () => resolveScoringConfig(appliedScoringConfig, optimizeResult),
+    [appliedScoringConfig, optimizeResult],
+  );
 
   const [benchmark, setBenchmark] = useState<EquityPoint[] | null>(null);
   useEffect(() => {
@@ -235,6 +481,10 @@ export function BacktestPage() {
     <Button variant="primary" disabled={running} onClick={() => setSettingsOpen(true)}><Play className="h-3.5 w-3.5" />{running ? '回测进行中' : '运行回测'}</Button>
   </>;
 
+  const pageRunIds = paginatedHistory.items.map((item) => item.run_id);
+  const pageAllSelected = pageRunIds.length > 0 && pageRunIds.every((runId) => selectedRunIds.has(runId));
+  const pageSomeSelected = pageRunIds.some((runId) => selectedRunIds.has(runId));
+
   if (loading && !result) return <><PageHeaderActions>{headerActions}</PageHeaderActions><LoadingPanel label="正在读取回测历史…" /></>;
 
   return (
@@ -248,13 +498,13 @@ export function BacktestPage() {
         <div className="panel"><EmptyState title="还没有可展示的回测" description="先运行一次策略回测，系统会自动构建可复现的历史截面。" /></div>
       ) : (
         <>
-        <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_260px_260px]">
-          <div className="panel p-3.5">
-            <div className="mb-2 flex flex-wrap items-end justify-between gap-3 border-b border-line pb-2"><h2 className="font-display text-base text-ink">回测走势（{resultDays}天）</h2><div className="font-mono text-[11px] text-muted">{result.date_range}</div></div>
+        <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_220px_540px]">
+          <div className="panel min-w-0 p-3.5">
+            <div className="mb-2 flex flex-wrap items-end justify-between gap-2 border-b border-line pb-2"><h2 className="font-display text-base text-ink">回测走势（{resultDays}天）</h2><div className="font-mono text-[11px] text-muted">{result.date_range}</div></div>
             <EquityCurve data={curve} benchmark={benchmark ?? undefined} />
           </div>
 
-          <section className="panel overflow-hidden">
+          <section className="panel min-w-0 overflow-hidden">
             <div className="module-header"><h2 className="font-display text-base text-ink">回测统计</h2></div>
             <div className="divide-y divide-line-soft">
               {[
@@ -266,25 +516,37 @@ export function BacktestPage() {
                 ['最大回撤', `${(result.summary.max_drawdown_pct ?? 0).toFixed(2)}%`, 'text-trading-down'],
                 ['交易数', String(result.summary.total_trades), 'text-ink'],
                 ['最大持仓', `${result.summary.max_holdings} 只`, 'text-ink'],
-              ].map(([label, value, valueClass]) => <div key={label} className="flex items-center justify-between gap-3 px-3 py-2.5"><span className="text-[11px] text-muted">{label}</span><span className={`font-mono text-[11px] ${valueClass}`}>{value}</span></div>)}
+              ].map(([label, value, valueClass]) => <div key={label} className="flex items-center justify-between gap-2 px-2.5 py-2"><span className="text-[11px] text-muted">{label}</span><span className={`font-mono text-[11px] ${valueClass}`}>{value}</span></div>)}
             </div>
           </section>
 
-          <section className="panel flex flex-col p-3.5">
-            <h2 className="font-display text-base text-ink">参数</h2>
-            <div className="mt-3 grid gap-x-4 gap-y-0 grid-cols-2">
+          <section className="panel flex min-w-0 flex-col p-3.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="font-display text-base text-ink">参数</h2>
+              {optimizeResult ? (
+                <Button variant="secondary" onClick={() => setOptimizeOpen(true)}>
+                  <SlidersHorizontal className="h-3.5 w-3.5" />
+                  最新优化方案
+                </Button>
+              ) : null}
+            </div>
+            <div className="mt-3 grid grid-cols-4 gap-x-3 gap-y-0">
               <div>
                 <h3 className="mb-1.5 font-mono text-[11px] text-muted">策略参数</h3>
                 <div className="space-y-1">
                   {[
+                    ['回测天数', `${result.config.days} 天`],
+                    ['组合序号', `#${result.config.combo_index}`],
+                    ['策略数', `${result.config.strategy_count} 组`],
+                    ['初始资金', formatMoney(result.summary.initial_capital)],
                     ['仓位', `${configNumber('position_size_pct')}%`],
-                    ['持仓', `${configNumber('max_positions')} 只`],
-                    ['持有', `${configNumber('max_hold_days')} 天`],
-                    ['止损', `${configNumber('stop_loss_pct')}%`],
+                    ['持仓个数', `${configNumber('max_positions')} 只`],
+                    ['持有天数', `${configNumber('max_hold_days')} 天`],
                     ['止盈', `+${configNumber('take_profit_pct')}%`],
-                    ['日增', `≤${configNumber('max_positions_per_day')} 只`],
-                    ['池', `前${configNumber('max_candidates')} 名`],
-                    ...(result.engine_version ? [['成交', 'T+1 滑点']] : []),
+                    ['止损', `${configNumber('stop_loss_pct')}%`],
+                    ['日增上限', `≤${configNumber('max_positions_per_day')} 只`],
+                    ['候选池', `前${configNumber('max_candidates')} 名`],
+                    ['滑点', `${configNumber('slippage_bps')} bps`],
                   ].map(([label, value]) => <div key={label} className="flex items-center justify-between gap-1 font-mono text-[11px]"><span className="text-muted">{label}</span><span className="text-right text-ink">{value}</span></div>)}
                 </div>
               </div>
@@ -299,6 +561,36 @@ export function BacktestPage() {
                   ].map(([label, value]) => <div key={label} className="flex items-center justify-between gap-1 font-mono text-[11px]"><span className="text-muted">{label}</span><span className="text-right text-ink">{value}</span></div>)}
                 </div>
               </div>
+              <div>
+                <h3 className="mb-1.5 font-mono text-[11px] text-muted">评分参数</h3>
+                <div className="space-y-1">
+                  {[
+                    ['评分相关', optimizeResult ? optimizeResult.scoring.scoreCorrelation.toFixed(3) : '-'],
+                    ['Top/Bottom 远期差', optimizeResult ? `${optimizeResult.scoring.topBottomSpreadPct >= 0 ? '+' : ''}${optimizeResult.scoring.topBottomSpreadPct.toFixed(2)}%` : '-'],
+                    ['优选区间', optimizeResult?.scoring.sweetSpotLabels.length ? optimizeResult.scoring.sweetSpotLabels.join('、') : '-'],
+                  ].map(([label, value]) => <div key={label} className="flex items-center justify-between gap-1 font-mono text-[11px]"><span className="text-muted">{label}</span><span className="text-right text-ink">{value}</span></div>)}
+                </div>
+                <h3 className="mb-1.5 mt-3 font-mono text-[11px] text-muted">距60日低点分档</h3>
+                <div className="space-y-1">
+                  <div className="flex justify-between gap-2 font-mono text-[11px]"><span className="text-muted">贴合低点</span><span className="text-ink">{formatScorePts(displayScoringConfig.distanceFromLow.atLowScore)}</span></div>
+                  {displayScoringConfig.distanceFromLow.tiers.map((tier) => (
+                    <div key={tier.label} className="flex justify-between gap-2 font-mono text-[11px]"><span className="text-muted">{tier.label} &lt;{tier.maxPct}%</span><span className="text-ink">{formatScorePts(tier.score)}</span></div>
+                  ))}
+                  <div className="flex justify-between gap-2 font-mono text-[11px]"><span className="text-muted">高位延伸</span><span className="text-ink">{formatScorePts(displayScoringConfig.distanceFromLow.extendedScore)}</span></div>
+                </div>
+              </div>
+              <div>
+                <h3 className="mb-1.5 font-mono text-[11px] text-muted">趋势维度</h3>
+                <div className="space-y-1">
+                  {[
+                    ['多头排列', formatScorePts(displayScoringConfig.trend.bullishAlignment)],
+                    ['纠缠', formatScorePts(displayScoringConfig.trend.tangledAlignment)],
+                    ['空头排列', formatScorePts(displayScoringConfig.trend.bearishAlignment)],
+                    ['强度乘数', String(displayScoringConfig.trend.trendBonusMultiplier)],
+                    ['强度上限', formatScorePts(displayScoringConfig.trend.trendBonusCap)],
+                  ].map(([label, value]) => <div key={label} className="flex justify-between gap-2 font-mono text-[11px]"><span className="text-muted">{label}</span><span className="text-ink">{value}</span></div>)}
+                </div>
+              </div>
             </div>
             <div className="mt-auto flex items-center gap-2 font-mono text-[11px] text-muted"><CalendarRange className="h-3 w-3" />{result.timestamp}</div>
           </section>
@@ -311,11 +603,55 @@ export function BacktestPage() {
         </>
       )}
 
-      <Modal open={settingsOpen} onClose={() => setSettingsOpen(false)} title="回测设置" description="回测天数与策略组合个数为固定值；其余参数：当前方案按原值使用，随机组合则作为取参上限。">
-        <div className="space-y-4">
-          <label className="block"><span className="font-mono text-[11px] text-muted">回测天数（固定）</span><input type="number" min="5" max="60" step="5" value={days} onChange={(event) => setDays(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
-          <label className="block"><span className="font-mono text-[11px] text-muted">策略组合个数（固定，仅随机组合使用）</span><input type="number" min="1" max="200" step="1" value={strategyCount} onChange={(event) => setStrategyCount(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
-          <div className="grid gap-3 sm:grid-cols-3">
+      <Modal open={settingsOpen} onClose={() => { setSettingsOpen(false); setAppliedMessage(''); }} title="回测设置" width="max-w-3xl">
+        <div className="space-y-5">
+          {appliedMessage ? (
+            <div className="mb-4 flex items-start justify-between gap-3 border border-green/55 bg-accent-green-soft px-3 py-2 font-mono text-[11px] text-ink">
+              <span>{appliedMessage}</span>
+              <button type="button" className="shrink-0 text-muted hover:text-ink" aria-label="关闭通知" onClick={() => setAppliedMessage('')}>✕</button>
+            </div>
+          ) : null}
+          <section className="border border-primary/30 bg-surface-elevated p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <h3 className="flex items-center gap-2 font-display text-sm text-ink">
+                  <SlidersHorizontal className="h-4 w-4 text-primary" />
+                  参数优化
+                </h3>
+                {optimizeResult ? (
+                  <p className="mt-2 font-mono text-[11px] text-ink">
+                    已有优化结果：评分相关 {optimizeResult.scoring.scoreCorrelation.toFixed(3)}，
+                    验证收益 {optimizeResult.validation.totalReturnPct >= 0 ? '+' : ''}{optimizeResult.validation.totalReturnPct.toFixed(2)}%
+                  </p>
+                ) : (
+                  <p className="mt-2 font-mono text-[11px] text-muted">运行优化后，可在此查看并应用最新方案。</p>
+                )}
+              </div>
+              <div className="flex shrink-0 flex-col gap-2 sm:flex-row">
+                <Button variant="primary" disabled={optimizing || running} onClick={onOptimizeClick}>
+                  <SlidersHorizontal className="h-3.5 w-3.5" />
+                  {optimizing ? '优化进行中…' : '开始参数优化'}
+                </Button>
+                {optimizeResult ? (
+                  <>
+                    <Button variant="secondary" onClick={() => setOptimizeOpen(true)}>
+                      <SlidersHorizontal className="h-3.5 w-3.5" />
+                      最新优化方案
+                    </Button>
+                    <Button variant="secondary" onClick={() => applyOptimizedParams()}>
+                      应用优化结果
+                    </Button>
+                  </>
+                ) : null}
+              </div>
+            </div>
+          </section>
+
+          <section>
+            <h3 className="mb-3 font-display text-sm text-ink">手动回测参数</h3>
+      <div className="grid gap-3 sm:grid-cols-3">
+        <label className="sm:col-span-3 block"><span className="font-mono text-[11px] text-muted">回测天数（固定，优化共用）</span><input type="number" min="5" max="60" step="5" value={days} onChange={(event) => setDays(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+        <label className="sm:col-span-3 block"><span className="font-mono text-[11px] text-muted">策略组合个数（固定，仅随机组合使用）</span><input type="number" min="1" max="200" step="1" value={strategyCount} onChange={(event) => setStrategyCount(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
             <label className="block"><span className="font-mono text-[11px] text-muted">单票仓位（%）（上限）</span><input type="number" min="1" max="100" value={positionSizePct} onChange={(event) => setPositionSizePct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
             <label className="block"><span className="font-mono text-[11px] text-muted">持仓个数（上限）</span><input type="number" min="1" max="20" value={maxPositions} onChange={(event) => setMaxPositions(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
             <label className="block"><span className="font-mono text-[11px] text-muted">个股持仓天数（上限）</span><input type="number" min="1" max="60" value={maxHoldDays} onChange={(event) => setMaxHoldDays(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
@@ -326,10 +662,12 @@ export function BacktestPage() {
             <label className="block"><span className="font-mono text-[11px] text-muted">距60日低点权重（%）（上限）</span><input type="number" min="1" max="100" value={distanceFromLowWeightPct} onChange={(event) => setDistanceFromLowWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
             <label className="block"><span className="font-mono text-[11px] text-muted">波动因子权重（%）（上限）</span><input type="number" min="1" max="100" value={volatilityWeightPct} onChange={(event) => setVolatilityWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
           </div>
-          <div className="bg-surface-elevated p-3 text-[11px] leading-4 text-muted">
+          <div className="mt-3 bg-surface-elevated p-3 text-[11px] leading-4 text-muted">
             回测当前方案：直接使用上方参数原值跑 1 组结果。回测随机组合：在上限内随机取参，分别跑 {strategyCount} 组独立回测，可在历史记录中逐条查看。
           </div>
-          <div className="flex flex-wrap justify-end gap-2">
+          </section>
+
+          <div className="flex flex-wrap justify-end gap-2 border-t border-line pt-4">
             <Button variant="secondary" onClick={() => void collect()}>采集真实历史日线</Button>
             <Button variant="secondary" disabled={running} onClick={() => void run('current')}><Play className="h-3.5 w-3.5" />回测当前方案</Button>
             <Button variant="primary" disabled={running} onClick={() => void run('random')}><Play className="h-3.5 w-3.5" />回测随机组合</Button>
@@ -337,8 +675,199 @@ export function BacktestPage() {
         </div>
       </Modal>
 
-      <Modal open={historyOpen} onClose={() => setHistoryOpen(false)} title="回测历史" description={`共 ${history.length} 条记录。点击表头可排序。`} width="max-w-4xl">
-        <div className="table-scroll"><table className="data-table min-w-[800px]"><thead><tr><th>类型</th><th>时间</th><th>周期</th><th className="cursor-pointer select-none text-right" onClick={() => toggleSort('total_return_pct')}>收益率{sortColumn === 'total_return_pct' ? (sortDirection === 'asc' ? <ArrowUp className="ml-0.5 inline-block h-3 w-3" /> : <ArrowDown className="ml-0.5 inline-block h-3 w-3" />) : null}</th><th className="cursor-pointer select-none text-right" onClick={() => toggleSort('win_rate')}>胜率{sortColumn === 'win_rate' ? (sortDirection === 'asc' ? <ArrowUp className="ml-0.5 inline-block h-3 w-3" /> : <ArrowDown className="ml-0.5 inline-block h-3 w-3" />) : null}</th><th className="text-right">交易</th><th>参数</th><th className="w-10"></th></tr></thead><tbody>{history.length === 0 ? <tr><td colSpan={8}><EmptyState title="暂无历史记录" /></td></tr> : sortedHistory.map((item) => <tr key={item.run_id} className="cursor-pointer" onClick={() => void loadRun(item.run_id)}><td className="font-mono text-[11px] text-ink">{historyItemTitle(item)}</td><td className="font-mono text-[11px] text-muted">{item.timestamp}</td><td className="font-mono text-[11px] text-muted">{item.date_range}</td><td className={`text-right font-mono text-[11px] ${pctColor(item.total_return_pct)}`}>{item.total_return_pct > 0 ? '+' : ''}{item.total_return_pct.toFixed(2)}%</td><td className={`text-right font-mono text-[11px] ${pctColor(item.win_rate - 50)}`}>{item.win_rate.toFixed(1)}%</td><td className="text-right font-mono text-[11px] text-muted">{item.total_trades}</td><td className="font-mono text-[11px] text-muted">{[item.position_size_pct ? `${item.position_size_pct}%` : null, item.max_positions ? `${item.max_positions}只` : null, item.max_hold_days ? `${item.max_hold_days}天` : null].filter(Boolean).join(' ')}</td><td className="w-10"><button className="focus-ring border border-transparent p-1 text-muted hover:border-accent-red-soft hover:bg-accent-red-soft hover:text-trading-up" onClick={(e) => { e.stopPropagation(); void deleteRun(item.run_id); }} aria-label="删除回测"><Trash2 className="h-3 w-3" /></button></td></tr>)}</tbody></table></div>
+      <Modal open={optimizeOpen} onClose={() => setOptimizeOpen(false)} title="参数优化结果" description={optimizeResult?.methodology ?? '两阶段：先优化 scoreStock，再优化回测参数'} width="max-w-3xl">
+        {optimizeResult ? (
+          <div className="space-y-4">
+            <section className="border border-line bg-surface-elevated p-3">
+              <h3 className="mb-2 font-display text-sm text-ink">阶段1 · scoreStock 评分参数</h3>
+              <div className="mb-2 flex flex-wrap gap-4 font-mono text-[11px] text-muted">
+                <span>评分-收益相关 {optimizeResult.scoring.scoreCorrelation.toFixed(3)}</span>
+                <span>Top/Bottom 远期差 {optimizeResult.scoring.topBottomSpreadPct >= 0 ? '+' : ''}{optimizeResult.scoring.topBottomSpreadPct.toFixed(2)}%</span>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <h4 className="mb-1 font-mono text-[11px] text-muted">距60日低点分档</h4>
+                  <div className="space-y-1 font-mono text-[11px]">
+                    <div className="flex justify-between gap-2"><span className="text-muted">贴底</span><span className="text-ink">{optimizeResult.scoring.config.distanceFromLow.atLowScore} 分</span></div>
+                    {optimizeResult.scoring.config.distanceFromLow.tiers.map((tier) => (
+                      <div key={tier.label} className="flex justify-between gap-2"><span className="text-muted">{tier.label} &lt;{tier.maxPct}%</span><span className="text-ink">{tier.score} 分</span></div>
+                    ))}
+                    <div className="flex justify-between gap-2"><span className="text-muted">高位延伸</span><span className="text-ink">{optimizeResult.scoring.config.distanceFromLow.extendedScore} 分</span></div>
+                  </div>
+                </div>
+                <div>
+                  <h4 className="mb-1 font-mono text-[11px] text-muted">趋势维度</h4>
+                  <div className="space-y-1 font-mono text-[11px]">
+                    {[
+                      ['多头排列', `${optimizeResult.scoring.config.trend.bullishAlignment} 分`],
+                      ['纠缠', `${optimizeResult.scoring.config.trend.tangledAlignment} 分`],
+                      ['空头排列', `${optimizeResult.scoring.config.trend.bearishAlignment} 分`],
+                      ['强度乘数', String(optimizeResult.scoring.config.trend.trendBonusMultiplier)],
+                      ['强度上限', `${optimizeResult.scoring.config.trend.trendBonusCap} 分`],
+                    ].map(([label, value]) => <div key={label} className="flex justify-between gap-2"><span className="text-muted">{label}</span><span className="text-ink">{value}</span></div>)}
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="border border-line bg-surface-elevated p-3">
+              <h3 className="mb-2 font-display text-sm text-ink">阶段2 · 回测交易参数</h3>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <h4 className="mb-1 font-mono text-[11px] text-muted">推荐策略参数</h4>
+                  <div className="space-y-1 font-mono text-[11px]">
+                    {[
+                      ['持仓天数', `${optimizeResult.optimized.maxHoldDays} 天`],
+                      ['持仓个数', `${optimizeResult.optimized.maxPositions} 只`],
+                      ['单票仓位', `${optimizeResult.optimized.positionSizePct}%`],
+                      ['止盈', `+${optimizeResult.optimized.takeProfitPct}%`],
+                      ['止损', `${optimizeResult.optimized.stopLossPct}%`],
+                    ].map(([label, value]) => <div key={label} className="flex justify-between gap-2"><span className="text-muted">{label}</span><span className="text-ink">{value}</span></div>)}
+                  </div>
+                </div>
+                <div>
+                  <h4 className="mb-1 font-mono text-[11px] text-muted">因子权重</h4>
+                  <div className="space-y-1 font-mono text-[11px]">
+                    {[
+                      ['趋势', `${optimizeResult.optimized.trendWeightPct}%`],
+                      ['价量', `${optimizeResult.optimized.volumePriceWeightPct}%`],
+                      ['距低点', `${optimizeResult.optimized.distanceFromLowWeightPct}%`],
+                      ['波动', `${optimizeResult.optimized.volatilityWeightPct}%`],
+                    ].map(([label, value]) => <div key={label} className="flex justify-between gap-2"><span className="text-muted">{label}</span><span className="text-ink">{value}</span></div>)}
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="border border-line bg-surface-elevated p-3">
+              <h3 className="mb-2 font-mono text-[11px] text-muted">
+                {optimizeResult.beatBaseline ? '阶段2 网格验证' : '未超越默认基线，已回退默认参数'}
+                （{optimizeResult.days} 日回测）
+              </h3>
+              <div className="mb-2 flex flex-wrap gap-4 font-mono text-[11px] text-muted">
+                <span>默认基线 {optimizeResult.baseline.validation.totalReturnPct >= 0 ? '+' : ''}{optimizeResult.baseline.validation.totalReturnPct.toFixed(2)}%</span>
+                <span className={optimizeResult.beatBaseline ? 'text-trading-up' : 'text-trading-down'}>
+                  优化后 {optimizeResult.validation.totalReturnPct >= 0 ? '+' : ''}{optimizeResult.validation.totalReturnPct.toFixed(2)}%
+                </span>
+              </div>
+              <div className="flex flex-wrap gap-4 font-mono text-[11px]">
+                <span className={pctColor(optimizeResult.validation.totalReturnPct)}>收益率 {optimizeResult.validation.totalReturnPct >= 0 ? '+' : ''}{optimizeResult.validation.totalReturnPct.toFixed(2)}%</span>
+                <span className="text-ink">胜率 {optimizeResult.validation.winRate.toFixed(1)}%</span>
+                <span className="text-trading-down">最大回撤 {optimizeResult.validation.maxDrawdownPct.toFixed(2)}%</span>
+                <span className="text-muted">交易 {optimizeResult.validation.totalTrades} 笔</span>
+              </div>
+              <p className="mt-2 text-[11px] text-muted">优选距低点区间：{optimizeResult.scoring.sweetSpotLabels.join('、')}</p>
+            </section>
+
+            <div className="table-scroll">
+              <table className="data-table min-w-[640px]">
+                <thead><tr><th>距60日低点区间（阶段1统计）</th><th className="text-right">样本</th><th className="text-right">分档得分</th><th className="text-right">5日评估远期</th><th className="text-right">胜率</th></tr></thead>
+                <tbody>
+                  {optimizeResult.scoring.distanceBucketStats.map((bucket) => (
+                    <tr key={bucket.label} className={optimizeResult.scoring.sweetSpotLabels.includes(bucket.label) ? 'bg-surface-elevated' : undefined}>
+                      <td className="font-mono text-[11px] text-ink">{bucket.label}{optimizeResult.scoring.sweetSpotLabels.includes(bucket.label) ? ' ★' : ''}</td>
+                      <td className="text-right font-mono text-[11px] text-muted">{bucket.sampleCount}</td>
+                      <td className="text-right font-mono text-[11px] text-ink">{bucket.positionScore}</td>
+                      <td className={`text-right font-mono text-[11px] ${pctColor(bucket.avgForwardReturnPct)}`}>{bucket.avgForwardReturnPct >= 0 ? '+' : ''}{bucket.avgForwardReturnPct.toFixed(2)}%</td>
+                      <td className="text-right font-mono text-[11px] text-ink">{bucket.winRatePct.toFixed(1)}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="flex flex-wrap justify-end gap-2">
+              <Button variant="secondary" onClick={() => setOptimizeOpen(false)}>关闭</Button>
+              <Button variant="primary" onClick={applyOptimizedParams}>应用到回测设置</Button>
+            </div>
+          </div>
+        ) : <EmptyState title="暂无优化结果" />}
+      </Modal>
+
+      <Modal open={historyOpen} onClose={closeHistoryModal} title="回测历史" description={`共 ${history.length} 条记录。点击表头可排序，勾选后可批量删除。`} width="max-w-4xl">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <span className="font-mono text-[11px] text-muted">
+            {selectedRunIds.size > 0 ? `已选 ${selectedRunIds.size} 条` : '勾选条目后可批量删除'}
+          </span>
+          <Button
+            variant="secondary"
+            disabled={selectedRunIds.size === 0}
+            onClick={() => void deleteSelectedRuns().catch((deleteError) => setError(deleteError instanceof Error ? deleteError.message : String(deleteError)))}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            批量删除
+          </Button>
+        </div>
+        <div className="table-scroll border border-line">
+          <table className="data-table min-w-[820px]">
+            <thead>
+              <tr>
+                <th className="w-10">
+                  <input
+                    type="checkbox"
+                    className="h-3.5 w-3.5 accent-primary"
+                    checked={pageAllSelected}
+                    ref={(input) => {
+                      if (input) input.indeterminate = !pageAllSelected && pageSomeSelected;
+                    }}
+                    onChange={toggleSelectPage}
+                    aria-label="全选当前页"
+                  />
+                </th>
+                <th>类型</th>
+                <th>时间</th>
+                <th>周期</th>
+                <th className="cursor-pointer select-none text-right" onClick={() => toggleSort('total_return_pct')}>
+                  收益率
+                  {sortColumn === 'total_return_pct' ? (sortDirection === 'asc' ? <ArrowUp className="ml-0.5 inline-block h-3 w-3" /> : <ArrowDown className="ml-0.5 inline-block h-3 w-3" />) : null}
+                </th>
+                <th className="cursor-pointer select-none text-right" onClick={() => toggleSort('win_rate')}>
+                  胜率
+                  {sortColumn === 'win_rate' ? (sortDirection === 'asc' ? <ArrowUp className="ml-0.5 inline-block h-3 w-3" /> : <ArrowDown className="ml-0.5 inline-block h-3 w-3" />) : null}
+                </th>
+                <th className="text-right">交易</th>
+                <th>参数</th>
+                <th className="w-10"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {history.length === 0 ? (
+                <tr><td colSpan={9}><EmptyState title="暂无历史记录" /></td></tr>
+              ) : paginatedHistory.items.map((item) => (
+                <tr key={item.run_id} className="cursor-pointer" onClick={() => void loadRun(item.run_id)}>
+                  <td className="w-10" onClick={(event) => event.stopPropagation()}>
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 accent-primary"
+                      checked={selectedRunIds.has(item.run_id)}
+                      onChange={() => toggleSelectRun(item.run_id)}
+                      aria-label={`选择 ${historyItemTitle(item)}`}
+                    />
+                  </td>
+                  <td className="font-mono text-[11px] text-ink">{historyItemTitle(item)}</td>
+                  <td className="font-mono text-[11px] text-muted">{item.timestamp}</td>
+                  <td className="font-mono text-[11px] text-muted">{item.date_range}</td>
+                  <td className={`text-right font-mono text-[11px] ${pctColor(item.total_return_pct)}`}>{item.total_return_pct > 0 ? '+' : ''}{item.total_return_pct.toFixed(2)}%</td>
+                  <td className={`text-right font-mono text-[11px] ${pctColor(item.win_rate - 50)}`}>{item.win_rate.toFixed(1)}%</td>
+                  <td className="text-right font-mono text-[11px] text-muted">{item.total_trades}</td>
+                  <td className="font-mono text-[11px] text-muted">{[item.position_size_pct ? `${item.position_size_pct}%` : null, item.max_positions ? `${item.max_positions}只` : null, item.max_hold_days ? `${item.max_hold_days}天` : null].filter(Boolean).join(' ')}</td>
+                  <td className="w-10">
+                    <button
+                      className="focus-ring border border-transparent p-1 text-muted hover:border-accent-red-soft hover:bg-accent-red-soft hover:text-trading-up"
+                      onClick={(event) => { event.stopPropagation(); void deleteRun(item.run_id); }}
+                      aria-label="删除回测"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {paginatedHistory.totalPages > 1 ? (
+            <Pagination page={paginatedHistory.page} pages={paginatedHistory.totalPages} onPage={setHistoryPage} />
+          ) : null}
+        </div>
       </Modal>
       </div>
     </>

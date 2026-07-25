@@ -6,6 +6,8 @@
 --   osascript scripts/ths_order_dry_run.applescript snapshot funds
 --   osascript scripts/ths_order_dry_run.applescript snapshot positions
 --   osascript scripts/ths_order_dry_run.applescript snapshot orders
+--   osascript scripts/ths_order_dry_run.applescript snapshot account
+--   osascript scripts/ths_order_dry_run.applescript snapshot account 600001,000815
 --   osascript scripts/ths_order_dry_run.applescript quote 600519
 --   osascript scripts/ths_order_dry_run.applescript cancel buy 600519 100
 --
@@ -17,38 +19,59 @@
 --   osascript scripts/ths_order_dry_run.applescript 600519 1327.50 100
 
 property stoleFocus : false
+property snapshotHintCodes : {}
+property snapshotFundRowsFound : false
+property snapshotFoundCodes : {}
 
 on run argv
-    if (count of argv) is 3 then
-        return my submitSimulatedOrder("buy", item 1 of argv, item 2 of argv, item 3 of argv)
+    if (count of argv) >= 2 then
+        set commandName to item 1 of argv as text
+
+        if commandName is "snapshot" then
+            if (count of argv) < 2 or (count of argv) > 3 then error my usageText()
+            set snapshotKind to item 2 of argv as text
+            set hintCodes to {}
+            if (count of argv) is 3 then set hintCodes to my parseHintCodes(item 3 of argv as text)
+            return my takeSnapshot(snapshotKind, hintCodes)
+        else if commandName is "quote" then
+            if (count of argv) is not 2 then error my usageText()
+            return my readSimulatedQuote(item 2 of argv as text)
+        else if commandName is "order" then
+            if (count of argv) is not 5 then error my usageText()
+            return my submitSimulatedOrder(item 2 of argv as text, item 3 of argv as text, item 4 of argv as text, item 5 of argv as text)
+        else if commandName is "verify" then
+            if (count of argv) is not 5 then error my usageText()
+            return my verifyOrder(item 2 of argv as text, item 3 of argv as text, item 4 of argv as text, item 5 of argv as text)
+        else if commandName is "cancel" then
+            if (count of argv) is not 4 then error my usageText()
+            return my cancelSimulatedOrder(item 2 of argv as text, item 3 of argv as text, item 4 of argv as text)
+        end if
     end if
 
-    if (count of argv) < 2 then error my usageText()
-    set commandName to item 1 of argv as text
-
-    if commandName is "snapshot" then
-        if (count of argv) is not 2 then error my usageText()
-        return my takeSnapshot(item 2 of argv as text)
-    else if commandName is "quote" then
-        if (count of argv) is not 2 then error my usageText()
-        return my readSimulatedQuote(item 2 of argv as text)
-    else if commandName is "order" then
-        if (count of argv) is not 5 then error my usageText()
-        return my submitSimulatedOrder(item 2 of argv as text, item 3 of argv as text, item 4 of argv as text, item 5 of argv as text)
-    else if commandName is "verify" then
-        if (count of argv) is not 5 then error my usageText()
-        return my verifyOrder(item 2 of argv as text, item 3 of argv as text, item 4 of argv as text, item 5 of argv as text)
-    else if commandName is "cancel" then
-        if (count of argv) is not 4 then error my usageText()
-        return my cancelSimulatedOrder(item 2 of argv as text, item 3 of argv as text, item 4 of argv as text)
+    if (count of argv) is 3 then
+        return my submitSimulatedOrder("buy", item 1 of argv, item 2 of argv, item 3 of argv)
     end if
 
     error my usageText()
 end run
 
 on usageText()
-    return "用法：snapshot funds|positions|orders；quote 股票代码；order buy|sell 股票代码 价格|AUTO 数量；verify buy|sell 股票代码 价格|AUTO 数量；cancel buy|sell 股票代码 数量"
+    return "用法：snapshot funds|positions|orders|account [代码1,代码2]；quote 股票代码；order buy|sell 股票代码 价格|AUTO 数量；verify buy|sell 股票代码 价格|AUTO 数量；cancel buy|sell 股票代码 数量"
 end usageText
+
+on parseHintCodes(rawHints)
+    set parsed to {}
+    set normalized to my replaceText(rawHints as text, " ", "")
+    if normalized is "" then return parsed
+    set AppleScript's text item delimiters to ","
+    set parts to text items of normalized
+    set AppleScript's text item delimiters to ""
+    repeat with i from 1 to count of parts
+        set codeText to item i of parts as text
+        if my isStockCode(codeText) then set end of parsed to codeText
+    end repeat
+    return parsed
+end parseHintCodes
 
 on cancelSimulatedOrder(orderSide, orderCode, orderQuantity)
     if orderSide is not in {"buy", "sell"} then error "撤单方向必须是 buy 或 sell"
@@ -153,7 +176,9 @@ on readSimulatedQuote(orderCode)
     end tell
 end readSimulatedQuote
 
-on takeSnapshot(snapshotKind)
+on takeSnapshot(snapshotKind, hintCodes)
+    if snapshotKind is "account" then return my takeAccountSnapshot(hintCodes)
+    set my snapshotHintCodes to hintCodes
     if snapshotKind is not in {"funds", "positions", "orders"} then error "未知查询类型：" & snapshotKind
     set previousApp to my saveForegroundApp()
     tell application "System Events"
@@ -164,14 +189,63 @@ on takeSnapshot(snapshotKind)
             if simulationWindow is missing value then error "未找到包含“模拟练习”的窗口，已停止"
             my refreshSimulationConnection(simulationWindow)
             my navigateTo(simulationWindow, snapshotKind)
-            delay 0.6
+            my waitForSimulationPage(simulationWindow, snapshotKind)
             if not my elementContainsText(simulationWindow, "模拟练习") then error "查询前无法确认模拟交易状态，已停止"
             set snapshotResult to my snapshotWindow(simulationWindow, snapshotKind)
             my restoreForegroundApp(previousApp)
+            set my snapshotHintCodes to {}
             return snapshotResult
         end tell
     end tell
 end takeSnapshot
+
+on takeAccountSnapshot(hintCodes)
+    set my snapshotHintCodes to hintCodes
+    -- 单次会话读取资金+持仓，避免两次 osascript 冷启动和重复找窗口。
+    -- 只读同步跳过 refreshSimulationConnection，省 1.5 秒且非交易时段无需重连。
+    set previousApp to my saveForegroundApp()
+    tell application "System Events"
+        if not (exists process "同花顺") then error "同花顺尚未运行"
+        tell process "同花顺"
+            set simulationWindow to my findSimulationWindow(it)
+            if simulationWindow is missing value then error (my windowUnavailableReason(it))
+            my navigateTo(simulationWindow, "positions")
+            my waitForSimulationPage(simulationWindow, "positions")
+            if not my elementContainsText(simulationWindow, "模拟练习") then error "查询前无法确认模拟交易状态，已停止"
+            set positionsPart to my snapshotWindow(simulationWindow, "positions")
+            set fundsPart to positionsPart
+            if not my snapshotContainsFunds(positionsPart) then
+                my navigateTo(simulationWindow, "funds")
+                my waitForSimulationPage(simulationWindow, "funds")
+                set fundsPart to my snapshotWindow(simulationWindow, "funds")
+            end if
+            my restoreForegroundApp(previousApp)
+            set my snapshotHintCodes to {}
+            return my mergeAccountSnapshot(positionsPart, fundsPart)
+        end tell
+    end tell
+end takeAccountSnapshot
+
+on snapshotContainsFunds(snapshotText)
+    set snapshotText to snapshotText as text
+    return snapshotText contains "可用" and snapshotText contains "资产"
+end snapshotContainsFunds
+
+on mergeAccountSnapshot(positionsPart, fundsPart)
+    set outputLines to {"THS_SIMULATOR_V1", "MODE|account", "SIMULATION|confirmed"}
+    my appendSnapshotLines(outputLines, positionsPart as text)
+    if fundsPart is not positionsPart then my appendSnapshotLines(outputLines, fundsPart as text)
+    return my joinList(outputLines, linefeed)
+end mergeAccountSnapshot
+
+on appendSnapshotLines(outputLines, snapshotText)
+    repeat with lineText in paragraphs of snapshotText
+        set lineText to lineText as text
+        if lineText starts with "ROW|" or lineText starts with "TEXT|" then
+            if lineText is not in outputLines then set end of outputLines to lineText
+        end if
+    end repeat
+end appendSnapshotLines
 
 on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
     if orderSide is not in {"buy", "sell"} then error "交易方向必须是 buy 或 sell"
@@ -293,6 +367,7 @@ on verifyOrderInWindow(simulationWindow, orderSide, orderCode, orderPrice, order
 end verifyOrderInWindow
 
 on navigateTo(simulationWindow, destination)
+    if my simulationPageReady(simulationWindow, destination) then return
     set labels to {}
     if destination is "funds" then
         set labels to {"资金股份", "资金", "持仓"}
@@ -312,15 +387,72 @@ on navigateTo(simulationWindow, destination)
         return
     end if
 
-    -- 有些版本把资金、持仓和委托放在同一页；页面已含目标内容时允许继续。
-    if destination is "funds" and (my elementContainsText(simulationWindow, "可用资金")) then return
-    if destination is "positions" and (my elementContainsText(simulationWindow, "可用股份")) then return
-    if destination is "orders" and (my elementContainsText(simulationWindow, "委托状态")) then return
-    if destination is "buy" and (my elementContainsText(simulationWindow, "确定买入")) then return
-    if destination is "sell" and (my elementContainsText(simulationWindow, "确定卖出")) then return
-
     error "无法切换到模拟交易页面：" & destination
 end navigateTo
+
+-- 切页后用轮询代替固定 delay：页面就绪立即继续，最多等 100×50ms=5s。
+on waitForSimulationPage(simulationWindow, destination)
+    repeat 100 times
+        if my simulationPageReady(simulationWindow, destination) then return
+        delay 0.05
+    end repeat
+end waitForSimulationPage
+
+on simulationPageReady(simulationWindow, destination)
+    if destination is "funds" then
+        return my shallowTextContains(simulationWindow, {"可用资金", "可用金额", "总资产", "资金余额"})
+    else if destination is "positions" then
+        if my shallowTextContains(simulationWindow, {"可用股份", "可用金额", "总资产", "证券代码", "股票余额", "资金余额"}) then return true
+        return my hasSmallPositionTable(simulationWindow)
+    else if destination is "orders" then
+        return my shallowTextContains(simulationWindow, {"委托状态", "当日委托"})
+    else if destination is "buy" then
+        return my shallowTextContains(simulationWindow, {"确定买入", "买入"})
+    else if destination is "sell" then
+        return my shallowTextContains(simulationWindow, {"确定卖出", "卖出"})
+    end if
+    return false
+end simulationPageReady
+
+on shallowTextContains(rootElement, wantedTexts)
+    tell application "System Events"
+        tell rootElement
+            try
+                repeat with t in static texts
+                    set tx to my elementText(t)
+                    repeat with i from 1 to count of wantedTexts
+                        set wanted to item i of wantedTexts as text
+                        if tx contains wanted then return true
+                    end repeat
+                end repeat
+                repeat with b in buttons
+                    set bn to my elementName(b)
+                    repeat with i from 1 to count of wantedTexts
+                        set wanted to item i of wantedTexts as text
+                        if bn contains wanted then return true
+                    end repeat
+                end repeat
+            end try
+        end tell
+    end tell
+    return false
+end shallowTextContains
+
+on hasSmallPositionTable(simulationWindow)
+    tell application "System Events"
+        tell simulationWindow
+            try
+                repeat with scrollItem in scroll areas
+                    repeat with tableItem in tables of scrollItem
+                        set rowCount to count of rows of tableItem
+                        if rowCount > 0 and rowCount <= 100 and (count of columns of tableItem) <= 20 then return true
+                    end repeat
+                end repeat
+            end try
+        end tell
+    end tell
+    return false
+end hasSmallPositionTable
 
 on refreshSimulationConnection(simulationWindow)
     -- 点击模拟练习标签页右侧的刷新图标，确保会话处于已连接状态。
@@ -598,25 +730,17 @@ on allTextFields(rootElement)
 end allTextFields
 
 on snapshotWindow(simulationWindow, snapshotKind)
+    set hintCodes to my snapshotHintCodes
     set outputLines to {"THS_SIMULATOR_V1", "MODE|" & snapshotKind, "SIMULATION|confirmed"}
+    set skipTextScan to snapshotKind is in {"account", "positions"}
+    set tableRows to my collectSnapshotTableRows(simulationWindow, snapshotKind, hintCodes)
+    repeat with i from 1 to count of tableRows
+        set end of outputLines to item i of tableRows as text
+    end repeat
+    if skipTextScan and my snapshotScanComplete(hintCodes, tableRows) then return my joinList(outputLines, linefeed)
+    if skipTextScan and (count of hintCodes) is 0 and my snapshotHasFundRows(tableRows) then return my joinList(outputLines, linefeed)
+    if skipTextScan and (count of tableRows) > 0 and snapshotKind is "account" and my snapshotHasFundRows(tableRows) and my snapshotHasPositionRows(tableRows) then return my joinList(outputLines, linefeed)
     tell application "System Events"
-        -- 模拟账户区域是小表格；跳过行情区的数百行大表，避免 Swift AX 树展开阻塞。
-        try
-            repeat with scrollItem in scroll areas of simulationWindow
-                repeat with tableItem in tables of scrollItem
-                    if (count of rows of tableItem) <= 100 and (count of columns of tableItem) <= 20 then
-                        repeat with uiItem in rows of tableItem
-                            set rowValues to {}
-                            repeat with rowItem in UI elements of uiItem
-                                set cellText to my elementText(rowItem)
-                                if cellText is not "" then set end of rowValues to cellText
-                            end repeat
-                            if (count of rowValues) > 0 then set end of outputLines to "ROW|" & my joinList(rowValues, "|")
-                        end repeat
-                    end if
-                end repeat
-            end repeat
-        end try
         try
             repeat with uiItem in (static texts of simulationWindow) & (text fields of simulationWindow) & (buttons of simulationWindow)
                 set itemText to my elementText(uiItem)
@@ -626,6 +750,172 @@ on snapshotWindow(simulationWindow, snapshotKind)
     end tell
     return my joinList(outputLines, linefeed)
 end snapshotWindow
+
+on collectSnapshotTableRows(simulationWindow, snapshotKind, hintCodes)
+    set capturedRows to {}
+    set my snapshotFundRowsFound to false
+    set my snapshotFoundCodes to {}
+    set primaryHandled to false
+    tell application "System Events"
+        tell simulationWindow
+            repeat with scrollItem in scroll areas
+                repeat with tableItem in tables of scrollItem
+                    if (count of rows of tableItem) <= 100 and (count of columns of tableItem) <= 20 then
+                        set scanAllRows to false
+                        if not primaryHandled then
+                            if (count of hintCodes) > 0 then
+                                if my tableContainsAnyHint(tableItem, hintCodes) then
+                                    set scanAllRows to true
+                                    set primaryHandled to true
+                                end if
+                            else if my tableLooksLikeAccount(tableItem) then
+                                set scanAllRows to true
+                                set primaryHandled to true
+                            end if
+                        end if
+                        my appendTableSnapshotRows(tableItem, hintCodes, capturedRows, scanAllRows)
+                        if (count of hintCodes) > 0 and my snapshotScanComplete(hintCodes, capturedRows) then
+                            set plainRows to {}
+                            repeat with i from 1 to count of capturedRows
+                                set end of plainRows to (item i of capturedRows) as text
+                            end repeat
+                            return plainRows
+                        end if
+                    end if
+                end repeat
+                if (count of hintCodes) > 0 and my snapshotScanComplete(hintCodes, capturedRows) then exit repeat
+            end repeat
+        end tell
+    end tell
+    set plainRows to {}
+    repeat with i from 1 to count of capturedRows
+        set end of plainRows to (item i of capturedRows) as text
+    end repeat
+    return plainRows
+end collectSnapshotTableRows
+
+on appendTableSnapshotRows(tableItem, hintCodes, capturedRows, scanAllPositionRows)
+    tell application "System Events"
+        repeat with uiItem in rows of tableItem
+            set rowValues to {}
+            repeat with rowItem in UI elements of uiItem
+                set cellText to my elementText(rowItem)
+                if cellText is not "" then set end of rowValues to cellText
+            end repeat
+            if my shouldCaptureSnapshotRow(rowValues, hintCodes, scanAllPositionRows) then
+                set rowLine to "ROW|" & my joinList(rowValues, "|")
+                if rowLine is not in capturedRows then
+                    set end of capturedRows to rowLine
+                    if my isFundSummaryRow(rowValues) then set my snapshotFundRowsFound to true
+                    set rowCode to my stockCodeInRowValues(rowValues)
+                    if rowCode is not "" and rowCode is not in my snapshotFoundCodes then set end of my snapshotFoundCodes to rowCode
+                end if
+            end if
+        end repeat
+    end tell
+end appendTableSnapshotRows
+
+on tableContainsAnyHint(tableItem, hintCodes)
+    tell application "System Events"
+        repeat with uiItem in rows of tableItem
+            set rowValues to {}
+            repeat with rowItem in UI elements of uiItem
+                set cellText to my elementText(rowItem)
+                if cellText is not "" then set end of rowValues to cellText
+            end repeat
+            set rowCode to my stockCodeInRowValues(rowValues)
+            if rowCode is not "" then
+                repeat with i from 1 to count of hintCodes
+                    if rowCode is (item i of hintCodes as text) then return true
+                end repeat
+            end if
+        end repeat
+    end tell
+    return false
+end tableContainsAnyHint
+
+on tableLooksLikeAccount(tableItem)
+    tell application "System Events"
+        repeat with uiItem in rows of tableItem
+            set rowValues to {}
+            repeat with rowItem in UI elements of uiItem
+                set cellText to my elementText(rowItem)
+                if cellText is not "" then set end of rowValues to cellText
+            end repeat
+            if my isFundSummaryRow(rowValues) then return true
+            if my stockCodeInRowValues(rowValues) is not "" then return true
+        end repeat
+    end tell
+    return false
+end tableLooksLikeAccount
+
+on shouldCaptureSnapshotRow(rowValues, hintCodes, scanAllPositionRows)
+    if my isJunkSnapshotRow(rowValues) then return false
+    if my isFundSummaryRow(rowValues) then return true
+    set rowCode to my stockCodeInRowValues(rowValues)
+    if rowCode is "" then return false
+    if scanAllPositionRows then return true
+    if (count of hintCodes) is 0 then return true
+    repeat with i from 1 to count of hintCodes
+        if rowCode is (item i of hintCodes as text) then return true
+    end repeat
+    return false
+end shouldCaptureSnapshotRow
+
+on snapshotScanComplete(hintCodes, capturedRows)
+    if not my snapshotFundRowsFound then return false
+    if (count of hintCodes) is 0 then return (count of capturedRows) > 0
+    return (count of my snapshotFoundCodes) >= (count of hintCodes)
+end snapshotScanComplete
+
+on snapshotHasFundRows(capturedRows)
+    repeat with i from 1 to count of capturedRows
+        set rowLine to item i of capturedRows as text
+        repeat with j from 1 to 4
+            set labelText to item j of {"总资产", "可用金额", "可用资金", "资金余额"} as text
+            if rowLine contains labelText then return true
+        end repeat
+    end repeat
+    return false
+end snapshotHasFundRows
+
+on snapshotHasPositionRows(capturedRows)
+    repeat with i from 1 to count of capturedRows
+        set rowLine to item i of capturedRows as text
+        if my rowLineHasStockCode(rowLine) then return true
+    end repeat
+    return false
+end snapshotHasPositionRows
+
+on rowLineHasStockCode(rowLine)
+    set AppleScript's text item delimiters to "|"
+    set cells to text items of rowLine
+    set AppleScript's text item delimiters to ""
+    repeat with j from 1 to count of cells
+        if my isStockCode(item j of cells as text) then return true
+    end repeat
+    return false
+end rowLineHasStockCode
+
+on isJunkSnapshotRow(rowValues)
+    if (count of rowValues) is 0 then return true
+    if (count of rowValues) is 1 and (item 1 of rowValues as text) is "单元格" then return true
+    return false
+end isJunkSnapshotRow
+
+on isFundSummaryRow(rowValues)
+    if (count of rowValues) < 2 then return false
+    set labelText to item 1 of rowValues as text
+    return labelText is in {"总资产", "总市值", "总盈亏", "当日盈亏", "资金余额", "可取金额", "可用金额", "可用资金"}
+end isFundSummaryRow
+
+on stockCodeInRowValues(rowValues)
+    repeat with i from 1 to count of rowValues
+        set cellText to item i of rowValues as text
+        if my isStockCode(cellText) then return cellText
+    end repeat
+    return ""
+end stockCodeInRowValues
 
 on collectElementText(rootElement)
     set textParts to {}

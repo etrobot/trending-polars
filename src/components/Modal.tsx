@@ -13,7 +13,7 @@ export function Modal({ open, onClose, title, description, children, width = 'ma
 
   if (!open) return null;
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-[2px]" onMouseDown={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" onMouseDown={onClose}>
       <div className={`animate-enter max-h-[90vh] w-full overflow-auto border border-line bg-surface p-4 shadow-[0_4px_12px_rgba(0,0,0,0.12)] ${width}`} style={{ borderRadius: 6 }} role="dialog" aria-modal="true" aria-label={title} onMouseDown={(event) => event.stopPropagation()}>
         <div className="flex items-start justify-between gap-4 border-b border-line pb-3">
           <div>

@@ -8,6 +8,8 @@ import {
   scoreStock,
   type PreparedSeries,
   type SectorContext,
+  type ScoreStockConfig,
+  DEFAULT_SCORE_STOCK_CONFIG,
 } from './scoring-engine.js';
 import {
   calculateEntrySize,
@@ -284,7 +286,11 @@ function sellPosition(
   };
 }
 
-function buildBacktestContext(history: HistoricalMarketData, days: number): BacktestContext {
+function buildBacktestContext(
+  history: HistoricalMarketData,
+  days: number,
+  scoringConfig: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
+): BacktestContext {
   const dates = history.calendar.filter((date) => date <= history.as_of_date).slice(-days);
   if (dates.length < 2) throw new Error('历史数据不足，至少需要两个交易日');
   const exactLimitUpDates = limitUpDatesByCode(history);
@@ -292,7 +298,7 @@ function buildBacktestContext(history: HistoricalMarketData, days: number): Back
   return {
     dates,
     exactLimitUpCodes: limitUpCodesByDate(history),
-    scoreMap: computeBacktestScores(history, dates, exactLimitUpDates),
+    scoreMap: computeBacktestScores(history, dates, exactLimitUpDates, scoringConfig),
     prepared,
     seriesByCode: new Map(prepared.map((series) => [series.stockCode, series] as const)),
   };
@@ -577,6 +583,7 @@ export function runPolarsBacktest(
     volumePriceWeightPct?: number;
     distanceFromLowWeightPct?: number;
     volatilityTrendWeightPct?: number;
+    scoringConfig?: ScoreStockConfig;
   },
 ): BacktestResult {
   const days = Math.min(60, Math.max(5, Math.trunc(options.days || 20)));
@@ -593,6 +600,7 @@ export function runPolarsBacktest(
     distanceFromLowWeightPct: options.distanceFromLowWeightPct,
     volatilityTrendWeightPct: options.volatilityTrendWeightPct,
   });
+  const scoringConfig = options.scoringConfig ?? DEFAULT_SCORE_STOCK_CONFIG;
   console.log('[backtest] runPolarsBacktest current scheme', {
     days,
     maxHoldDays: strategy.maxHoldDays,
@@ -604,8 +612,9 @@ export function runPolarsBacktest(
     volumePriceWeightPct: factorWeights.volumePriceWeightPct,
     distanceFromLowWeightPct: factorWeights.distanceFromLowWeightPct,
     volatilityTrendWeightPct: factorWeights.volatilityTrendWeightPct,
+    scoring_config: 'custom',
   });
-  const context = buildBacktestContext(history, days);
+  const context = buildBacktestContext(history, days, scoringConfig);
   const simulation = simulateBacktest(context, strategy, factorWeights);
   return buildResult(history, context, strategy, simulation, {
     mode: 'current',
@@ -652,6 +661,7 @@ export function runRandomizedBacktest(
     volumePriceWeightPctUpper?: number;
     distanceFromLowWeightPctUpper?: number;
     volatilityTrendWeightPctUpper?: number;
+    scoringConfig?: ScoreStockConfig;
   },
 ): BacktestResult[] {
   const days = Math.min(60, Math.max(5, Math.trunc(options.days || 20)));
@@ -667,8 +677,9 @@ export function runRandomizedBacktest(
     distanceFromLowWeightPct: Math.min(100, Math.max(1, Math.trunc(options.distanceFromLowWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct))),
     volatilityTrendWeightPct: Math.min(100, Math.max(1, Math.trunc(options.volatilityTrendWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct))),
   };
-  console.log('[backtest] runRandomizedBacktest start', { days, strategyCount, bounds });
-  const context = buildBacktestContext(history, days);
+  const scoringConfig = options.scoringConfig ?? DEFAULT_SCORE_STOCK_CONFIG;
+  console.log('[backtest] runRandomizedBacktest start', { days, strategyCount, bounds, scoring_config: 'custom' });
+  const context = buildBacktestContext(history, days, scoringConfig);
   const batchRunId = `${compactDate().slice(0, 8)}_${compactDate().slice(8)}`;
   const seed = hashString([
     history.as_of_date,
@@ -724,4 +735,58 @@ export function runRandomizedBacktest(
   }
 
   return results;
+}
+
+export interface BacktestQuickSummary {
+  totalReturnPct: number;
+  winRate: number;
+  maxDrawdownPct: number;
+  totalTrades: number;
+}
+
+/** 构建可复用的回测上下文（评分矩阵 + 日历），供参数优化等批量模拟使用。 */
+export function prepareBacktestContext(
+  history: HistoricalMarketData,
+  days: number,
+  scoringConfig: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
+) {
+  return buildBacktestContext(history, days, scoringConfig);
+}
+
+/** 在已有 context 上快速模拟一组参数，避免重复构建评分矩阵。 */
+export function quickSimulateBacktest(
+  context: BacktestContext,
+  options: {
+    maxHoldDays: number;
+    maxPositions?: number;
+    stopLossPct?: number;
+    takeProfitPct?: number;
+    positionSizePct?: number;
+    trendWeightPct?: number;
+    volumePriceWeightPct?: number;
+    distanceFromLowWeightPct?: number;
+    volatilityTrendWeightPct?: number;
+  },
+): BacktestQuickSummary {
+  const strategy = createT1StrategyConfig({
+    maxHoldDays: Math.max(1, Math.trunc(options.maxHoldDays)),
+    maxPositions: Math.max(1, Math.trunc(options.maxPositions ?? DEFAULT_T1_STRATEGY.maxPositions)),
+    stopLossPct: normalizeStopLossPct(options.stopLossPct),
+    takeProfitPct: Math.max(1, Math.trunc(options.takeProfitPct ?? DEFAULT_T1_STRATEGY.takeProfitPct)),
+    positionSizePct: Math.max(1, Math.trunc(options.positionSizePct ?? DEFAULT_T1_STRATEGY.positionSizePct)),
+  });
+  const factorWeights = normalizeFactorWeights({
+    trendWeightPct: options.trendWeightPct,
+    volumePriceWeightPct: options.volumePriceWeightPct,
+    distanceFromLowWeightPct: options.distanceFromLowWeightPct,
+    volatilityTrendWeightPct: options.volatilityTrendWeightPct,
+  });
+  const simulation = simulateBacktest(context, strategy, factorWeights);
+  const summary = summarizeSimulation(simulation);
+  return {
+    totalReturnPct: summary.totalReturnPct,
+    winRate: summary.winRate,
+    maxDrawdownPct: summary.maxDrawdownPct,
+    totalTrades: summary.totalTrades,
+  };
 }

@@ -116,6 +116,27 @@ export function displayDate(value: string): string {
   return `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`;
 }
 
+/** 与调度器持仓监控窗口一致：9:25–15:20 视为交易时段。 */
+export const ACCOUNT_SYNC_SESSION_START_MINUTE = 9 * 60 + 25;
+export const ACCOUNT_SYNC_SESSION_END_MINUTE = 15 * 60 + 20;
+
+/**
+ * 非交易日期/时段只需同步账户与持仓，跳过策略补算、行情补采和同花顺委托查询。
+ */
+export function isAccountSyncOnlyPeriod(
+  clock: ReturnType<typeof shanghaiClock>,
+  calendar: readonly string[] = [],
+): boolean {
+  if (clock.weekday === 0 || clock.weekday === 6) return true;
+  if (calendar.length > 0) {
+    const tradingDays = calendar.map(compactDate).filter(Boolean).sort();
+    const latestCalendarDay = tradingDays.at(-1) ?? '';
+    // 日历尚未覆盖到当前日期时，不能据此判定为节假日。
+    if (clock.date <= latestCalendarDay && !new Set(tradingDays).has(clock.date)) return true;
+  }
+  return clock.minute < ACCOUNT_SYNC_SESSION_START_MINUTE || clock.minute > ACCOUNT_SYNC_SESSION_END_MINUTE;
+}
+
 export function shanghaiClock(date: Date): { date: string; minute: number; weekday: number; timestamp: string } {
   const formatter = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',

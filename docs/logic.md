@@ -6,7 +6,23 @@
 
 ## 1. 行情趋势分析与策略分类
 
-### 1.1 指数趋势分析 —— `server/scoring-engine.ts` + `server/polars-engine.ts`
+### 1.1 评分参数配置化
+
+评分引擎和向量化回测已支持参数化配置，便于参数优化和自定义策略。
+
+**核心类型**：`ScoreStockConfig`（`server/scoring-engine.ts`），包含：
+
+| 配置域 | 字段 | 含义 |
+|--------|------|------|
+| `distanceFromLow` | `tiers[]`, `atLowScore`, `extendedScore` | 距 60 日低点评分的分档阈值和分值 |
+| `trend` | `bullishAlignment`, `trendBonusMultiplier`, `sectorUpBonus` | K 线趋势评分参数 |
+| `volatilityTrend` | `limitUp.highMinLimitUps`, `matrix` | 波动率分类阈值和交叉评分矩阵 |
+
+**默认配置**：`DEFAULT_SCORE_STOCK_CONFIG`，可在 `ScoreStockConfig` 基础上通过 `normalizeScoreStockConfig(overrides)` 覆盖，生成完整配置副本。
+
+**入口**：`scoreStock(series, date, sector?, config?)` 和 `computeBacktestScores(history, dates, limitUpDates, scoringConfig?)` 均接受可选 `config` 参数，默认使用 `DEFAULT_SCORE_STOCK_CONFIG`。
+
+### 1.2 指数趋势分析 —— `server/scoring-engine.ts` + `server/polars-engine.ts`
 
 **入口**：`refreshAnalysis(data) → AnalysisData`（`polars-engine.ts`）做聚合统计；
 `classifyMarketState(bars) → MarketStateResult`（`scoring-engine.ts`）做七态分类。
@@ -49,7 +65,7 @@ df_daily (K线)
 - 下跌趋势（`bearish` 排列或 `trendStrength < -0.003`）：5日跌幅≥8% 或波动率≥4.5 → 恐慌暴跌；否则 → 阴跌不止
 - 横盘：量比<0.8 → 缩量无序；否则 → 箱体震荡
 
-### 1.2 板块趋势分析 —— `server/scoring-engine.ts`
+### 1.3 板块趋势分析 —— `server/scoring-engine.ts`
 
 **接口**：`analyzeBlockTrend(daily, weekly?, monthly?) → MarketStateResult`
 
@@ -70,7 +86,7 @@ df_daily (K线)
 
 **输出字段**：`state_id`, `state_name`, `trend`, `position`, `signal`, `latest`, `ma5`, `ma20`, `near_high`, `volume_trend`, `downgraded?`
 
-### 1.3 板块策略矩阵 —— `server/scoring-engine.ts`
+### 1.4 板块策略矩阵 —— `server/scoring-engine.ts`
 
 **接口**：`blockStrategy(stateId, limitUpNum, maxContinue) → BlockStrategy`
 
@@ -86,7 +102,7 @@ df_daily (K线)
 | 6-阴跌不止 | 回避 0成 | 回避 0成 |
 | 7-恐慌暴跌 | 超跌反弹 0-1成 | 回避 0成 |
 
-### 1.4 市场情绪分类 —— `server/polars-engine.ts`
+### 1.5 市场情绪分类 —— `server/polars-engine.ts`
 
 **实现**：`refreshAnalysis()` 中的实时计算
 
@@ -201,7 +217,7 @@ Phase 2: 四维评分计算（scoreStock()）
 
 ---
 
-## 3. 策略回测 —— `server/backtest-engine.ts`
+## 3. 回测 —— `server/backtest-engine.ts`（驱动）+ `server/backtest-scoring.ts`（向量化评分）
 
 ### 3.1 数据采集
 
@@ -361,6 +377,91 @@ for each date in 交易日:
   ]
 }
 ```
+
+---
+
+### 3.4 参数优化 —— `server/backtest-param-optimizer.ts`
+
+> 两阶段：以「完整回测收益」为最终目标，而不是截面相关性。若优化结果跑不过默认基线，则回退到默认参数。
+
+**核心接口**：`optimizeStrategyParams(history, { days? }) → ParamOptimizeResult`
+
+**输入**：与 `runPolarsBacktest` 相同的 `HistoricalMarketData`（可在 `/api/backtest/optimize` 接口传 `days`，默认 20，区间 5–60）。
+
+**输出结构**（同时回传给前端 + 持久化到任务结果）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `days` | int | 实际使用的回测窗口 |
+| `scoring.config` | `ScoreStockConfig` | 阶段1 选出的完整评分配置 |
+| `scoring.scoreCorrelation` | number | 距60日低点评分与 5 日远期收益的相关系数 |
+| `scoring.topBottomSpreadPct` | number | 评分前 20% 与后 20% 的 5 日远期差（≥0 越理想） |
+| `scoring.distanceBucketStats[]` | array | 每个分档的样本数、位置分、5 日远期收益均值、胜率 |
+| `scoring.sweetSpotLabels` | string[] | 远期为正、样本≥5 的两个最佳分档（如「启动确认、趋势上行」） |
+| `optimized` | object | 阶段2 选出的回测交易参数（`maxHoldDays/maxPositions/positionSizePct/takeProfitPct/stopLossPct`） + 因子权重 |
+| `validation` | object | 阶段2 网格在最优参数上的回测验证：`totalReturnPct/winRate/maxDrawdownPct/totalTrades` |
+| `baseline` | object | 默认 scoreStock + 默认策略参数的基线结果，用来对比 |
+| `beatBaseline` | bool | 阶段2 是否超越基线；为 `false` 时回退默认 |
+| `methodology` | string | 一段中文说明使用的搜索空间、最终目标和比较基准 |
+
+**阶段 1：scoreStock 评分参数搜索**
+
+```
+1. collectRawObservations() 用默认评分 + 默认策略参数构建 BacktestContext
+   └─ 对每个回测交易日 × 股票，取 observation =
+        { distancePct, alignment, trendStrength, volumePriceScore,
+          limitUpCount20d, sectorTrend, forwardByHold[5 日] }
+2. scoreConfigCandidates() 网格：
+   ├─ 阈值网格 3 组（5/15/30/50/80、5/12/25/45/75、5/18/35/55/85）
+   ├─ 趋势网格 3 组（multiplier=300/400/500，bullish=24/28/32）
+   └─ 共 3×3=9 组 + 默认 1 组 = 10 个候选 ScoreStockConfig
+3. 每个候选：
+   ├─ buildDistanceConfigFromStats() 用样本均值+胜率重赋 tier.score
+   ├─ prepareBacktestContext(history, days, config) 重新计算评分矩阵
+   ├─ quickSimulateBacktest(context, defaultParams) 跑一次完整回测
+   └─ backtestObjective() = 收益 − 0.45×回撤 + (胜率≥50 ? 1 : 0)
+                                − max(0, (35−胜率)×0.08)
+                                − 交易<6 罚 12 / 交易<8 罚 4
+4. 选 objective 最高的 config → 关联该次回测得到的 actualValidation
+```
+
+**阶段 2：回测交易参数网格**
+
+固定 `scoring.config`，在同一 `BacktestContext`（避免重算评分矩阵）上做两层网格：
+
+```
+2a 核心交易参数：6 持仓天数 × 5 止盈 × 5 止损 = 150 组
+2b 仓位 + 因子权重（在 2a 最优基础上）：
+   4 持仓个数 × 4 单票仓位 × 3 距低点权重 × 3 趋势权重 = 144 组
+合计 294 组回测 → 选 objective 最高
+```
+
+若阶段 2 仍未超过阶段 0 的默认基线（默认 scoreStock + 默认策略参数跑出的 `baseline.validation`），将 `optimized/validation` 回退为默认，并在 `methodology` 中说明「未超越默认方案」。
+
+**复用工具** —— `server/backtest-engine.ts`：
+
+| 函数 | 作用 |
+|------|------|
+| `prepareBacktestContext(history, days, scoringConfig?)` | 构建可复用上下文（评分矩阵 + 日历 + Map） |
+| `quickSimulateBacktest(context, options) → { totalReturnPct, winRate, maxDrawdownPct, totalTrades }` | 在已有 context 上快速跑一次回测，参数覆盖默认值 |
+
+**API**（`server/app/routes.ts`）：
+
+```
+POST /api/backtest/optimize?days=20&date=YYYYMMDD
+  → 202 { task_id, status: 'started', message: '参数优化任务已启动' }
+  → 任务进度：
+     ├─ 0–55% ：marketService.ensureHistoricalCoverage()（必要时补采行情）
+     ├─ 58%   ：「阶段1：优化 scoreStock 评分参数」
+     └─ 90%   ：「阶段2：网格搜索回测交易参数」
+```
+
+**前端展示**（`src/pages/BacktestPage.tsx`）：
+
+- 「回测设置」modal 顶部新增「参数优化」面板，显示 `scoreCorrelation` + `validation` 摘要
+- 「开始参数优化」→ 调起异步任务，完成后弹出「参数优化结果」modal（含阶段 1 评分配置表 + 阶段 2 交易参数 + 验证 vs 基线对比 + 分档收益明细 + ★ 优选分档）
+- 「应用到回测设置」一键把推荐参数写回回测表单
+- 历史记录 modal：支持分页（`HISTORY_PAGE_SIZE = 15`）+ 勾选批量删除
 
 ---
 

@@ -95,6 +95,33 @@ describe('Tonghuashun simulated broker', () => {
     expect(account.positions[0].stock_code).toBe('000001');
   });
 
+  it('builds an account-only snapshot without querying orders', async () => {
+    const commands: string[][] = [];
+    const broker = new ThsSimulatedBroker({
+      runner: async (args) => {
+        commands.push(args);
+        if (args[1] === 'account') {
+          return snapshot(
+            'account',
+            'TEXT|可用资金：90000',
+            'TEXT|总资产：100000',
+            'ROW|证券代码|证券名称|股票余额|可用余额|成本价|当前价|股票市值|总盈亏|盈亏比例',
+            'ROW|000001|平安银行|1000|1000|10|10|10000|0|0%',
+          );
+        }
+        throw new Error('account-only mode should use snapshot account');
+      },
+    });
+
+    const account = await broker.snapshotAccountOnly({ hintStockCodes: ['000001'] });
+
+    expect(commands).toEqual([
+      ['snapshot', 'account', '000001'],
+    ]);
+    expect(account.orders).toEqual([]);
+    expect(account.positions[0].stock_code).toBe('000001');
+  });
+
   it('returns the AppleScript-confirmed execution price to the Node trading core', async () => {
     const broker = new ThsSimulatedBroker({
       runner: async () => [

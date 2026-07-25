@@ -5,6 +5,7 @@ import {
   type PaperMarketContext,
   type PaperTradingStateStore,
 } from '../server/paper-trading.js';
+import { isAccountSyncOnlyPeriod, shanghaiClock } from '../server/paper-trading/helpers.js';
 import type { SimulatedAccountSnapshot, SimulatedBroker } from '../server/ths-simulated-broker.js';
 import type { AnalysisData, PaperOrder, PaperTradingRuntimeState, RankingRow } from '../src/types.js';
 
@@ -49,6 +50,12 @@ class FlowBroker implements SimulatedBroker {
 
   async snapshot(): Promise<SimulatedAccountSnapshot> {
     return structuredClone(this.account);
+  }
+
+  async snapshotAccountOnly(): Promise<SimulatedAccountSnapshot> {
+    const snapshot = structuredClone(this.account);
+    snapshot.orders = [];
+    return snapshot;
   }
 
   async quote(stockCode: string): Promise<number> {
@@ -594,5 +601,45 @@ describe('Node T+1 paper-trading core', () => {
       expect.objectContaining({ type: 'available_cash_changed' }),
       expect.objectContaining({ type: 'position_added', stock_code: '600001' }),
     ]));
+  });
+
+  it('uses account-only sync outside trading session and skips strategy backfill', async () => {
+    const now = new Date('2026-07-25T20:00:00+08:00');
+    const audit = new RecordingAudit();
+    let accountOnlyCalls = 0;
+    let fullSnapshotCalls = 0;
+    const broker: SimulatedBroker = {
+      async snapshot() {
+        fullSnapshotCalls += 1;
+        return { availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] };
+      },
+      async snapshotAccountOnly() {
+        accountOnlyCalls += 1;
+        return { availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] };
+      },
+      async quote() { return 10; },
+      async placeOrder(order: PaperOrder) {
+        return { verified: true, brokerOutput: `ORDER_VERIFIED|${order.stock_code}` };
+      },
+      async cancelOrder() {
+        return { verified: true, brokerOutput: 'CANCEL_VERIFIED' };
+      },
+    };
+    const service = new PaperTradingService(broker, { audit, now: () => now });
+    const context: PaperMarketContext = {
+      analysis,
+      rankingDate: '20260724',
+      rankings: [ranking('600001', '测试', 80)],
+      calendar: ['20260722', '20260723', '20260724'],
+      marketAverageChange: -1,
+      limitUpRecords: [],
+    };
+    await service.overview(context.analysis, context.rankingDate, context.rankings, context.calendar, 'trace-account-only', context.marketAverageChange, context.limitUpRecords);
+
+    expect(isAccountSyncOnlyPeriod(shanghaiClock(now), context.calendar ?? [])).toBe(true);
+    expect(accountOnlyCalls).toBe(1);
+    expect(fullSnapshotCalls).toBe(0);
+    expect(audit.records.some((record) => record.event === 'previous_close_plan_backfilled')).toBe(false);
+    expect(audit.records.some((record) => record.event === 'account_only_sync')).toBe(true);
   });
 });

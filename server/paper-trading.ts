@@ -43,6 +43,7 @@ import {
   executionWindowLabel,
   isActiveInstruction,
   instructionStatusLabel,
+  isAccountSyncOnlyPeriod,
   isWeakMarket,
   type MarketTimingAssessment,
   MemoryPaperTradingStateStore,
@@ -178,6 +179,10 @@ export class PaperTradingService extends EventEmitter {
     return this.overviewInFlight;
   }
 
+  isAccountSyncOnlyNow(calendar: readonly string[] = []): boolean {
+    return isAccountSyncOnlyPeriod(shanghaiClock(this.now()), calendar);
+  }
+
   async cachedOverview(
     analysis: AnalysisData,
     rankingDate: string,
@@ -198,12 +203,16 @@ export class PaperTradingService extends EventEmitter {
     const connection: PaperOverview['connection'] = observation
       ? { status: 'cached', source: 'runtime-state', observed_at: observation.observed_at }
       : { status: 'unavailable', source: 'runtime-state' };
-    if (observation) {
-      const clock = shanghaiClock(this.now());
+    const clock = shanghaiClock(this.now());
+    const accountOnly = isAccountSyncOnlyPeriod(clock, calendar);
+    if (observation && !accountOnly) {
       this.initializeCapital(state, snapshot);
       this.reconcileState(state, snapshot, clock.date);
       await this.ensurePreviousClosePlan(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange, limitUpRecords }, clock.date, traceId, true);
       await this.ensureSameDayCloseSignals(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange, limitUpRecords }, clock, traceId, true);
+    } else if (observation) {
+      this.initializeCapital(state, snapshot);
+      this.reconcileState(state, snapshot, clock.date);
     }
     await this.audit.info('paper_trading', 'cached_overview_built', {
       traceId,
@@ -355,7 +364,10 @@ export class PaperTradingService extends EventEmitter {
     return this.exclusive(async () => {
       const state = await this.getState();
       const clock = shanghaiClock(this.now());
-      const snapshot = await this.readAndObserveAccount(state, traceId, source);
+      const accountOnly = isAccountSyncOnlyPeriod(clock, []);
+      const snapshot = accountOnly
+        ? await this.readAndObserveAccountOnly(state, traceId, source)
+        : await this.readAndObserveAccount(state, traceId, source);
       this.initializeCapital(state, snapshot);
       this.reconcileState(state, snapshot, clock.date);
       await this.persist(state);
@@ -392,17 +404,23 @@ export class PaperTradingService extends EventEmitter {
 
   private async buildOverview(context: PaperMarketContext, traceId: string): Promise<PaperOverview> {
     const state = await this.getState();
-    const snapshot = await this.readAndObserveAccount(state, traceId, 'overview');
     const clock = shanghaiClock(this.now());
+    const accountOnly = isAccountSyncOnlyPeriod(clock, context.calendar ?? []);
+    const snapshot = accountOnly
+      ? await this.readAndObserveAccountOnly(state, traceId, 'overview')
+      : await this.readAndObserveAccount(state, traceId, 'overview');
     this.initializeCapital(state, snapshot);
     this.reconcileState(state, snapshot, clock.date);
-    await this.ensurePreviousClosePlan(state, snapshot, context, clock.date, traceId);
-    await this.ensureSameDayCloseSignals(state, snapshot, context, clock, traceId);
+    if (!accountOnly) {
+      await this.ensurePreviousClosePlan(state, snapshot, context, clock.date, traceId);
+      await this.ensureSameDayCloseSignals(state, snapshot, context, clock, traceId);
+    }
     await this.persist(state);
     await this.audit.info('paper_trading', 'overview_built', {
       traceId,
       data: {
         ranking_date: context.rankingDate,
+        account_only: accountOnly,
         positions: snapshot.positions.length,
         broker_orders: snapshot.orders.length,
         active_instructions: state.instructions.filter(isActiveInstruction).length,
@@ -1030,6 +1048,36 @@ export class PaperTradingService extends EventEmitter {
     const snapshot = await this.broker.snapshot(context);
     await this.observeAccountChanges(state, snapshot, traceId, stage);
     return snapshot;
+  }
+
+  private async readAndObserveAccountOnly(
+    state: PaperTradingRuntimeState,
+    traceId: string,
+    stage: string,
+  ): Promise<SimulatedAccountSnapshot> {
+    const context: BrokerCallContext = {
+      traceId,
+      stage,
+      source: 'paper_trading',
+      hintStockCodes: state.last_account_observation?.positions.map((position) => position.stock_code) ?? [],
+    };
+    const snapshot = await this.broker.snapshotAccountOnly(context);
+    const previousOrders = state.last_account_observation?.orders ?? [];
+    const merged: SimulatedAccountSnapshot = {
+      ...snapshot,
+      orders: previousOrders.map((order) => ({ ...order })),
+    };
+    await this.audit.info('account_monitor', 'account_only_sync', {
+      traceId,
+      data: {
+        stage,
+        hint_stock_codes: context.hintStockCodes,
+        positions: merged.positions.length,
+        preserved_orders: merged.orders.length,
+      },
+    });
+    await this.observeAccountChanges(state, merged, traceId, stage);
+    return merged;
   }
 
   private async observeAccountChanges(
