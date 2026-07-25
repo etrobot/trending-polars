@@ -79,11 +79,11 @@ export function HomePage() {
   const blocks = useMemo(() => {
     if (!data) return [];
     return [...data.blocks]
-      .filter((block) => Number(block.trend.state_id) >= 1 && Number(block.trend.state_id) <= 7)
+      .filter((block) => Number(block.trend.state_id) >= 1 && Number(block.trend.state_id) <= 8)
       .sort((a, b) => compareBlocks(a, b, sort.key) * (sort.desc ? -1 : 1));
   }, [data, sort]);
 
-  const indices = useMemo(() => data?.indices.filter((item) => item.state.state_id >= 1 && item.state.state_id <= 7) ?? [], [data]);
+  const indices = useMemo(() => data?.indices.filter((item) => item.state.state_id >= 1 && item.state.state_id <= 8) ?? [], [data]);
 
   if (loading) return <><PageHeaderActions><Button disabled><RefreshCw className="h-3.5 w-3.5 animate-spin" />加载中</Button></PageHeaderActions><LoadingPanel label="正在读取指数、板块与市场情绪…" /></>;
   if (!data) return <><PageHeaderActions><Button onClick={() => void load()}><RefreshCw className="h-3.5 w-3.5" />重新加载</Button></PageHeaderActions><div className="panel"><EmptyState title="市场数据加载失败" description={error || '当前没有可用数据'} /></div></>;

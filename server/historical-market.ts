@@ -272,6 +272,14 @@ export function parseTencentKlines(rows: unknown): KLineData[] {
   });
 }
 
+/** 仅从腾讯财经获取前复权日线，供启动补全指数等场景使用。 */
+export async function fetchTencentKlines(symbol: string, limit = 120): Promise<KLineData[]> {
+  const normalized = normalizedSymbol(symbol);
+  if (!normalized) return [];
+  const boundedLimit = Math.min(1000, Math.max(1, Math.trunc(limit)));
+  return fetchFromTencent(normalized, boundedLimit);
+}
+
 async function fetchFromTencent(symbol: { code: string; market: 'SH' | 'SZ'; full: string }, limit: number): Promise<KLineData[]> {
   const url = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?_var=kline_dayqfq&param=${symbol.full},day,,,${limit},qfq&r=${Math.random().toString().slice(2, 18)}`;
   try {

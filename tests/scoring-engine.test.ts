@@ -4,9 +4,12 @@ import {
   analyzeBlockTrend,
   blockStrategy,
   classifyMarketState,
+  distanceFromLowScore,
   limitUpCount,
   scoreStock,
   singlePeriodTrend,
+  strategyForScore,
+  suggestedPositionPct,
   volatilityClassOf,
   volatilityTrendScore,
   type Bar,
@@ -74,6 +77,17 @@ describe('dimension 4 — 波动率-趋势适配矩阵', () => {
   });
 });
 
+describe('distanceFromLowScore — 距60日低点分档', () => {
+  it('maps rebound buckets to 0-20 scores', () => {
+    expect(distanceFromLowScore(2)).toEqual({ score: 4, label: '贴近低点' });
+    expect(distanceFromLowScore(10)).toEqual({ score: 10, label: '刚离低点' });
+    expect(distanceFromLowScore(20)).toEqual({ score: 18, label: '启动确认' });
+    expect(distanceFromLowScore(40)).toEqual({ score: 20, label: '趋势上行' });
+    expect(distanceFromLowScore(60)).toEqual({ score: 14, label: '远离低点' });
+    expect(distanceFromLowScore(90)).toEqual({ score: 8, label: '高位延伸' });
+  });
+});
+
 describe('scoreStock — 四维评分与标签', () => {
   it('replaces the flat 8 with a real volatility-trend score and emits labels', () => {
     const row = scoreStock(prepared(steadyUp()), String(100059))!;
@@ -83,11 +97,15 @@ describe('scoreStock — 四维评分与标签', () => {
     // 低波动 × 上升 = 8（与旧的写死 8 巧合，但现在是矩阵推导）。
     expect(row.volatility_trend_score).toBe(8);
     expect(row.limit_up_count_20d).toBe(0);
-    expect(row.position_label).toBe('强势多头');
     expect(typeof row.volume_price_label).toBe('string');
     expect(row.volatility_label).toBe('低波动');
+    expect(typeof row.distance_from_low_pct).toBe('number');
+    expect(Number(row.position_score)).toBeGreaterThan(0);
     expect(row.total_score).toBeCloseTo(
-      Number(row.trend_score) + Number(row.volume_price_score) + Number(row.position_score) + Number(row.volatility_trend_score),
+      Number(row.trend_score)
+        + Number(row.volume_price_score)
+        + Number(row.position_score)
+        + Number(row.volatility_trend_score),
       1,
     );
   });
@@ -127,7 +145,7 @@ describe('scoreStock — 四维评分与标签', () => {
   });
 });
 
-describe('classifyMarketState — 七种市场状态', () => {
+describe('classifyMarketState — 八种市场状态', () => {
   it('returns 数据不足 with fewer than 20 bars', () => {
     expect(classifyMarketState(steadyUp(10).slice(0, 10)).state_id).toBe(0);
   });
@@ -143,6 +161,20 @@ describe('classifyMarketState — 七种市场状态', () => {
     expect(classifyMarketState(steadyDown()).state_id).toBe(6);
     const crash = barsFromReturns(20, [...Array.from({ length: 55 }, () => -0.3), -3, -3, -3, -3, -3]);
     expect(classifyMarketState(crash).state_id).toBe(7);
+  });
+
+  it('flags bottom recovery after decline as 筑底成功', () => {
+    const decline = Array.from({ length: 50 }, () => -0.4);
+    const recovery = Array.from({ length: 10 }, () => 0.8);
+    const volumes = [
+      ...Array.from({ length: 50 }, () => 1_000_000),
+      ...Array.from({ length: 10 }, () => 1_600_000),
+    ];
+    const state = classifyMarketState(barsFromReturns(20, [...decline, ...recovery], volumes));
+    expect(state.state_id).toBe(8);
+    expect(state.state_name).toBe('筑底成功');
+    expect(state.position).toBe('1');
+    expect(state.signal).toBe('buy');
   });
 
   it('separates 箱体震荡 from 缩量无序 by volume contraction', () => {
@@ -175,6 +207,21 @@ describe('analyzeBlockTrend — 周月线交叉验证', () => {
   });
 });
 
+describe('strategyForScore — 建议仓位系数', () => {
+  it('maps score tiers to 0.x position ratios', () => {
+    expect(strategyForScore(70)).toMatchObject({ strategy_position_ratio: 0.8, strategy_position: '0.8' });
+    expect(strategyForScore(55)).toMatchObject({ strategy_position_ratio: 0.6, strategy_position: '0.6' });
+    expect(strategyForScore(40)).toMatchObject({ strategy_position_ratio: 0.4, strategy_position: '0.4' });
+    expect(strategyForScore(25)).toMatchObject({ strategy_position_ratio: 0.2, strategy_position: '0.2' });
+    expect(strategyForScore(10)).toMatchObject({ strategy_position_ratio: 0.05, strategy_position: '0.05' });
+    expect(strategyForScore(3)).toMatchObject({ strategy_position_ratio: 0, strategy_position: '0' });
+  });
+
+  it('multiplies ratio by backtest position_size_pct', () => {
+    expect(suggestedPositionPct(0.8, 10)).toBe(8);
+    expect(suggestedPositionPct(0.6, 12)).toBe(7.2);
+  });
+});
 describe('blockStrategy — 状态 × 涨停热度矩阵', () => {
   it('splits by hot heat (涨停≥5 且连板≥2)', () => {
     expect(blockStrategy(1, 6, 3)).toEqual({ action: 'accumulate', label: '主线主升', position: '7-9成' });
@@ -184,6 +231,7 @@ describe('blockStrategy — 状态 × 涨停热度矩阵', () => {
     expect(blockStrategy(5, 9, 5)).toEqual({ action: 'ignore', label: '休息', position: '0成' });
     expect(blockStrategy(7, 6, 2)).toEqual({ action: 'trade', label: '超跌反弹', position: '0-1成' });
     expect(blockStrategy(7, 1, 1)).toEqual({ action: 'ignore', label: '回避', position: '0成' });
+    expect(blockStrategy(8, 2, 1)).toEqual({ action: 'accumulate', label: '筑底成功', position: '1' });
   });
 });
 

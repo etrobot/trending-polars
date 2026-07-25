@@ -4,7 +4,6 @@ import type {
   RankingResponse,
   RankingRow,
   RankingSummary,
-  StrategyAction,
 } from '../src/types.js';
 import { formatDateTime, round } from './format.js';
 
@@ -16,24 +15,14 @@ const SORTABLE_FIELDS = new Set([
   'continue_num',
   'latest_price',
   'latest_change_rate',
+  'distance_from_low_pct',
   'total_score',
   'trend_score',
   'momentum_score',
   'volume_score',
   'position_score',
   'volatility_trend_score',
-  'strategy_label',
-  'strategy_position',
 ]);
-
-function strategyForScore(score: number): Pick<RankingRow, 'strategy_action' | 'strategy_label' | 'strategy_position'> {
-  if (score >= 70) return { strategy_action: 'accumulate', strategy_label: '重点加仓', strategy_position: '7-9成' };
-  if (score >= 55) return { strategy_action: 'accumulate', strategy_label: '趋势跟踪', strategy_position: '5-7成' };
-  if (score >= 40) return { strategy_action: 'trade', strategy_label: '短线博弈', strategy_position: '3-5成' };
-  if (score >= 25) return { strategy_action: 'trade', strategy_label: '轻仓试探', strategy_position: '1-3成' };
-  if (score >= 10) return { strategy_action: 'reduce', strategy_label: '观望减仓', strategy_position: '0-1成' };
-  return { strategy_action: 'ignore', strategy_label: '坚决回避', strategy_position: '0成' };
-}
 
 function rankingFrame(rows: RankingRow[]) {
   return pl.DataFrame(rows.map((row) => ({
@@ -42,7 +31,6 @@ function rankingFrame(rows: RankingRow[]) {
     stock_code: String(row.stock_code ?? ''),
     stock_name: String(row.stock_name ?? ''),
     sector_name: String(row.sector_name ?? ''),
-    strategy_action: String(row.strategy_action ?? 'ignore'),
     total_score: Number(row.total_score ?? 0),
     trend_score: Number(row.trend_score ?? 0),
     momentum_score: Number(row.momentum_score ?? 0),
@@ -68,9 +56,6 @@ export function queryRankings(
   },
 ): RankingResponse {
   const pageSize = Math.min(200, Math.max(5, Number(options.pageSize ?? 50)));
-  // An uncomputed board has no rows, so pl.DataFrame([]) yields a schema-less
-  // frame whose sort('total_score', …) throws `"total_score" not found`. Return
-  // an empty response before touching Polars.
   if (!source.rankings.length) {
     return {
       timestamp: source.timestamp,
@@ -80,7 +65,7 @@ export function queryRankings(
       page: 1,
       page_size: pageSize,
       rankings: [],
-      summary: { average_score: 0, median_score: 0, top_score: 0, actions: {} },
+      summary: { average_score: 0, median_score: 0, top_score: 0 },
       sectors: [],
     };
   }
@@ -92,9 +77,6 @@ export function queryRankings(
         .or(pl.col('stock_code').str.contains(search, true))
         .or(pl.col('sector_name').str.contains(search, true)),
     );
-  }
-  if (options.action && options.action !== 'all') {
-    frame = frame.filter(pl.col('strategy_action').eq(pl.lit(options.action)));
   }
   if (options.sector && options.sector !== 'all') {
     frame = frame.filter(pl.col('sector_name').eq(pl.lit(options.sector)));
@@ -108,13 +90,10 @@ export function queryRankings(
         pl.col('total_score').max().alias('top_score'),
       ).toRecords()[0] as Record<string, number>
     : { average_score: 0, median_score: 0, top_score: 0 };
-  const actionRecords = total ? frame.groupBy('strategy_action').len().toRecords() : [];
-  const actions = Object.fromEntries(actionRecords.map((item) => [String(item.strategy_action), Number(item.len)]));
   const summary: RankingSummary = {
     average_score: round(Number(summaryRecord.average_score ?? 0), 1),
     median_score: round(Number(summaryRecord.median_score ?? 0), 1),
     top_score: round(Number(summaryRecord.top_score ?? 0), 1),
-    actions,
   };
 
   const sort = SORTABLE_FIELDS.has(options.sort ?? '') ? options.sort! : 'total_score';
@@ -145,7 +124,7 @@ export function recomputeRanking(source: { timestamp: string; date: string; tota
     const position = Number(row.position_score ?? 0);
     const volatilityTrend = Number(row.volatility_trend_score ?? 0);
     const totalScore = round(trend + volumePrice + position + volatilityTrend, 1);
-    return { ...row, ...strategyForScore(totalScore), total_score: totalScore };
+    return { ...row, total_score: totalScore };
   });
   const ranked = rankingFrame(rescored)
     .sort('total_score', true, true)
@@ -194,12 +173,8 @@ export function refreshAnalysis(source: AnalysisData): AnalysisData {
     stats: {
       bullish_indices: bullishIndices,
       risk_indices: riskIndices,
-      valid_blocks: blockFrame.height ? blockFrame.filter(pl.col('state_id').isIn([1, 2, 3, 4, 5, 6, 7])).height : 0,
+      valid_blocks: blockFrame.height ? blockFrame.filter(pl.col('state_id').isIn([1, 2, 3, 4, 5, 6, 7, 8])).height : 0,
       average_block_change: round(averageChange, 2),
     },
   };
-}
-
-export function actionLabel(action: StrategyAction): string {
-  return ({ accumulate: '加仓', trade: '博弈', reduce: '减仓', ignore: '回避' } as const)[action] ?? action;
 }

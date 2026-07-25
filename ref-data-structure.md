@@ -234,7 +234,7 @@ CREATE TABLE ranking_factor (
 | total_score | numeric | 总评分（满分100） |
 | trend_score | numeric | K线趋势评分（40分） |
 | volume_price_score | numeric | 价量配合评分（25分） |
-| position_score | numeric | 价格位置评分（20分） |
+| position_score | numeric | 距60日低点评分（20分） |
 | volatility_trend_score | numeric | 波动率适配评分（15分） |
 | limit_up_count_20d | numeric | 最近20日 block_top 权威涨停次数 |
 | alignment | text | 均线排列（bullish/bearish/tangled） |

@@ -113,7 +113,7 @@ Phase 1: 数据准备
 Phase 2: 四维评分计算（scoreStock()）
   ├─ K线趋势评分（40分）
   ├─ 价量配合评分（25分）
-  ├─ 价格位置评分（20分）
+  ├─ 距60日低点评分（20分）
   └─ 波动率-趋势适配评分（15分）
   → 返回 RankingRow（含策略建议）
 ```
@@ -158,16 +158,19 @@ Phase 2: 四维评分计算（scoreStock()）
 
 **量比计算**：近5日均量 / 再前5日均量
 
-#### 维度 3：价格位置评分（20 分）
+#### 维度 3：距60日低点评分（20 分）
 
-| 状态 | 分值 | 条件 |
-|------|------|------|
-| 强势多头 | 14 | 收盘 > MA5 > MA20 |
-| 偏多 | 10 | 收盘 > MA20 |
-| 弱势反弹 | 6 | 收盘 > MA5（但低于 MA20） |
-| 空头排列 | 2 | 收盘 < MA5 + 其他 |
-| 距60日高点加分 | +6 | 回落 5% 内 |
-| 距60日高点加分 | +3 | 回落 5-15% |
+`distanceFromLowScore(distanceFromLowPct) → { score, label }`，写入 `position_score` / `position_label`，并计入 `total_score`。
+
+| 距60日低点涨幅 | 分值 | 标签 |
+|---------------|------|------|
+| < 0% 或无效 | 2 | 贴近低点 |
+| 0–5% | 4 | 贴近低点 |
+| 5–15% | 10 | 刚离低点 |
+| 15–30% | 18 | 启动确认 |
+| 30–50% | 20 | 趋势上行 |
+| 50–80% | 14 | 远离低点 |
+| ≥ 80% | 8 | 高位延伸 |
 
 #### 维度 4：波动率-趋势适配评分（15 分）
 
@@ -185,14 +188,16 @@ Phase 2: 四维评分计算（scoreStock()）
 
 `strategyForScore(score) → { strategy_action, strategy_label, strategy_position }`
 
-| 总分区间 | 策略动作 | 标签 | 仓位 |
-|---------|---------|------|------|
-| ≥ 70 | accumulate | 重点加仓 | 7-9成 |
-| ≥ 55 | accumulate | 趋势跟踪 | 5-7成 |
-| ≥ 40 | trade | 短线博弈 | 3-5成 |
-| ≥ 25 | trade | 轻仓试探 | 1-3成 |
-| ≥ 10 | reduce | 观望减仓 | 0-1成 |
-| < 10 | ignore | 坚决回避 | 0成 |
+| 总分区间 | 策略动作 | 标签 | 仓位系数 |
+|---------|---------|------|---------|
+| ≥ 70 | accumulate | 重点加仓 | 0.8 |
+| ≥ 55 | accumulate | 趋势跟踪 | 0.6 |
+| ≥ 40 | trade | 短线博弈 | 0.4 |
+| ≥ 25 | trade | 轻仓试探 | 0.2 |
+| ≥ 10 | reduce | 观望减仓 | 0.05 |
+| < 10 | ignore | 坚决回避 | 0 |
+
+满分 100＝趋势40 + 价量25 + 距60日低点20 + 波动15。
 
 ---
 
@@ -448,12 +453,12 @@ PaperMarketContext
 
 ```typescript
 T1StrategyConfig {
-  maxHoldDays: 5,           // 最大持有天数
-  maxPositions: 10,         // 最大持仓数量
-  stopLossPct: -5,          // 止损线
-  takeProfitPct: 15,        // 止盈线
+  maxHoldDays: 7,           // 最大持有天数
+  maxPositions: 5,         // 最大持仓数量
+  stopLossPct: -15,          // 止损线
+  takeProfitPct: 20,        // 止盈线
   maxEntriesPerDay: 2,      // 每日最多新增持仓
-  positionSizePct: 10,      // 单票仓位比例
+  positionSizePct: 20,      // 单票仓位比例
   maxCandidates: 5,         // 排行榜候选数量
   lotSize: 100,             // 每手股数
   slippageRate: 0.0005,     // 滑点 5bps

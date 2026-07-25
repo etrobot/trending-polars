@@ -28,7 +28,8 @@ describe('market kline sources', () => {
       alignment: 'tangled',
       strategy_action: 'trade',
       strategy_label: '测试',
-      strategy_position: '1成',
+      strategy_position: '0.2',
+      strategy_position_ratio: 0.2,
     })) as RankingRow[];
 
     expect(assessHistoricalMarketCoverage(history, rankings, { days: 60, asOfDate: '20260722' }))

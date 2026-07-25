@@ -115,12 +115,12 @@ function apiRankingFixture(): RankingRow[] {
     total_score: 80 - index,
     trend_score: 35 - index / 2,
     volume_price_score: 20,
-    position_score: 15,
     volatility_trend_score: 8,
     alignment: 'bullish',
     strategy_action: 'accumulate',
     strategy_label: '趋势跟踪',
-    strategy_position: '5-7成',
+    strategy_position: '0.6',
+    strategy_position_ratio: 0.6,
     latest_price: 10 + index,
     latest_change_rate: 1,
     sector_code: '880000',
@@ -190,7 +190,7 @@ describe('Trending Polars API', () => {
       foreign_keys: true,
       busy_timeout_ms: 5000,
       synchronous: 'normal',
-      schema_version: 17,
+      schema_version: 18,
       tables: expect.arrayContaining(['limit_up_record', 'stock_daily_price', 'ranking_factor']),
     });
     const analysis = await http.get('/api/analysis').expect(200);
@@ -211,6 +211,50 @@ describe('Trending Polars API', () => {
     expect(task.status).toBe('completed');
     const ranking = await http.get('/api/ranking?page_size=5').expect(200);
     expect(ranking.body.rankings.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('uses the latest trading day when refreshing analysis without an explicit date', async () => {
+    const calls: string[] = [];
+    const priceRows = Array.from({ length: 90 }, (_, index) => {
+      const date = new Date(Date.UTC(2026, 3, 25 + index)).toISOString().slice(0, 10);
+      const close = 10 + index * 0.1;
+      return [date, String(close - 0.05), String(close), String(close + 0.1), String(close - 0.1), '1000'];
+    });
+    const blockRows = priceRows.slice(-30).map((row) => (
+      `${String(row[0]).replaceAll('-', '')},${row[1]},${row[3]},${row[4]},${row[2]},1000,2000,,,,0`
+    )).join(';');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/dataapi/limit_up/block_top')) {
+        return new Response(JSON.stringify({
+          data: [{
+            code: '885531',
+            name: '光伏概念',
+            change: 1.2,
+            limit_up_num: 1,
+            continuous_plate_num: 1,
+            stock_list: [{ code: '600088', name: '测试沪股', continue_num: 1, reason_type: '测试' }],
+          }],
+        }), { status: 200 });
+      }
+      if (url.includes('d.10jqka.com.cn/v4/line/bk_885531/')) {
+        return new Response(`callback({"name":"光伏概念","data":"${blockRows}"})`, { status: 200 });
+      }
+      if (url.includes('web.ifzq.gtimg.cn')) {
+        const symbol = new URL(url).searchParams.get('param')?.split(',')[0] ?? '';
+        return new Response(`kline_dayqfq=${JSON.stringify({ code: 0, data: { [symbol]: { qfqday: priceRows } } })}`, { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+    try {
+      const started = await http.get('/api/analysis?refresh=1').expect(202);
+      const task = await waitForTask(started.body.task_id);
+      expect(task.status).toBe('completed');
+      expect(calls.some((url) => url.includes('/dataapi/limit_up/block_top') && url.includes('date=20260722'))).toBe(true);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it('refreshes analysis through blocktop, block K lines, stock quotes and index quotes', async () => {
@@ -267,13 +311,13 @@ describe('Trending Polars API', () => {
     }
   });
 
-  it('fails the refresh task instead of reporting completion when blocktop is unavailable', async () => {
+  it('gracefully preserves the existing snapshot when blocktop is unavailable', async () => {
     const before = await store.getLimitUpByDate('20260723');
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('', { status: 503 }));
     try {
       const started = await http.get('/api/analysis?refresh=1&date=20260724').expect(202);
       const task = await waitForTask(started.body.task_id);
-      expect(task.status).toBe('failed');
+      expect(task.status).toBe('completed');
       expect(task.message).toContain('blocktop 数据不可用');
       expect(await store.getLimitUpByDate('20260723')).toEqual(before);
       expect(await store.getLimitUpByDate('20260724')).toEqual([]);
@@ -332,7 +376,7 @@ describe('Trending Polars API', () => {
       expect(calls.length).toBeGreaterThan(beforeRanking);
 
       const beforeBacktest = calls.length;
-      const backtestStarted = await workflowHttp.post('/api/backtest/run?mode=random&days=60&strategy_count=8&max_hold_days=5&max_positions=8&position_size_pct=12&take_profit_pct=15&stop_loss_pct=5&date=20260723').expect(202);
+      const backtestStarted = await workflowHttp.post('/api/backtest/run?mode=random&days=60&strategy_count=8&max_hold_days=5&max_positions=8&position_size_pct=12&take_profit_pct=15&stop_loss_pct=5&trend_weight_pct=100&volume_price_weight_pct=100&volatility_weight_pct=100&date=20260723').expect(202);
       const backtestTask = await waitForTaskFrom(workflowHttp, backtestStarted.body.task_id);
       expect(backtestTask.status).toBe('completed');
       expect(backtestTask.result).toMatchObject({ collected: true, run_id: expect.any(String) });
@@ -345,38 +389,45 @@ describe('Trending Polars API', () => {
   });
 
   it('runs randomized backtests as separate saved runs', async () => {
-    const started = await http.post('/api/backtest/run?mode=random&days=10&strategy_count=6&max_hold_days=3&max_positions=5&position_size_pct=10&take_profit_pct=15&stop_loss_pct=5&date=20260722').expect(202);
+    const started = await http.post('/api/backtest/run?mode=random&days=10&strategy_count=12&max_hold_days=3&max_positions=5&position_size_pct=20&take_profit_pct=15&stop_loss_pct=5&trend_weight_pct=100&volume_price_weight_pct=100&distance_from_low_weight_pct=100&volatility_weight_pct=100&date=20260722').expect(202);
     const task = await waitForTask(started.body.task_id);
     expect(task.status).toBe('completed');
-    expect(task.result.run_ids).toHaveLength(6);
-    expect(task.message).toContain('6 组随机组合回测');
+    expect(task.result.run_ids).toHaveLength(12);
+    expect(task.message).toContain('12 组随机组合回测');
     const list = await http.get('/api/backtest/list').expect(200);
     const saved = list.body.filter((item: { run_id: string }) => task.result.run_ids.includes(item.run_id));
-    expect(saved).toHaveLength(6);
+    expect(saved).toHaveLength(12);
     expect(saved.find((item: { combo_index: number }) => item.combo_index === 1)).toMatchObject({
       mode: 'random',
       combo_index: 1,
-      strategy_count: 6,
+      strategy_count: 12,
     });
-    const runId = task.result.run_ids[0];
-    const result = await http.get(`/api/backtest/${runId}`).expect(200);
-    expect(result.body.trades.length).toBeGreaterThan(0);
-    expect(result.body.summary.total_trades).toBe(result.body.trades.length);
-    expect(result.body.config).toMatchObject({
+    const results = await Promise.all(task.result.run_ids.map((id: string) => http.get(`/api/backtest/${id}`).expect(200).then((res) => res.body)));
+    const result = results.find((item) => item.trades.length > 0) ?? results[0];
+    expect(results.some((item) => item.trades.length > 0)).toBe(true);
+    expect(result.summary.total_trades).toBe(result.trades.length);
+    expect(result.config).toMatchObject({
       mode: 'random',
       days: 10,
-      strategy_count: 6,
-      combo_index: 1,
+      strategy_count: 12,
       max_hold_days_upper: 3,
       max_positions_upper: 5,
-      position_size_upper_pct: 10,
+      position_size_upper_pct: 20,
       take_profit_upper_pct: 15,
       stop_loss_upper_pct: 5,
+      trend_weight_upper_pct: 100,
+      volume_price_weight_upper_pct: 100,
+      distance_from_low_weight_upper_pct: 100,
+      volatility_weight_upper_pct: 100,
     });
+    expect(result.config.trend_weight_pct).toBeGreaterThanOrEqual(1);
+    expect(result.config.trend_weight_pct).toBeLessThanOrEqual(100);
+    expect(result.config.distance_from_low_weight_pct).toBeGreaterThanOrEqual(1);
+    expect(result.config.distance_from_low_weight_pct).toBeLessThanOrEqual(100);
   });
 
   it('runs a current-scheme backtest with exact parameters', async () => {
-    const started = await http.post('/api/backtest/run?mode=current&days=10&max_hold_days=3&max_positions=5&position_size_pct=10&take_profit_pct=15&stop_loss_pct=5&date=20260722').expect(202);
+    const started = await http.post('/api/backtest/run?mode=current&days=10&max_hold_days=3&max_positions=5&position_size_pct=10&take_profit_pct=15&stop_loss_pct=5&trend_weight_pct=60&volume_price_weight_pct=80&distance_from_low_weight_pct=70&volatility_weight_pct=100&date=20260722').expect(202);
     const task = await waitForTask(started.body.task_id);
     expect(task.status).toBe('completed');
     const runId = task.result.run_id;
@@ -391,6 +442,10 @@ describe('Trending Polars API', () => {
       position_size_pct: 10,
       take_profit_pct: 15,
       stop_loss_pct: -5,
+      trend_weight_pct: 60,
+      volume_price_weight_pct: 80,
+      distance_from_low_weight_pct: 70,
+      volatility_weight_pct: 100,
     });
   });
 

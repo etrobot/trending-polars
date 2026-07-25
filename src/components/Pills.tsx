@@ -9,6 +9,7 @@ const stateClasses: Record<number, string> = {
   5: 'bg-accent-green-soft text-[#1a5a4a] ring-accent-green-soft',
   6: 'bg-accent-green-soft text-accent-green ring-accent-green-soft',
   7: 'bg-primary/10 text-primary-active ring-primary/10',
+  8: 'bg-accent-green-soft text-trading-down ring-accent-green-soft',
 };
 
 export function StatePill({ state, compact = false }: { state?: MarketState; compact?: boolean }) {

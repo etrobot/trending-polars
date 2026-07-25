@@ -36,7 +36,7 @@ export function DetailsPage() {
   }, []);
   useEffect(() => { void load(); }, [load]);
 
-  const blocks = useMemo(() => data?.blocks.filter((block) => block.trend.state_id >= 1 && block.trend.state_id <= 7) ?? [], [data]);
+  const blocks = useMemo(() => data?.blocks.filter((block) => block.trend.state_id >= 1 && block.trend.state_id <= 8) ?? [], [data]);
   const selectedIndex = useMemo(() => {
     const code = params.get('code');
     const byCode = code ? blocks.findIndex((block) => block.code === code) : -1;

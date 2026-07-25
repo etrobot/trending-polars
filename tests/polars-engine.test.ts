@@ -10,13 +10,13 @@ function rankingRow(code: string, name: string, score: number): RankingRow {
     total_score: score,
     trend_score: score / 2,
     volume_price_score: 10,
-    position_score: 8,
     volatility_trend_score: 5,
     alignment: 'bullish',
     sector_name: '半导体',
     strategy_action: 'accumulate',
     strategy_label: '趋势跟踪',
-    strategy_position: '5-7成',
+    strategy_position: '0.6',
+    strategy_position_ratio: 0.6,
     latest_price: 10,
     latest_change_rate: 2,
   };
@@ -36,7 +36,7 @@ describe('queryRankings', () => {
       page: 1,
       page_size: 50,
       rankings: [],
-      summary: { average_score: 0, median_score: 0, top_score: 0, actions: {} },
+      summary: { average_score: 0, median_score: 0, top_score: 0 },
       sectors: [],
     });
   });

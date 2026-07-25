@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import type { AnalysisData, BlockAnalysis, IndexAnalysis, LimitUpStock, RankingRow } from '../src/types.js';
 import { AuditLogger, guardDetachedPromise, type AuditLevel } from './audit-log.js';
-import { historicalCrossSectionRankings, runPolarsBacktest, runRandomizedBacktest } from './backtest-engine.js';
+import { historicalCrossSectionRankings, runPolarsBacktest, runRandomizedBacktest, sectorTrendLookupMap, type SectorTrendLookup } from './backtest-engine.js';
 import { fetchSohuIndexKlines, buildBenchmarkCurve } from './benchmark.js';
 import { DataStore } from './data-store.js';
 import { compactDate, formatDateTime, round } from './format.js';
@@ -20,6 +20,7 @@ import {
   type HistoricalMarketData,
   type KLineData,
 } from './historical-market.js';
+import { resolveLatestTradingDate } from './index-bootstrap.js';
 import { PAPER_ENGINE_VERSION, PaperTradingService } from './paper-trading.js';
 import { queryRankings, refreshAnalysis } from './polars-engine.js';
 import { analyzeBlockTrend, blockStrategy, classifyMarketState, klinesToBars } from './scoring-engine.js';
@@ -395,12 +396,12 @@ export function createApp(services: Partial<AppServices> = {}) {
   };
 
   const refreshMarketAnalysis = async (options: {
-    date: string;
+    date?: string;
     traceId: string;
     cancelled?: () => boolean;
     progress?: (value: number, message: string) => void;
   }) => {
-    const date = marketDateParam(options.date);
+    const date = await resolveLatestTradingDate(store, options.date);
     const base = await store.getAnalysis();
     options.progress?.(4, `获取 ${date} 同花顺 blocktop`);
     const collected = await collectLimitUpAnalysis(base, date, {
@@ -412,7 +413,16 @@ export function createApp(services: Partial<AppServices> = {}) {
         traceId: options.traceId,
         data: { date, source: collected.source },
       });
-      throw new Error('同花顺 blocktop 数据不可用，已保留现有分析快照');
+      options.progress?.(100, '同花顺 blocktop 数据不可用，已保留现有分析快照');
+      return {
+        analysis: base,
+        date,
+        blocks: 0,
+        blocktop_source: 'none',
+        stock_quotes: 0,
+        indices: 0,
+        message: '同花顺 blocktop 数据不可用，已保留现有分析快照',
+      };
     }
     const minimumBlockCoverage = Math.min(collected.blocks, Math.max(1, Math.floor(collected.blocks * 0.2)));
     if (collected.blocks_with_klines < minimumBlockCoverage) {
@@ -470,6 +480,28 @@ export function createApp(services: Partial<AppServices> = {}) {
     };
   };
 
+  /**
+   * 对 sectorTrendsByCode 中缺失的板块趋势，从 block_daily_price 表实时
+   * 计算日线趋势分类作为兜底，确保每只股票的所属板块都有趋势数据。
+   */
+  async function enrichSectorTrends(
+    sectorTrendsByCode: Map<string, SectorTrendLookup>,
+    rankings: RankingRow[],
+    date: string,
+  ): Promise<Map<string, SectorTrendLookup>> {
+    const missingCodes = [...new Set(
+      rankings
+        .map((r) => r.sector_code)
+        .filter((code): code is string => !!code && !sectorTrendsByCode.has(code)),
+    )];
+    if (!missingCodes.length) return sectorTrendsByCode;
+    await runConcurrent(missingCodes, 6, async (code) => {
+      const trend = await store.computeSectorTrendFromBlockPrices(code, date);
+      if (trend) sectorTrendsByCode.set(code, trend);
+    });
+    return sectorTrendsByCode;
+  }
+
   const loadPaperContext = async (refreshForClose = false, traceId: string = randomUUID()) => {
     const [initialAnalysis, ranking] = await Promise.all([
       store.getAnalysis(),
@@ -480,7 +512,7 @@ export function createApp(services: Partial<AppServices> = {}) {
       const now = formatDateTime();
       const hourMinute = Number(now.slice(11, 13)) * 60 + Number(now.slice(14, 16));
       if (hourMinute < 15 * 60) throw new Error('收盘决策只能在交易日 15:00 后运行');
-      const refreshed = await refreshMarketAnalysis({ date: compactDate().slice(0, 8), traceId });
+      const refreshed = await refreshMarketAnalysis({ traceId });
       analysis = refreshed.analysis;
     }
     const targetDate = refreshForClose ? compactDate().slice(0, 8) : marketDateParam(ranking.date);
@@ -493,7 +525,12 @@ export function createApp(services: Partial<AppServices> = {}) {
     });
     const history = prepared.history;
     const strategyDate = history.as_of_date;
-    const strategyRankings = historicalCrossSectionRankings(history, strategyDate, ranking.rankings);
+    const sectorTrendsByCode = await enrichSectorTrends(
+      sectorTrendLookupMap(await store.getSectorTrendsForDate(strategyDate)),
+      ranking.rankings,
+      strategyDate,
+    );
+    const strategyRankings = historicalCrossSectionRankings(history, strategyDate, ranking.rankings, sectorTrendsByCode);
     if (!strategyRankings.length) throw new Error(`行情已准备，但 ${strategyDate} 无法生成截面排行`);
     if (refreshForClose || ranking.date !== strategyDate) {
       await store.saveRanking({
@@ -574,9 +611,8 @@ export function createApp(services: Partial<AppServices> = {}) {
 
   app.get('/api/analysis', asyncHandler(async (request, response) => {
     if (String(request.query.refresh ?? '0') === '1') {
-      const date = marketDateParam(request.query.date);
       const task = tasks.start('analysis_fetch', '刷新指数、板块与个股行情', ({ progress, cancelled, traceId }) => (
-        refreshMarketAnalysis({ date, progress, cancelled, traceId })
+        refreshMarketAnalysis({ date: String(request.query.date ?? ''), progress, cancelled, traceId })
       ));
       response.status(202).json({ task_id: task.id, status: 'started', message: '分析任务已启动' });
       return;
@@ -585,15 +621,17 @@ export function createApp(services: Partial<AppServices> = {}) {
   }));
 
   app.post('/api/analysis/collect', asyncHandler(async (request, response) => {
-    const date = marketDateParam(request.query.date);
     const task = tasks.start('analysis_collect', '采集指数、板块与个股行情', ({ progress, cancelled, traceId }) => (
-      refreshMarketAnalysis({ date, progress, cancelled, traceId })
+      refreshMarketAnalysis({ date: String(request.query.date ?? ''), progress, cancelled, traceId })
     ));
     response.status(202).json({ task_id: task.id, status: 'started', message: '涨停采集任务已启动' });
   }));
 
   app.get('/api/limit_up', asyncHandler(async (request, response) => {
-    const date = String(request.query.date || await store.getLatestAnalysisDate() || compactDate().slice(0, 8));
+    const date = await resolveLatestTradingDate(
+      store,
+      request.query.date || await store.getLatestAnalysisDate() || compactDate().slice(0, 8),
+    );
     response.json(await store.getLimitUpByDate(date));
   }));
 
@@ -717,7 +755,17 @@ export function createApp(services: Partial<AppServices> = {}) {
       });
       if (cancelled()) return null;
       progress(76, `按 ${prepared.history.as_of_date} 行情计算截面因子`);
-      const rankings = historicalCrossSectionRankings(prepared.history, prepared.history.as_of_date, source.rankings);
+      const sectorTrendsByCode = await enrichSectorTrends(
+          sectorTrendLookupMap(await store.getSectorTrendsForDate(prepared.history.as_of_date)),
+          source.rankings,
+          prepared.history.as_of_date,
+        );
+        const rankings = historicalCrossSectionRankings(
+        prepared.history,
+        prepared.history.as_of_date,
+        source.rankings,
+        sectorTrendsByCode,
+      );
       if (!rankings.length) throw new Error(`${prepared.history.as_of_date} 行情不足，无法生成截面排行`);
       const computed = {
         timestamp: formatDateTime(),
@@ -820,6 +868,10 @@ export function createApp(services: Partial<AppServices> = {}) {
     const positionSizePct = numberParam(request.query.position_size_pct, 10, 1, 100);
     const takeProfitPct = numberParam(request.query.take_profit_pct, 15, 1, 60);
     const stopLossPct = numberParam(request.query.stop_loss_pct, 5, 1, 30);
+    const trendWeightPct = numberParam(request.query.trend_weight_pct, 100, 1, 100);
+    const volumePriceWeightPct = numberParam(request.query.volume_price_weight_pct, 100, 1, 100);
+    const distanceFromLowWeightPct = numberParam(request.query.distance_from_low_weight_pct, 100, 1, 100);
+    const volatilityWeightPct = numberParam(request.query.volatility_weight_pct, 100, 1, 100);
     const requestedDate = marketDateParam(request.query.date);
     const taskLabel = mode === 'current'
       ? `运行 ${days} 日当前方案回测`
@@ -846,6 +898,10 @@ export function createApp(services: Partial<AppServices> = {}) {
         position_size_pct: positionSizePct,
         take_profit_pct: takeProfitPct,
         stop_loss_pct: stopLossPct,
+        trend_weight_pct: trendWeightPct,
+        volume_price_weight_pct: volumePriceWeightPct,
+        distance_from_low_weight_pct: distanceFromLowWeightPct,
+        volatility_weight_pct: volatilityWeightPct,
         history_as_of_date: history.as_of_date,
         stocks: history.stocks.length,
       });
@@ -860,6 +916,10 @@ export function createApp(services: Partial<AppServices> = {}) {
           position_size_pct: positionSizePct,
           take_profit_pct: takeProfitPct,
           stop_loss_pct: stopLossPct,
+          trend_weight_pct: trendWeightPct,
+          volume_price_weight_pct: volumePriceWeightPct,
+          distance_from_low_weight_pct: distanceFromLowWeightPct,
+          volatility_weight_pct: volatilityWeightPct,
           history_as_of_date: history.as_of_date,
           stocks: history.stocks.length,
         },
@@ -878,6 +938,10 @@ export function createApp(services: Partial<AppServices> = {}) {
           positionSizePct,
           takeProfitPct,
           stopLossPct,
+          trendWeightPct,
+          volumePriceWeightPct,
+          distanceFromLowWeightPct,
+          volatilityTrendWeightPct: volatilityWeightPct,
         })]
         : runRandomizedBacktest(history, {
           days,
@@ -887,6 +951,10 @@ export function createApp(services: Partial<AppServices> = {}) {
           positionSizePctUpper: positionSizePct,
           takeProfitPctUpper: takeProfitPct,
           stopLossPctUpper: stopLossPct,
+          trendWeightPctUpper: trendWeightPct,
+          volumePriceWeightPctUpper: volumePriceWeightPct,
+          distanceFromLowWeightPctUpper: distanceFromLowWeightPct,
+          volatilityTrendWeightPctUpper: volatilityWeightPct,
         });
       progress(88, mode === 'current' ? '汇总含交易成本的收益、胜率与回撤' : `汇总 ${results.length} 组回测结果`);
       for (let index = 0; index < results.length; index += 1) {

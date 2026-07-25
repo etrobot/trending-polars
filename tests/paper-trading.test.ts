@@ -110,7 +110,8 @@ function ranking(stockCode: string, stockName: string, score: number, latestPric
     alignment: 'bullish',
     strategy_action: 'trade',
     strategy_label: '短线博弈',
-    strategy_position: '3-5成',
+    strategy_position: '0.4',
+    strategy_position_ratio: 0.4,
     latest_price: latestPrice,
   };
 }

@@ -2,7 +2,7 @@ import pl from 'nodejs-polars';
 import type { RankingRow } from '../src/types.js';
 import { round } from './format.js';
 import type { HistoricalBlockSeries, HistoricalMarketData } from './historical-market.js';
-import { classifyMarketState, strategyForScore, volatilityTrendScore, type Bar, type TrendAxis, type VolatilityClass } from './scoring-engine.js';
+import { classifyMarketState, volatilityTrendScore, type Bar, type TrendAxis, type VolatilityClass } from './scoring-engine.js';
 
 // ---------------------------------------------------------------------------
 // Vectorized backtest scoring: computes the full (stock × date) score matrix
@@ -84,7 +84,7 @@ function computeSectorStates(
       if (endIdx == null || endIdx < 19) continue;
       const window = bars.slice(0, endIdx + 1);
       const state = classifyMarketState(window);
-      if (state.state_id >= 1 && state.state_id <= 7) {
+      if (state.state_id >= 1 && state.state_id <= 8) {
         stateMap.set(date, state.state_id);
       }
     }
@@ -205,6 +205,7 @@ export function computeBacktestScores(
     pl.col('volume').rollingMean({ windowSize: 5 }).over(g).alias('vol_recent_5'),
     pl.col('volume').shift(5).rollingMean({ windowSize: 5 }).over(g).alias('vol_prev_5'),
     pl.col('high').rollingMax({ windowSize: 60, minPeriods: 1 }).over(g).alias('high_60d'),
+    pl.col('low').rollingMin({ windowSize: 60, minPeriods: 1 }).over(g).alias('low_60d'),
     pl.col('close').shift(1).over(g).alias('prev_close'),
     pl.col('limit_up_flag').rollingSum({ windowSize: 20 }).over(g).alias('limit_up_count_20d'),
     pl.col('close').cumCount().over(g).sub(1).alias('bar_idx'),
@@ -227,6 +228,11 @@ export function computeBacktestScores(
       .then(pl.lit(0.0))
       .otherwise(pl.col('close').sub(pl.col('high_60d')).div(pl.col('high_60d')).mul(100))
       .alias('distance_from_high_pct'),
+    // Distance from 60d low (in %) — 从60日最低点反弹的涨幅
+    pl.when(pl.col('low_60d').isNull().or(pl.col('low_60d').eq(0)))
+      .then(pl.lit(0.0))
+      .otherwise(pl.col('close').sub(pl.col('low_60d')).div(pl.col('low_60d')).mul(100))
+      .alias('distance_from_low_pct'),
   );
 
   // ---- 5. Alignment classification ----
@@ -245,7 +251,8 @@ export function computeBacktestScores(
   // Sector bonus: states 1-3 (up) → +4, states 6-7 (down) → -4, else 0
   frame = frame.withColumns(
     pl.col('trend_strength').mul(400).clip(-12, 12).alias('trend_bonus'),
-    pl.when(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3))).then(pl.lit(4))
+    pl.when(pl.col('sector_state_id').eq(pl.lit(8))
+      .or(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3)))).then(pl.lit(4))
       .when(pl.col('sector_state_id').gtEq(6)).then(pl.lit(-4))
       .otherwise(pl.lit(0))
       .alias('sector_bonus'),
@@ -307,30 +314,24 @@ export function computeBacktestScores(
       .alias('volume_price_label'),
   );
 
-  // ---- 8. Dimension 3: Position score (0-20) ----
-  const posBase = pl.when(pl.col('ma5').isNull().or(pl.col('ma20').isNull()))
-    .then(pl.lit(6))
-    .when(pl.col('close').gt(pl.col('ma5')).and(pl.col('ma5').gt(pl.col('ma20')))).then(pl.lit(14))
-    .when(pl.col('close').gt(pl.col('ma20'))).then(pl.lit(10))
-    .when(pl.col('close').gt(pl.col('ma5'))).then(pl.lit(6))
-    .otherwise(pl.lit(2));
-
-  const posLabel = pl.when(pl.col('ma5').isNull().or(pl.col('ma20').isNull()))
-    .then(pl.lit('中性'))
-    .when(pl.col('close').gt(pl.col('ma5')).and(pl.col('ma5').gt(pl.col('ma20')))).then(pl.lit('强势多头'))
-    .when(pl.col('close').gt(pl.col('ma20'))).then(pl.lit('偏多'))
-    .when(pl.col('close').gt(pl.col('ma5'))).then(pl.lit('弱势反弹'))
-    .otherwise(pl.lit('空头排列'));
-
-  const highBonus = pl.when(pl.col('ma5').isNull().or(pl.col('ma20').isNull()))
-    .then(pl.lit(0))
-    .when(pl.col('distance_from_high_pct').gt(-5)).then(pl.lit(6))
-    .when(pl.col('distance_from_high_pct').gt(-15)).then(pl.lit(3))
-    .otherwise(pl.lit(0));
-
+  // ---- 8. Dimension 3: Distance-from-60d-low score (0-20) ----
   frame = frame.withColumns(
-    posBase.add(highBonus).clip(0, 20).alias('position_score'),
-    posLabel.alias('position_label'),
+    pl.when(pl.col('distance_from_low_pct').lt(0)).then(pl.lit(2))
+      .when(pl.col('distance_from_low_pct').lt(5)).then(pl.lit(4))
+      .when(pl.col('distance_from_low_pct').lt(15)).then(pl.lit(10))
+      .when(pl.col('distance_from_low_pct').lt(30)).then(pl.lit(18))
+      .when(pl.col('distance_from_low_pct').lt(50)).then(pl.lit(20))
+      .when(pl.col('distance_from_low_pct').lt(80)).then(pl.lit(14))
+      .otherwise(pl.lit(8))
+      .alias('position_score'),
+    pl.when(pl.col('distance_from_low_pct').lt(0)).then(pl.lit('贴近低点'))
+      .when(pl.col('distance_from_low_pct').lt(5)).then(pl.lit('贴近低点'))
+      .when(pl.col('distance_from_low_pct').lt(15)).then(pl.lit('刚离低点'))
+      .when(pl.col('distance_from_low_pct').lt(30)).then(pl.lit('启动确认'))
+      .when(pl.col('distance_from_low_pct').lt(50)).then(pl.lit('趋势上行'))
+      .when(pl.col('distance_from_low_pct').lt(80)).then(pl.lit('远离低点'))
+      .otherwise(pl.lit('高位延伸'))
+      .alias('position_label'),
   );
 
   // ---- 9. Dimension 4: Volatility-trend score (0-15) ----
@@ -340,7 +341,8 @@ export function computeBacktestScores(
       .when(pl.col('limit_up_count_20d').gtEq(1)).then(pl.lit('medium'))
       .otherwise(pl.lit('low'))
       .alias('volatility_class'),
-    pl.when(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3))).then(pl.lit('up'))
+    pl.when(pl.col('sector_state_id').eq(pl.lit(8))
+      .or(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3)))).then(pl.lit('up'))
       .when(pl.col('sector_state_id').gtEq(6)).then(pl.lit('down'))
       .when(pl.col('sector_state_id').gtEq(4).and(pl.col('sector_state_id').ltEq(5))).then(pl.lit('range'))
       .when(pl.col('alignment').eq(pl.lit('bullish'))).then(pl.lit('up'))
@@ -365,38 +367,16 @@ export function computeBacktestScores(
       .alias('volatility_trend_score'),
   );
 
-  // ---- 10. Total score & strategy ----
+  // ---- 10. Total score ----
   frame = frame.withColumns(
-    pl.col('trend_score').add(pl.col('volume_price_score')).add(pl.col('position_score')).add(pl.col('volatility_trend_score'))
+    pl.col('trend_score')
+      .add(pl.col('volume_price_score'))
+      .add(pl.col('position_score'))
+      .add(pl.col('volatility_trend_score'))
       .alias('total_score'),
   );
 
-  // Strategy classification
-  frame = frame.withColumns(
-    pl.when(pl.col('total_score').gtEq(70)).then(pl.lit('accumulate'))
-      .when(pl.col('total_score').gtEq(55)).then(pl.lit('accumulate'))
-      .when(pl.col('total_score').gtEq(40)).then(pl.lit('trade'))
-      .when(pl.col('total_score').gtEq(25)).then(pl.lit('trade'))
-      .when(pl.col('total_score').gtEq(10)).then(pl.lit('reduce'))
-      .otherwise(pl.lit('ignore'))
-      .alias('strategy_action'),
-    pl.when(pl.col('total_score').gtEq(70)).then(pl.lit('重点加仓'))
-      .when(pl.col('total_score').gtEq(55)).then(pl.lit('趋势跟踪'))
-      .when(pl.col('total_score').gtEq(40)).then(pl.lit('短线博弈'))
-      .when(pl.col('total_score').gtEq(25)).then(pl.lit('轻仓试探'))
-      .when(pl.col('total_score').gtEq(10)).then(pl.lit('观望减仓'))
-      .otherwise(pl.lit('坚决回避'))
-      .alias('strategy_label'),
-    pl.when(pl.col('total_score').gtEq(70)).then(pl.lit('7-9成'))
-      .when(pl.col('total_score').gtEq(55)).then(pl.lit('5-7成'))
-      .when(pl.col('total_score').gtEq(40)).then(pl.lit('3-5成'))
-      .when(pl.col('total_score').gtEq(25)).then(pl.lit('1-3成'))
-      .when(pl.col('total_score').gtEq(10)).then(pl.lit('0-1成'))
-      .otherwise(pl.lit('0成'))
-      .alias('strategy_position'),
-  );
-
-  // ---- 11. Filter to valid scoring rows and requested dates ----
+  // ---- 9. Filter to valid scoring rows and requested dates ----
   frame = frame.filter(
     pl.col('ma20').isNotNull()
       .and(pl.col('volume').gt(0))
@@ -405,7 +385,7 @@ export function computeBacktestScores(
       .and(pl.col('date').isIn([...dateSet])),
   );
 
-  // ---- 12. Extract to JS and group by date ----
+  // ---- 10. Extract to JS and group by date ----
   const records = frame.toRecords() as Record<string, unknown>[];
   const byDate = new Map<string, RankingRow[]>();
   for (const row of records) {
@@ -429,9 +409,7 @@ export function computeBacktestScores(
       limit_up_count_20d: Number(row.limit_up_count_20d),
       alignment: String(row.alignment),
       trend_strength: round(Number(row.trend_strength), 4),
-      strategy_action: String(row.strategy_action) as RankingRow['strategy_action'],
-      strategy_label: String(row.strategy_label),
-      strategy_position: String(row.strategy_position),
+      distance_from_low_pct: round(Number(row.distance_from_low_pct), 2),
       latest_price: Number(row.close),
       latest_change_rate: Number(row.change_pct),
     });

@@ -102,11 +102,10 @@ export interface RankingRow {
   volume_label?: string;
   volume_price_label?: string;
   position_label?: string;
-  strategy_action: StrategyAction;
-  strategy_label: string;
-  strategy_position: string;
   latest_price?: number | null;
   latest_change_rate?: number | null;
+  /** 距60日低点涨幅(%) */
+  distance_from_low_pct?: number;
   sector_code?: string;
   sector_name?: string;
   sector_trend_name?: string;
@@ -120,7 +119,6 @@ export interface RankingSummary {
   average_score: number;
   median_score: number;
   top_score: number;
-  actions: Record<string, number>;
 }
 
 export interface RankingResponse {
@@ -245,14 +243,12 @@ export interface PaperOrder {
   execution_window?: PlanExecutionWindow;
   signal_date?: string;
   rank?: number;
-  strategy_label?: string;
   cancelable?: boolean;
 }
 
 export interface PaperPlanHistoryItem extends PaperOrder {
   signal_date: string;
   rank?: number;
-  strategy_label?: string;
   created_at: string;
   submitted_at?: string;
   completed_at?: string;
@@ -313,7 +309,6 @@ export interface PaperStrategyInstruction {
   signal_price: number;
   quantity: number;
   rank?: number;
-  strategy_label?: string;
   reason: string;
   execution_window?: PlanExecutionWindow;
   status: StrategyInstructionStatus;

@@ -51,10 +51,9 @@ export function rankEntryCandidates(
   return pl.DataFrame(eligible.map((row) => ({
     ...row,
     stock_code: String(row.stock_code ?? ''),
-    strategy_action: String(row.strategy_action ?? 'ignore'),
     total_score: Number(row.total_score ?? 0),
   })))
-    .filter(pl.col('strategy_action').isIn(['accumulate', 'trade']))
+    .filter(pl.col('total_score').gtEq(40))
     .sort('total_score', true, true)
     .head(Math.max(0, Math.trunc(limit)))
     .toRecords() as unknown as RankingRow[];

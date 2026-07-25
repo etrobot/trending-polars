@@ -1,4 +1,4 @@
-import type { MarketState, RankingRow } from '../src/types.js';
+import type { MarketState, RankingRow, StrategyAction } from '../src/types.js';
 import { round } from './format.js';
 import type { HistoricalBar, HistoricalStockSeries, KLineData } from './historical-market.js';
 
@@ -202,12 +202,27 @@ function alignmentToTrendAxis(alignment: Alignment): TrendAxis {
 
 const VOLATILITY_LABEL: Record<VolatilityClass, string> = { high: '高波动', medium: '中波动', low: '低波动' };
 
-function positionScoreOf(latestClose: number, ma5: number | null, ma20: number | null): { score: number; label: string } {
-  if (ma5 == null || ma20 == null) return { score: 6, label: '中性' };
-  if (latestClose > ma5 && ma5 > ma20) return { score: 14, label: '强势多头' };
-  if (latestClose > ma20) return { score: 10, label: '偏多' };
-  if (latestClose > ma5) return { score: 6, label: '弱势反弹' };
-  return { score: 2, label: '空头排列' };
+// ---- 维度 3：距60日低点评分（0-20）----------------------------------------
+
+export interface DistanceFromLowScore {
+  score: number;
+  label: string;
+}
+
+/**
+ * 距60日低点涨幅 → 位置分。
+ * 过低（贴底）与过高（延伸）均降分；15–50% 为启动确认/趋势上行的甜点区。
+ */
+export function distanceFromLowScore(distanceFromLowPct: number): DistanceFromLowScore {
+  if (!Number.isFinite(distanceFromLowPct) || distanceFromLowPct < 0) {
+    return { score: 2, label: '贴近低点' };
+  }
+  if (distanceFromLowPct < 5) return { score: 4, label: '贴近低点' };
+  if (distanceFromLowPct < 15) return { score: 10, label: '刚离低点' };
+  if (distanceFromLowPct < 30) return { score: 18, label: '启动确认' };
+  if (distanceFromLowPct < 50) return { score: 20, label: '趋势上行' };
+  if (distanceFromLowPct < 80) return { score: 14, label: '远离低点' };
+  return { score: 8, label: '高位延伸' };
 }
 
 /** 打分时可传入板块趋势上下文，用于维度 1 板块加分与维度 4 的趋势轴。 */
@@ -222,7 +237,7 @@ export interface SectorContext {
 }
 
 /**
- * 个股四维评分：K线趋势(40) + 价量配合(25) + 价格位置(20) + 波动率-趋势适配(15)。
+ * 个股四维评分：K线趋势(40) + 价量配合(25) + 距60日低点(20) + 波动率-趋势适配(15)。
  * 仅使用 date 当日及之前的 K 线，无未来数据。
  */
 export function scoreStock(series: PreparedSeries, date: string, sector?: SectorContext): RankingRow | null {
@@ -235,6 +250,8 @@ export function scoreStock(series: PreparedSeries, date: string, sector?: Sector
   const ma10 = movingAverage(series.bars, endIndex, 10);
   const ma20 = movingAverage(series.bars, endIndex, 20);
   const ma60 = movingAverage(series.bars, endIndex, 60);
+  const low60 = Math.min(...series.bars.slice(Math.max(0, endIndex - 59), endIndex + 1).map((bar) => bar.low));
+  const distanceFromLowPct = low60 > 0 ? round((latest.close - low60) / low60 * 100, 2) : 0;
   const strength = trendStrength(series.bars, endIndex);
   const alignment = alignmentOf(ma5, ma10, ma20, ma60);
 
@@ -248,19 +265,11 @@ export function scoreStock(series: PreparedSeries, date: string, sector?: Sector
   const sectorBonus = sector?.trend === 'up' ? 4 : sector?.trend === 'down' ? -4 : 0;
   const trendScore = Math.max(0, Math.min(40, alignmentScore + trendBonus + sectorBonus));
 
-  // 维度 3：价格位置评分
-  const position = positionScoreOf(latest.close, ma5, ma20);
-  let positionScore = position.score;
-  if (ma5 != null && ma20 != null) {
-    const high = Math.max(...series.bars.slice(Math.max(0, endIndex - 59), endIndex + 1).map((bar) => bar.high));
-    const distance = high > 0 ? (latest.close - high) / high : 0;
-    if (distance > -0.05) positionScore += 6;
-    else if (distance > -0.15) positionScore += 3;
-  }
-  positionScore = Math.min(20, Math.max(0, positionScore));
-
   // 维度 2：价量配合评分
   const volumePrice = volumePriceScore(series.bars, endIndex);
+
+  // 维度 3：距60日低点评分
+  const fromLow = distanceFromLowScore(distanceFromLowPct);
 
   // 维度 4：波动率-趋势适配评分
   const limitUps = limitUpCount(series.bars, endIndex, sector?.limitUpDates ?? new Set());
@@ -268,8 +277,7 @@ export function scoreStock(series: PreparedSeries, date: string, sector?: Sector
   const trendAxis = sector?.trend ?? alignmentToTrendAxis(alignment);
   const volatilityTrend = volatilityTrendScore(volatility, trendAxis);
 
-  const totalScore = round(trendScore + volumePrice.score + positionScore + volatilityTrend, 1);
-  const strategy = strategyForScore(totalScore);
+  const totalScore = round(trendScore + volumePrice.score + fromLow.score + volatilityTrend, 1);
 
   return {
     rank: 0,
@@ -281,36 +289,53 @@ export function scoreStock(series: PreparedSeries, date: string, sector?: Sector
     volume_score: volumePrice.score,
     volume_price_label: volumePrice.label,
     volume_label: volumePrice.label,
-    position_score: positionScore,
-    position_label: position.label,
+    position_score: fromLow.score,
+    position_label: fromLow.label,
     volatility_trend_score: volatilityTrend,
     volatility_class: volatility,
     volatility_label: VOLATILITY_LABEL[volatility],
     limit_up_count_20d: limitUps,
     alignment,
     trend_strength: round(strength, 4),
+    distance_from_low_pct: distanceFromLowPct,
     sector_code: sector?.code,
     sector_name: sector?.name,
     sector_trend_name: sector?.trendName,
     sector_trend_state_id: sector?.stateId,
-    strategy_action: strategy.strategy_action,
-    strategy_label: strategy.strategy_label,
-    strategy_position: strategy.strategy_position,
     latest_price: latest.close,
     latest_change_rate: latest.changePct,
   };
 }
 
-export function strategyForScore(score: number): Pick<RankingRow, 'strategy_action' | 'strategy_label' | 'strategy_position'> {
-  if (score >= 70) return { strategy_action: 'accumulate', strategy_label: '重点加仓', strategy_position: '7-9成' };
-  if (score >= 55) return { strategy_action: 'accumulate', strategy_label: '趋势跟踪', strategy_position: '5-7成' };
-  if (score >= 40) return { strategy_action: 'trade', strategy_label: '短线博弈', strategy_position: '3-5成' };
-  if (score >= 25) return { strategy_action: 'trade', strategy_label: '轻仓试探', strategy_position: '1-3成' };
-  if (score >= 10) return { strategy_action: 'reduce', strategy_label: '观望减仓', strategy_position: '0-1成' };
-  return { strategy_action: 'ignore', strategy_label: '坚决回避', strategy_position: '0成' };
+/** 建议仓位系数（0.x），最终仓位 = 系数 × 单票仓位上限（%）。满分 100。 */
+export function positionRatioForScore(score: number): number {
+  if (score >= 70) return 0.8;
+  if (score >= 55) return 0.6;
+  if (score >= 40) return 0.4;
+  if (score >= 25) return 0.2;
+  if (score >= 10) return 0.05;
+  return 0;
 }
 
-// ---- 七种市场状态分类（ref-doc §3.1）--------------------------------------
+export function formatPositionRatio(ratio: number): string {
+  return Number(ratio.toFixed(2)).toString();
+}
+
+export function suggestedPositionPct(ratio: number, positionSizePct: number): number {
+  return round(ratio * positionSizePct, 1);
+}
+
+export function strategyForScore(score: number): Pick<RankingRow, 'strategy_action' | 'strategy_label' | 'strategy_position' | 'strategy_position_ratio'> {
+  const strategy_position_ratio = positionRatioForScore(score);
+  if (score >= 70) return { strategy_action: 'accumulate', strategy_label: '重点加仓', strategy_position_ratio, strategy_position: formatPositionRatio(strategy_position_ratio) };
+  if (score >= 55) return { strategy_action: 'accumulate', strategy_label: '趋势跟踪', strategy_position_ratio, strategy_position: formatPositionRatio(strategy_position_ratio) };
+  if (score >= 40) return { strategy_action: 'trade', strategy_label: '短线博弈', strategy_position_ratio, strategy_position: formatPositionRatio(strategy_position_ratio) };
+  if (score >= 25) return { strategy_action: 'trade', strategy_label: '轻仓试探', strategy_position_ratio, strategy_position: formatPositionRatio(strategy_position_ratio) };
+  if (score >= 10) return { strategy_action: 'reduce', strategy_label: '观望减仓', strategy_position_ratio, strategy_position: formatPositionRatio(strategy_position_ratio) };
+  return { strategy_action: 'ignore', strategy_label: '坚决回避', strategy_position_ratio, strategy_position: formatPositionRatio(strategy_position_ratio) };
+}
+
+// ---- 八种市场状态分类（ref-doc §3.1 + 筑底成功）--------------------------------------
 
 export interface MarketStateResult extends MarketState {
   signal: 'buy' | 'sell' | 'hold' | 'empty';
@@ -339,6 +364,7 @@ const STATE_TABLE: Record<number, StateTemplate> = {
   5: { state_id: 5, state_name: '缩量无序', trend: '横盘', position: '0成', signal: 'empty' },
   6: { state_id: 6, state_name: '阴跌不止', trend: '下跌', position: '0成', signal: 'empty' },
   7: { state_id: 7, state_name: '恐慌暴跌', trend: '下跌', position: '0-1成', signal: 'empty' },
+  8: { state_id: 8, state_name: '筑底成功', trend: '横盘', position: '1', signal: 'buy' },
 };
 
 function standardDeviation(values: number[]): number {
@@ -379,7 +405,7 @@ function buildStateResult(templateId: number, bars: Bar[], extra: Partial<Market
 }
 
 /**
- * 七种市场状态分类：均线排列 → 趋势强度 → 距高点 → 量能 → 波动率的规则判定。
+ * 八种市场状态分类：均线排列 → 趋势强度 → 距高点 → 量能 → 波动率的规则判定。
  * 这是本地启发式实现（ref-doc 只给出状态表，未给出精确阈值）。
  */
 export function classifyMarketState(bars: Bar[]): MarketStateResult {
@@ -401,6 +427,14 @@ export function classifyMarketState(bars: Bar[]): MarketStateResult {
 
   const rising = alignment === 'bullish' || strength > 0.003;
   const falling = alignment === 'bearish' || strength < -0.003;
+  const bottomingSuccess = !rising
+    && return5 > 0
+    && return5 <= 0.08
+    && volumeRatio >= 1.0
+    && distanceFromHigh <= -0.08
+    && strength > -0.005;
+
+  if (bottomingSuccess) return buildStateResult(8, bars);
 
   let stateId: number;
   if (rising && !falling) {
@@ -408,7 +442,8 @@ export function classifyMarketState(bars: Bar[]): MarketStateResult {
     else if (distanceFromHigh <= -0.05) stateId = 3;
     else stateId = 1;
   } else if (falling && !rising) {
-    stateId = return5 <= -0.08 || volatility >= 4.5 ? 7 : 6;
+    if (return5 <= -0.08 || volatility >= 4.5) stateId = 7;
+    else stateId = 6;
   } else {
     stateId = volumeRatio < 0.8 ? 5 : 4;
   }
@@ -443,12 +478,12 @@ export function analyzeBlockTrend(daily: Bar[], weekly?: Bar[], monthly?: Bar[])
 // ---- 板块策略矩阵（ref-doc §3.3）------------------------------------------
 
 export interface BlockStrategy {
-  action: RankingRow['strategy_action'];
+  action: StrategyAction;
   label: string;
   position: string;
 }
 
-const BLOCK_STRATEGY_ACTION: Record<string, RankingRow['strategy_action']> = {
+const BLOCK_STRATEGY_ACTION: Record<string, StrategyAction> = {
   主线主升: 'accumulate',
   趋势跟踪: 'trade',
   逢高减仓: 'reduce',
@@ -456,6 +491,7 @@ const BLOCK_STRATEGY_ACTION: Record<string, RankingRow['strategy_action']> = {
   情绪博弈: 'trade',
   箱体操作: 'trade',
   超跌反弹: 'trade',
+  筑底成功: 'accumulate',
   休息: 'ignore',
   回避: 'ignore',
 };
@@ -475,6 +511,7 @@ export function blockStrategy(stateId: number, limitUpNum: number, maxContinue: 
     case 5: return strategyFor('休息', '0成');
     case 6: return strategyFor('回避', '0成');
     case 7: return hot ? strategyFor('超跌反弹', '0-1成') : strategyFor('回避', '0成');
+    case 8: return strategyFor('筑底成功', '1');
     default: return strategyFor('回避', '0成');
   }
 }

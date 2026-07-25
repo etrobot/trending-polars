@@ -189,10 +189,10 @@ function assessMarketTiming(context: PaperMarketContext): MarketTimingAssessment
   const hasMarketAverage = Number.isFinite(marketAverageChange);
   const indices = (context.analysis.indices ?? []).filter((item) => {
     const stateId = Number(item.state?.state_id ?? 0);
-    return stateId >= 1 && stateId <= 7;
+    return stateId >= 1 && stateId <= 8;
   });
   const riskIndices = indices.filter((item) => [6, 7].includes(Number(item.state?.state_id ?? 0))).length;
-  const bullishIndices = indices.filter((item) => [1, 2, 3].includes(Number(item.state?.state_id ?? 0))).length;
+  const bullishIndices = indices.filter((item) => [1, 2, 3, 8].includes(Number(item.state?.state_id ?? 0))).length;
   const broadCodes = new Set(['sh000001', 'sz399001', 'sz399006', 'sh000300', 'sh000905', 'sh000016', 'sh000688']);
   const broadRiskIndices = indices.filter((item) => (
     broadCodes.has(String(item.code).toLowerCase())
@@ -622,7 +622,6 @@ export class PaperTradingService extends EventEmitter {
       ...this.instructionToOrder(instruction, instruction.execution_price ?? instruction.signal_price),
       signal_date: instruction.signal_date,
       rank: instruction.rank,
-      strategy_label: instruction.strategy_label,
       created_at: instruction.created_at,
       submitted_at: instruction.submitted_at,
       completed_at: instruction.completed_at,
@@ -954,7 +953,7 @@ export class PaperTradingService extends EventEmitter {
       const sizing = calculateEntrySize(estimatedCash, referenceCapital, signalPrice, this.strategy);
       const status = sizing ? 'pending' as const : 'skipped' as const;
       const reason = sizing
-        ? withExecutionTiming(`信号日${signalDate} 排名#${candidate.rank} ${candidate.strategy_label}`, 'buy', executionWindow)
+        ? withExecutionTiming(`信号日${signalDate} 排名#${candidate.rank}`, 'buy', executionWindow)
         : `信号日${signalDate} 排名#${candidate.rank} 可用资金不足一手`;
       generated.push({
         id: randomUUID(),
@@ -965,7 +964,6 @@ export class PaperTradingService extends EventEmitter {
         signal_price: signalPrice,
         quantity: sizing?.shares ?? 0,
         rank: candidate.rank,
-        strategy_label: candidate.strategy_label,
         reason,
         execution_window: executionWindow,
         status,
@@ -979,7 +977,6 @@ export class PaperTradingService extends EventEmitter {
             stock_name: candidate.stock_name,
             rank: candidate.rank,
             total_score: candidate.total_score,
-            strategy_label: candidate.strategy_label,
             signal_price: signalPrice,
             estimated_cash_before: estimatedCash,
             occupied_positions: occupiedCodes.size,
@@ -1374,7 +1371,6 @@ export class PaperTradingService extends EventEmitter {
       execution_window: executionWindow,
       signal_date: instruction.signal_date,
       rank: instruction.rank,
-      strategy_label: instruction.strategy_label,
       cancelable: instruction.status === 'submitted',
     };
   }

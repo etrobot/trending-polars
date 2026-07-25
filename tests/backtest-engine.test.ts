@@ -1,9 +1,37 @@
 import { describe, expect, it } from 'vitest';
-import { historicalStrategyCandidates, runPolarsBacktest } from '../server/backtest-engine.js';
+import { historicalCrossSectionRankings, historicalStrategyCandidates, runPolarsBacktest, sectorTrendLookupMap } from '../server/backtest-engine.js';
 import { parseEastmoneyKlines } from '../server/historical-market.js';
 import { historicalFixture } from './historical-fixture.js';
 
 describe('historical backtest timing', () => {
+  it('joins sector trend names from the lookup map when scoring the cross section', () => {
+    const fixture = historicalFixture();
+    const previousRows = fixture.stocks.map((stock, index) => ({
+      rank: index + 1,
+      stock_code: stock.stock_code,
+      stock_name: stock.stock_name,
+      total_score: 0,
+      trend_score: 0,
+      alignment: 'tangled',
+      strategy_action: 'ignore' as const,
+      strategy_label: '待计算',
+      strategy_position: '—',
+      sector_code: '881145',
+      sector_name: '半导体',
+    }));
+    const sectorTrends = sectorTrendLookupMap([{
+      sector_code: '881145',
+      sector_name: '半导体',
+      state_id: 1,
+      state_name: '主线主升',
+    }]);
+    const date = fixture.calendar.at(-1)!;
+    const rankings = historicalCrossSectionRankings(fixture, date, previousRows, sectorTrends);
+    expect(rankings.length).toBeGreaterThan(0);
+    expect(rankings.every((row) => row.sector_trend_name === '主线主升')).toBe(true);
+    expect(rankings.every((row) => row.sector_trend_state_id === 1)).toBe(true);
+  });
+
   it('parses real daily bars without inventing fields', () => {
     const bars = parseEastmoneyKlines([
       '2026-07-22,10.81,10.98,10.98,10.77,1029484,1120150607.17,1.94,1.29,0.14,0.53',

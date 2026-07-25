@@ -165,7 +165,7 @@
 | `total_score` | 总分 | numeric | 0-100 |
 | `trend_score` | 趋势评分 | numeric | 0-40 |
 | `volume_price_score` | 价量评分 | numeric | 0-25 |
-| `position_score` | 位置评分 | numeric | 0-20 |
+| `position_score` | 距60日低点评分 | numeric | 0-20 |
 | `volatility_trend_score` | 波动率适配评分 | numeric | 0-15 |
 | `alignment` | 均线排列 | text | bullish/tangled/bearish |
 | `trend_strength` | 趋势强度 | numeric | 线性回归斜率/均价 |

@@ -3,7 +3,12 @@ import type { BacktestResult, BacktestTrade, EquityPoint, RankingRow } from '../
 import { computeBacktestScores } from './backtest-scoring.js';
 import { compactDate, formatDateTime, round } from './format.js';
 import type { HistoricalMarketData } from './historical-market.js';
-import { prepareSeries, scoreStock, type PreparedSeries } from './scoring-engine.js';
+import {
+  prepareSeries,
+  scoreStock,
+  type PreparedSeries,
+  type SectorContext,
+} from './scoring-engine.js';
 import {
   calculateEntrySize,
   commission,
@@ -28,7 +33,6 @@ interface EntryOrder {
   stockCode: string;
   stockName: string;
   rank: number;
-  strategyLabel: string;
   signalDate: string;
 }
 
@@ -61,21 +65,70 @@ interface BacktestSummarySnapshot {
   maxDrawdownPct: number;
 }
 
+interface FactorWeights {
+  trendWeightPct: number;
+  volumePriceWeightPct: number;
+  /** 距60日低点（position_score）权重 */
+  distanceFromLowWeightPct: number;
+  volatilityTrendWeightPct: number;
+}
+
 interface BacktestRunMeta {
   mode: 'current' | 'random';
   batchSize?: number;
   comboIndex?: number;
   batchRunId?: string;
+  factorWeights?: FactorWeights;
   bounds?: {
     maxHoldDays: number;
     maxPositions: number;
     stopLossPct: number;
     takeProfitPct: number;
     positionSizePct: number;
+    trendWeightPct: number;
+    volumePriceWeightPct: number;
+    distanceFromLowWeightPct: number;
+    volatilityTrendWeightPct: number;
   };
 }
 
 const INITIAL_CAPITAL = 100_000;
+
+const DEFAULT_FACTOR_WEIGHTS: FactorWeights = {
+  trendWeightPct: 100,
+  volumePriceWeightPct: 100,
+  distanceFromLowWeightPct: 100,
+  volatilityTrendWeightPct: 100,
+};
+
+function normalizeFactorWeights(weights?: Partial<FactorWeights>): FactorWeights {
+  return {
+    trendWeightPct: Math.min(100, Math.max(1, Math.trunc(weights?.trendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.trendWeightPct))),
+    volumePriceWeightPct: Math.min(100, Math.max(1, Math.trunc(weights?.volumePriceWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct))),
+    distanceFromLowWeightPct: Math.min(100, Math.max(1, Math.trunc(weights?.distanceFromLowWeightPct ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct))),
+    volatilityTrendWeightPct: Math.min(100, Math.max(1, Math.trunc(weights?.volatilityTrendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct))),
+  };
+}
+
+function applyFactorWeights(rows: RankingRow[], weights: FactorWeights): RankingRow[] {
+  const trendMul = weights.trendWeightPct / 100;
+  const volumeMul = weights.volumePriceWeightPct / 100;
+  const fromLowMul = weights.distanceFromLowWeightPct / 100;
+  const volatilityMul = weights.volatilityTrendWeightPct / 100;
+  const rescored = rows.map((row) => {
+    const totalScore = round(
+      row.trend_score * trendMul
+        + Number(row.volume_price_score ?? row.volume_score ?? 0) * volumeMul
+        + Number(row.position_score ?? 0) * fromLowMul
+        + Number(row.volatility_trend_score ?? 0) * volatilityMul,
+      1,
+    );
+    return { ...row, total_score: totalScore };
+  });
+  rescored.sort((left, right) => right.total_score - left.total_score || left.stock_code.localeCompare(right.stock_code));
+  for (let index = 0; index < rescored.length; index += 1) rescored[index].rank = index + 1;
+  return rescored;
+}
 
 function limitUpDatesByCode(history: HistoricalMarketData): Map<string, Set<string>> {
   const result = new Map<string, Set<string>>();
@@ -108,10 +161,50 @@ function candidatesAtDate(series: PreparedSeries[], date: string, exactLimitUpDa
 }
 
 function trendAxisFromState(stateId: number | undefined, alignment: string | undefined): 'up' | 'range' | 'down' {
-  if (stateId != null && [1, 2, 3].includes(stateId)) return 'up';
+  if (stateId != null && [1, 2, 3, 8].includes(stateId)) return 'up';
   if (stateId != null && [6, 7].includes(stateId)) return 'down';
   if (stateId != null && [4, 5].includes(stateId)) return 'range';
   return alignment === 'bullish' ? 'up' : alignment === 'bearish' ? 'down' : 'range';
+}
+
+export interface SectorTrendLookup {
+  sector_code: string;
+  sector_name: string;
+  state_id: number;
+  state_name: string;
+}
+
+export function sectorTrendLookupMap(
+  records: Array<{ sector_code: string; sector_name: string; state_id: number; state_name: string }>,
+): Map<string, SectorTrendLookup> {
+  return new Map(records.map((record) => [record.sector_code, record]));
+}
+
+function sectorContextForRanking(
+  previous: RankingRow | undefined,
+  sectorTrendsByCode: Map<string, SectorTrendLookup>,
+  limitUpDates: ReadonlySet<string> | undefined,
+): SectorContext {
+  const sectorCode = String(previous?.sector_code ?? '').trim();
+  const trend = sectorCode ? sectorTrendsByCode.get(sectorCode) : undefined;
+  if (trend) {
+    return {
+      trend: trendAxisFromState(trend.state_id, previous?.alignment),
+      trendName: trend.state_name,
+      stateId: trend.state_id,
+      code: trend.sector_code,
+      name: trend.sector_name || previous?.sector_name,
+      limitUpDates,
+    };
+  }
+  return {
+    trend: trendAxisFromState(previous?.sector_trend_state_id, previous?.alignment),
+    trendName: previous?.sector_trend_name,
+    stateId: previous?.sector_trend_state_id,
+    code: previous?.sector_code,
+    name: previous?.sector_name,
+    limitUpDates,
+  };
 }
 
 /** Build the complete as-of-date cross section from persisted K lines. */
@@ -119,20 +212,18 @@ export function historicalCrossSectionRankings(
   history: HistoricalMarketData,
   date: string,
   previousRows: RankingRow[] = [],
+  sectorTrendsByCode: Map<string, SectorTrendLookup> = new Map(),
 ): RankingRow[] {
   const targetDate = date.replaceAll('-', '').slice(0, 8);
   const previousByCode = new Map(previousRows.map((row) => [row.stock_code, row]));
   const exactLimitUpDates = limitUpDatesByCode(history);
   const scored = history.stocks.flatMap((stock): RankingRow[] => {
     const previous = previousByCode.get(stock.stock_code);
-    const row = scoreStock(prepareSeries(stock), targetDate, {
-      trend: trendAxisFromState(previous?.sector_trend_state_id, previous?.alignment),
-      trendName: previous?.sector_trend_name,
-      stateId: previous?.sector_trend_state_id,
-      code: previous?.sector_code,
-      name: previous?.sector_name,
-      limitUpDates: exactLimitUpDates.get(stock.stock_code),
-    });
+    const row = scoreStock(
+      prepareSeries(stock),
+      targetDate,
+      sectorContextForRanking(previous, sectorTrendsByCode, exactLimitUpDates.get(stock.stock_code)),
+    );
     if (!row) return [];
     return [{
       ...previous,
@@ -207,7 +298,11 @@ function buildBacktestContext(history: HistoricalMarketData, days: number): Back
   };
 }
 
-function simulateBacktest(context: BacktestContext, strategy: ReturnType<typeof createT1StrategyConfig>): SimulatedBacktest {
+function simulateBacktest(
+  context: BacktestContext,
+  strategy: ReturnType<typeof createT1StrategyConfig>,
+  factorWeights: FactorWeights = DEFAULT_FACTOR_WEIGHTS,
+): SimulatedBacktest {
   const { dates, prepared, seriesByCode, exactLimitUpCodes, scoreMap } = context;
   const positions = new Map<string, Position>();
   const pendingExits = new Map<string, string>();
@@ -275,7 +370,7 @@ function simulateBacktest(context: BacktestContext, strategy: ReturnType<typeof 
         hold_days: 0,
         pnl_pct: 0,
         pnl_amount: 0,
-        reason: `信号日${order.signalDate} 排名#${order.rank} ${order.strategyLabel} 次日开盘`,
+        reason: `信号日${order.signalDate} 排名#${order.rank} 次日开盘`,
       });
     }
     maxHoldings = Math.max(maxHoldings, positions.size);
@@ -309,7 +404,7 @@ function simulateBacktest(context: BacktestContext, strategy: ReturnType<typeof 
     if (dateIndex < dates.length - 1) {
       const heldOrOrdered = new Set([...positions.keys(), ...pendingEntries.map((order) => order.stockCode)]);
       const availableSlots = Math.max(0, strategy.maxPositions - positions.size);
-      const dayScores = scoreMap.get(date) ?? [];
+      const dayScores = applyFactorWeights(scoreMap.get(date) ?? [], factorWeights);
       pendingEntries = rankEntryCandidates(dayScores, new Set(), DEFAULT_T1_STRATEGY.maxCandidates)
         .filter((candidate) => !heldOrOrdered.has(candidate.stock_code))
         .slice(0, Math.min(strategy.maxEntriesPerDay, availableSlots))
@@ -317,7 +412,6 @@ function simulateBacktest(context: BacktestContext, strategy: ReturnType<typeof 
           stockCode: candidate.stock_code,
           stockName: candidate.stock_name,
           rank: candidate.rank,
-          strategyLabel: candidate.strategy_label,
           signalDate: date,
         }));
     }
@@ -400,6 +494,10 @@ function buildResult(
     position_size_pct: strategy.positionSizePct,
     take_profit_pct: strategy.takeProfitPct,
     stop_loss_pct: strategy.stopLossPct,
+    trend_weight_pct: meta?.factorWeights?.trendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.trendWeightPct,
+    volume_price_weight_pct: meta?.factorWeights?.volumePriceWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct,
+    distance_from_low_weight_pct: meta?.factorWeights?.distanceFromLowWeightPct ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct,
+    volatility_weight_pct: meta?.factorWeights?.volatilityTrendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct,
     total_return_pct: summary.totalReturnPct,
     trades: summary.totalTrades,
   });
@@ -449,6 +547,14 @@ function buildResult(
       stop_loss_upper_pct: meta?.bounds?.stopLossPct ?? Math.abs(strategy.stopLossPct),
       take_profit_upper_pct: meta?.bounds?.takeProfitPct ?? strategy.takeProfitPct,
       position_size_upper_pct: meta?.bounds?.positionSizePct ?? strategy.positionSizePct,
+      trend_weight_pct: meta?.factorWeights?.trendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.trendWeightPct,
+      volume_price_weight_pct: meta?.factorWeights?.volumePriceWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct,
+      distance_from_low_weight_pct: meta?.factorWeights?.distanceFromLowWeightPct ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct,
+      volatility_weight_pct: meta?.factorWeights?.volatilityTrendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct,
+      trend_weight_upper_pct: meta?.bounds?.trendWeightPct ?? meta?.factorWeights?.trendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.trendWeightPct,
+      volume_price_weight_upper_pct: meta?.bounds?.volumePriceWeightPct ?? meta?.factorWeights?.volumePriceWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct,
+      distance_from_low_weight_upper_pct: meta?.bounds?.distanceFromLowWeightPct ?? meta?.factorWeights?.distanceFromLowWeightPct ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct,
+      volatility_weight_upper_pct: meta?.bounds?.volatilityTrendWeightPct ?? meta?.factorWeights?.volatilityTrendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct,
       slippage_bps: strategy.slippageRate * 10_000,
       commission_bps: strategy.commissionRate * 10_000,
       stamp_tax_bps: strategy.stampTaxRate * 10_000,
@@ -467,6 +573,10 @@ export function runPolarsBacktest(
     stopLossPct?: number;
     takeProfitPct?: number;
     positionSizePct?: number;
+    trendWeightPct?: number;
+    volumePriceWeightPct?: number;
+    distanceFromLowWeightPct?: number;
+    volatilityTrendWeightPct?: number;
   },
 ): BacktestResult {
   const days = Math.min(60, Math.max(5, Math.trunc(options.days || 20)));
@@ -477,6 +587,12 @@ export function runPolarsBacktest(
     takeProfitPct: Math.max(1, Math.trunc(options.takeProfitPct ?? DEFAULT_T1_STRATEGY.takeProfitPct)),
     positionSizePct: Math.max(1, Math.trunc(options.positionSizePct ?? DEFAULT_T1_STRATEGY.positionSizePct)),
   });
+  const factorWeights = normalizeFactorWeights({
+    trendWeightPct: options.trendWeightPct,
+    volumePriceWeightPct: options.volumePriceWeightPct,
+    distanceFromLowWeightPct: options.distanceFromLowWeightPct,
+    volatilityTrendWeightPct: options.volatilityTrendWeightPct,
+  });
   console.log('[backtest] runPolarsBacktest current scheme', {
     days,
     maxHoldDays: strategy.maxHoldDays,
@@ -484,13 +600,18 @@ export function runPolarsBacktest(
     positionSizePct: strategy.positionSizePct,
     takeProfitPct: strategy.takeProfitPct,
     stopLossPct: strategy.stopLossPct,
+    trendWeightPct: factorWeights.trendWeightPct,
+    volumePriceWeightPct: factorWeights.volumePriceWeightPct,
+    distanceFromLowWeightPct: factorWeights.distanceFromLowWeightPct,
+    volatilityTrendWeightPct: factorWeights.volatilityTrendWeightPct,
   });
   const context = buildBacktestContext(history, days);
-  const simulation = simulateBacktest(context, strategy);
+  const simulation = simulateBacktest(context, strategy, factorWeights);
   return buildResult(history, context, strategy, simulation, {
     mode: 'current',
     batchSize: 1,
     comboIndex: 1,
+    factorWeights,
   });
 }
 
@@ -527,6 +648,10 @@ export function runRandomizedBacktest(
     stopLossPctUpper: number;
     takeProfitPctUpper: number;
     positionSizePctUpper: number;
+    trendWeightPctUpper?: number;
+    volumePriceWeightPctUpper?: number;
+    distanceFromLowWeightPctUpper?: number;
+    volatilityTrendWeightPctUpper?: number;
   },
 ): BacktestResult[] {
   const days = Math.min(60, Math.max(5, Math.trunc(options.days || 20)));
@@ -537,6 +662,10 @@ export function runRandomizedBacktest(
     stopLossPct: Math.min(30, Math.max(1, Math.trunc(options.stopLossPctUpper || Math.abs(DEFAULT_T1_STRATEGY.stopLossPct)))),
     takeProfitPct: Math.min(60, Math.max(1, Math.trunc(options.takeProfitPctUpper || DEFAULT_T1_STRATEGY.takeProfitPct))),
     positionSizePct: Math.min(100, Math.max(1, Math.trunc(options.positionSizePctUpper || DEFAULT_T1_STRATEGY.positionSizePct))),
+    trendWeightPct: Math.min(100, Math.max(1, Math.trunc(options.trendWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.trendWeightPct))),
+    volumePriceWeightPct: Math.min(100, Math.max(1, Math.trunc(options.volumePriceWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct))),
+    distanceFromLowWeightPct: Math.min(100, Math.max(1, Math.trunc(options.distanceFromLowWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct))),
+    volatilityTrendWeightPct: Math.min(100, Math.max(1, Math.trunc(options.volatilityTrendWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct))),
   };
   console.log('[backtest] runRandomizedBacktest start', { days, strategyCount, bounds });
   const context = buildBacktestContext(history, days);
@@ -551,6 +680,10 @@ export function runRandomizedBacktest(
     bounds.stopLossPct,
     bounds.takeProfitPct,
     bounds.positionSizePct,
+    bounds.trendWeightPct,
+    bounds.volumePriceWeightPct,
+    bounds.distanceFromLowWeightPct,
+    bounds.volatilityTrendWeightPct,
   ].join('|'));
   const rng = createRng(seed);
   const results: BacktestResult[] = [];
@@ -563,17 +696,28 @@ export function runRandomizedBacktest(
       takeProfitPct: randomInt(rng, 1, bounds.takeProfitPct),
       positionSizePct: randomInt(rng, 1, bounds.positionSizePct),
     });
-    const simulation = simulateBacktest(context, strategy);
+    const factorWeights = {
+      trendWeightPct: randomInt(rng, 1, bounds.trendWeightPct),
+      volumePriceWeightPct: randomInt(rng, 1, bounds.volumePriceWeightPct),
+      distanceFromLowWeightPct: randomInt(rng, 1, bounds.distanceFromLowWeightPct),
+      volatilityTrendWeightPct: randomInt(rng, 1, bounds.volatilityTrendWeightPct),
+    };
+    const simulation = simulateBacktest(context, strategy, factorWeights);
     results.push(buildResult(history, context, strategy, simulation, {
       mode: 'random',
       batchSize: strategyCount,
       comboIndex: index + 1,
       batchRunId,
       bounds,
+      factorWeights,
     }));
     console.log('[backtest] random combo done', {
       combo_index: index + 1,
       batch_size: strategyCount,
+      trend_weight_pct: factorWeights.trendWeightPct,
+      volume_price_weight_pct: factorWeights.volumePriceWeightPct,
+      distance_from_low_weight_pct: factorWeights.distanceFromLowWeightPct,
+      volatility_weight_pct: factorWeights.volatilityTrendWeightPct,
       total_return_pct: results.at(-1)?.summary.total_return_pct,
       run_id: results.at(-1)?.run_id,
     });

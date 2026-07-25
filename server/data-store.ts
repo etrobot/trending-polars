@@ -82,9 +82,6 @@ function universeFromLimitUp(records: LimitUpRecord[]): RankingRow[] {
       total_score: 0,
       trend_score: 0,
       alignment: '',
-      strategy_action: 'ignore',
-      strategy_label: '待计算',
-      strategy_position: '—',
       sector_code: record.sector_code || undefined,
       sector_name: record.sector_name || undefined,
       continue_num: record.continue_num,
@@ -268,6 +265,18 @@ export class DataStore {
 
   async getSectorTrendsForDate(date: string): Promise<SectorTrendRecord[]> {
     return this.sqlite.getSectorTrendsForDate(date);
+  }
+
+  /**
+   * 当 sector_trend_daily 缺少某板块趋势数据时，从 block_daily_price 表
+   * 实时计算该板块的日线趋势分类作为兜底。
+   * 返回 null 表示板块代码无效或数据不足。
+   */
+  async computeSectorTrendFromBlockPrices(
+    sectorCode: string,
+    date: string,
+  ): Promise<{ sector_code: string; sector_name: string; state_id: number; state_name: string } | null> {
+    return this.sqlite.computeSectorTrendFromBlockPrices(sectorCode, date);
   }
 
   async getRankingFactorsForDate(date: string): Promise<RankingFactorRecord[]> {

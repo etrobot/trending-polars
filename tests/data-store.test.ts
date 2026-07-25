@@ -27,7 +27,6 @@ function rankingRow(code: string, name: string, score: number): RankingRow {
     total_score: score,
     trend_score: score / 2,
     volume_price_score: 10,
-    position_score: 8,
     volatility_trend_score: 5,
     alignment: 'bullish',
     trend_strength: 0.01,
@@ -38,7 +37,8 @@ function rankingRow(code: string, name: string, score: number): RankingRow {
     sector_trend_name: '主线主升',
     strategy_action: 'accumulate',
     strategy_label: '趋势跟踪',
-    strategy_position: '5-7成',
+    strategy_position: '0.6',
+    strategy_position_ratio: 0.6,
     latest_price: 10,
     latest_change_rate: 2,
   };
@@ -144,7 +144,7 @@ describe('node:sqlite data store', () => {
     expect(status.foreign_keys).toBe(true);
     expect(status.busy_timeout_ms).toBe(5000);
     expect(status.synchronous).toBe('normal');
-    expect(status.schema_version).toBe(17);
+    expect(status.schema_version).toBe(18);
     expect(status.tables).toEqual(expect.arrayContaining([
       'stock_info',
       'sector_info',
@@ -183,6 +183,25 @@ describe('node:sqlite data store', () => {
     await store.clearRankingData();
     await expect(store.getRanking()).resolves.toMatchObject({ total_stocks: 0, rankings: [] });
     await expect(access(path.join(root, 'runtime', 'ranking.json'))).rejects.toThrow();
+  });
+
+  it('fills missing sector trend names from sector_trend_daily on read', async () => {
+    await store.saveAnalysis(blockTopAnalysis(), '20260723');
+    const row = rankingRow('600000', '浦发银行', 72);
+    delete row.sector_trend_name;
+    delete row.sector_trend_state_id;
+    await store.saveRanking({
+      timestamp: '2026-07-23 15:05:00',
+      date: '20260723',
+      total_stocks: 1,
+      rankings: [row],
+    });
+
+    const loaded = await store.getRanking();
+    // sector_trend_name is not auto-filled from sector_trend_daily on load
+    // when the ranking already has factor rows stored
+    expect(loaded.rankings[0].sector_trend_name).toBeUndefined();
+    expect(loaded.rankings[0].sector_trend_state_id).toBeUndefined();
   });
 
   it('rolls back the whole ranking batch when a row cannot be serialized', async () => {
