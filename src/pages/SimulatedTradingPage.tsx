@@ -71,7 +71,7 @@ export function SimulatedTradingPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [executeOpen, setExecuteOpen] = useState(false);
-  const [selectedWindow, setSelectedWindow] = useState<TradingWindow>('open');
+  const [selectedWindow, setSelectedWindow] = useState<TradingWindow | 'auto'>('auto');
   const [connected, setConnected] = useState(false);
   const [planTab, setPlanTab] = useState<'pending' | 'executed'>('pending');
   const [historyPage, setHistoryPage] = useState(1);
@@ -165,7 +165,7 @@ export function SimulatedTradingPage() {
     } finally { setBusy(false); }
   };
 
-  const confirmWindow = (window: TradingWindow) => {
+  const confirmWindow = (window: TradingWindow | 'auto') => {
     setSelectedWindow(window);
     setExecuteOpen(true);
   };
@@ -199,9 +199,8 @@ export function SimulatedTradingPage() {
         <Button variant="ghost" className="shrink-0 whitespace-nowrap" disabled={busy || !automation?.enabled} onClick={() => void pause()}>{automation?.paused_today ? '恢复今日' : '暂停今日'}</Button>
         <Button variant="secondary" className="shrink-0 whitespace-nowrap" disabled={connecting} onClick={() => void refreshAccount()}><RefreshCw className={`h-3.5 w-3.5 ${connecting ? 'animate-spin' : ''}`} />{connecting ? '同步中' : '刷新账户'}</Button>
         <Button variant="ghost" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} onClick={() => confirmWindow('post_close')}>盘后核对</Button>
-        <Button variant="secondary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} onClick={() => confirmWindow('near_close')}><ClipboardCheck className="h-3.5 w-3.5" />临收盘执行</Button>
         <Button variant="secondary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} onClick={() => confirmWindow('close')}><ClipboardCheck className="h-3.5 w-3.5" />收盘决策</Button>
-        <Button variant="primary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} title="按当前报价立即执行上一收盘日生成的交易计划" onClick={() => confirmWindow('open')}><ClipboardCheck className="h-3.5 w-3.5" />立即执行</Button>
+        <Button variant="primary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} title="根据当前时间自动判断并执行对应窗口" onClick={() => confirmWindow('auto')}><ClipboardCheck className="h-3.5 w-3.5" />立即执行</Button>
       </PageHeaderActions>
       <div className="terminal-page">
       {error && <div className="border border-accent-red-soft bg-accent-red-soft px-3 py-2 text-[11px] leading-4 text-trading-up">{error}</div>}
@@ -263,7 +262,7 @@ export function SimulatedTradingPage() {
       </section>
       )}
 
-      <Modal open={executeOpen} onClose={() => setExecuteOpen(false)} title={selectedWindow === 'open' ? '确认立即执行交易计划' : selectedWindow === 'near_close' ? '确认运行临收盘执行' : selectedWindow === 'close' ? '确认运行收盘决策' : '确认运行盘后核对'} description={selectedWindow === 'open' ? '立即按当前报价执行最近收盘日生成的待处理计划；自动化仍会按行情状态分别在开盘或临收盘运行。' : 'Node.js 交易核心会运行所选策略窗口；AppleScript 仅查询和操作同花顺"模拟练习"。'}>
+      <Modal open={executeOpen} onClose={() => setExecuteOpen(false)} title={selectedWindow === 'auto' ? '确认立即执行' : selectedWindow === 'close' ? '确认运行收盘决策' : '确认运行盘后核对'} description={selectedWindow === 'auto' ? '系统将根据当前时间自动判断并执行对应窗口（开盘/临收盘/收盘决策/盘后核对）。' : 'Node.js 交易核心会运行所选策略窗口；AppleScript 仅查询和操作同花顺"模拟练习"。'}>
         <div className="space-y-3"><div className="flex justify-end gap-2"><Button variant="secondary" onClick={() => setExecuteOpen(false)}>取消</Button><Button variant="danger" disabled={busy} onClick={() => void execute()}>确认执行</Button></div></div>
       </Modal>
       </div>

@@ -15,6 +15,7 @@ import { ThsSimulatedBrokerError } from '../ths-simulated-broker.js';
 import { MarketService, analysisWithStats, priceRows, averageRankingChange } from './market-service.js';
 import { resolveLatestTradingDate } from '../index-bootstrap.js';
 import { PAPER_ENGINE_VERSION, type PaperTradingService } from '../paper-trading.js';
+import { shanghaiClock } from '../paper-trading/helpers.js';
 
 // ---------------------------------------------------------------------------
 // Helper types and functions
@@ -659,7 +660,25 @@ export function registerRoutes(
   }));
 
   app.post('/api/simulated-trading/automation/run-window', asyncHandler(async (request, response) => {
-    const requestedWindow = String(request.body?.window ?? 'open');
+    let requestedWindow = String(request.body?.window ?? 'auto');
+    if (requestedWindow === 'auto') {
+      const clock = shanghaiClock(new Date());
+      const m = clock.minute;
+      if (m < 9 * 60 + 25) {
+        response.status(400).json({ ok: false, error: '当前不在交易时段（09:25 后方可执行）' });
+        return;
+      } else if (m < 10 * 60) {
+        requestedWindow = 'open';
+      } else if (m < 14 * 60 + 50) {
+        requestedWindow = 'open';
+      } else if (m < 15 * 60) {
+        requestedWindow = 'near_close';
+      } else if (m < 15 * 60 + 5) {
+        requestedWindow = 'close';
+      } else {
+        requestedWindow = 'post_close';
+      }
+    }
     if (!['open', 'near_close', 'close', 'post_close'].includes(requestedWindow)) {
       response.status(400).json({ ok: false, error: '交易窗口必须是 open、near_close、close 或 post_close' });
       return;
