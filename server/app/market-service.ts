@@ -21,6 +21,11 @@ import { resolveLatestTradingDate } from '../index-bootstrap.js';
 import { queryRankings, refreshAnalysis } from '../polars-engine.js';
 import { analyzeBlockTrend, blockStrategy, classifyMarketState, klinesToBars } from '../scoring-engine.js';
 import type { DataStore } from '../data-store.js';
+import {
+  BLOCK_PERIOD_DAILY,
+  BLOCK_PERIOD_WEEKLY,
+  BLOCK_PERIOD_MONTHLY,
+} from '../sqlite/helpers.js';
 import { defaultRankingRuntimeConfig, type RankingRuntimeConfig } from '../ranking-config.js';
 
 // ---------------------------------------------------------------------------
@@ -180,6 +185,11 @@ export class MarketService {
   /**
    * 涨停采集 → 板块 K 线 → 趋势分类 → 情绪重算的完整流水线（ref-doc §1/§3）。
    * 保留现有 indices，仅重建 blocks 与 sentiment；同花顺不可用时返回空块并保留原分析。
+   *
+   * 增量采集策略（避免重复请求）：
+   * - 日线：若 SQLite 已存最新交易日 = date，直接复用，不再请求网络。
+   * - 周/月线：若 SQLite 已存最新周期 K 线覆盖 date，直接复用。
+   * - 未命中时才发起网络请求，并将结果落库供回测/模拟交易兜底复用。
    */
   async collectLimitUpAnalysis(
     base: AnalysisData,
@@ -192,6 +202,8 @@ export class MarketService {
     let cursor = 0;
     let done = 0;
     let blocksWithKlines = 0;
+    let cachedBlocks = 0;
+    let fetchedBlocks = 0;
     const concurrency = Math.min(6, Math.max(1, options.concurrency ?? 4));
     const worker = async () => {
       while (true) {
@@ -200,15 +212,51 @@ export class MarketService {
         cursor += 1;
         if (index >= tops.length) return;
         const block = tops[index];
-        const [daily, weekly, monthly] = await Promise.all([
-          fetchBlockKlines(block.code, '01', 250),
-          fetchBlockKlines(block.code, '11', 120),
-          fetchBlockKlines(block.code, '21', 120),
+        const [dailyStored, weeklyStored, monthlyStored] = await Promise.all([
+          this.store.getBlockLatestKlineDate(block.code, BLOCK_PERIOD_DAILY),
+          this.store.getBlockLatestKlineDate(block.code, BLOCK_PERIOD_WEEKLY),
+          this.store.getBlockLatestKlineDate(block.code, BLOCK_PERIOD_MONTHLY),
         ]);
-        const throughDate = (kline: KLineData) => marketDateParam(kline.date, '') <= date;
-        const dailyKlines = daily.klines.filter(throughDate);
-        const weeklyKlines = weekly.klines.filter(throughDate);
-        const monthlyKlines = monthly.klines.filter(throughDate);
+        const dailyCacheHit = dailyStored && dailyStored >= date;
+        const weeklyCacheHit = weeklyStored && weeklyStored >= date;
+        const monthlyCacheHit = monthlyStored && monthlyStored >= date;
+        let dailyKlines: KLineData[];
+        let weeklyKlines: KLineData[];
+        let monthlyKlines: KLineData[];
+        if (dailyCacheHit && weeklyCacheHit && monthlyCacheHit) {
+          // 三周期全部命中缓存，直接从 SQLite 读，避免任何网络请求。
+          cachedBlocks += 1;
+          const [dailyCached, weeklyCached, monthlyCached] = await Promise.all([
+            this.store.getBlockPrices(block.code, 250, BLOCK_PERIOD_DAILY),
+            this.store.getBlockPrices(block.code, 30, BLOCK_PERIOD_WEEKLY),
+            this.store.getBlockPrices(block.code, 30, BLOCK_PERIOD_MONTHLY),
+          ]);
+          dailyKlines = dailyCached.filter((kline) => marketDateParam(kline.date, '') <= date);
+          weeklyKlines = weeklyCached.filter((kline) => marketDateParam(kline.date, '') <= date);
+          monthlyKlines = monthlyCached.filter((kline) => marketDateParam(kline.date, '') <= date);
+        } else {
+          // 至少一个周期未命中，发起网络请求并落库。
+          fetchedBlocks += 1;
+          const [daily, weekly, monthly] = await Promise.all([
+            fetchBlockKlines(block.code, '01', 250),
+            fetchBlockKlines(block.code, '11', 30),
+            fetchBlockKlines(block.code, '21', 30),
+          ]);
+          const throughDate = (kline: KLineData) => marketDateParam(kline.date, '') <= date;
+          dailyKlines = daily.klines.filter(throughDate);
+          weeklyKlines = weekly.klines.filter(throughDate);
+          monthlyKlines = monthly.klines.filter(throughDate);
+          // 落库供下次复用：日线全量、周月线全量（数据量小）。
+          if (dailyKlines.length) {
+            await this.store.upsertBlockPrices(block.code, block.name, daily.klines, BLOCK_PERIOD_DAILY);
+          }
+          if (weeklyKlines.length) {
+            await this.store.upsertBlockPrices(block.code, block.name, weekly.klines, BLOCK_PERIOD_WEEKLY);
+          }
+          if (monthlyKlines.length) {
+            await this.store.upsertBlockPrices(block.code, block.name, monthly.klines, BLOCK_PERIOD_MONTHLY);
+          }
+        }
         if (dailyKlines.length >= 20) blocksWithKlines += 1;
         results.push(buildBlockAnalysis(block, dailyKlines, weeklyKlines, monthlyKlines));
         done += 1;
@@ -217,6 +265,11 @@ export class MarketService {
     };
     await Promise.all(Array.from({ length: Math.min(concurrency, tops.length) }, () => worker()));
     results.sort((left, right) => right.block_info.limit_up_num - left.block_info.limit_up_num);
+    if (cachedBlocks > 0) {
+      await this.audit.info('market_data', 'block_kline_cache_hit', {
+        data: { cached: cachedBlocks, fetched: fetchedBlocks, total: tops.length },
+      });
+    }
     const analysis: AnalysisData = { ...base, timestamp: formatDateTime(), blocks: results };
     return { analysis: refreshAnalysis(analysis), blocks: results.length, blocks_with_klines: blocksWithKlines, source };
   }

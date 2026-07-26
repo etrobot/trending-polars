@@ -29,6 +29,10 @@ export interface HistoricalBlockSeries {
   block_code: string;
   block_name: string;
   bars: HistoricalBar[];
+  /** 周线 K 线（可选）。回测板块趋势交叉验证时使用。 */
+  weekly_bars?: HistoricalBar[];
+  /** 月线 K 线（可选）。回测板块趋势交叉验证时使用。 */
+  monthly_bars?: HistoricalBar[];
 }
 
 export interface HistoricalLimitUpRecord {
@@ -874,7 +878,7 @@ export async function collectHistoricalMarketData(
     data: { dates_requested: limitUpDates.length, days_collected: limitUpDaysCollected, days_failed: limitUpDaysFailed, records: limitUpRecords.length },
   });
 
-  // ---- 采集出现过的板块指数日线（用于回测滚动计算板块趋势） ----
+  // ---- 采集出现过的板块指数日/周/月线（用于回测滚动计算板块趋势） ----
   // 如果调用方已传入了现有板块 K 线，则跳过网络请求。
   const sectorCodes = limitUpRecords.length
     ? [...new Map(limitUpRecords.map((r) => [r.sector_code, r.sector_name])).entries()]
@@ -896,25 +900,33 @@ export async function collectHistoricalMarketData(
       data: { sectors_total: sectorCodes.length, blocks_loaded: blocksCollected },
     });
   } else {
+    const toBars = (klines: KLineData[]): HistoricalBar[] => klines.map((k): HistoricalBar => [
+      compactDate(k.date),
+      k.open,
+      k.close,
+      k.high,
+      k.low,
+      k.volume,
+      k.amount,
+      k.changeRate ?? 0,
+    ]);
     for (let i = 0; i < sectorCodes.length; i += 1) {
       if (options.cancelled?.()) break;
       const [code, name] = sectorCodes[i];
       try {
-        const { klines } = await fetchBlockKlines(code, '01', 250);
-        if (klines.length >= 20) {
+        // 周/月线拉少量即可（趋势判断只需要 14 根以上的预热）。
+        const [dailyRes, weeklyRes, monthlyRes] = await Promise.all([
+          fetchBlockKlines(code, '01', 250),
+          fetchBlockKlines(code, '11', 30),
+          fetchBlockKlines(code, '21', 30),
+        ]);
+        if (dailyRes.klines.length >= 20) {
           blockSeries.push({
             block_code: code,
             block_name: name || code,
-            bars: klines.map((k): HistoricalBar => [
-              compactDate(k.date),
-              k.open,
-              k.close,
-              k.high,
-              k.low,
-              k.volume,
-              k.amount,
-              k.changeRate ?? 0,
-            ]),
+            bars: toBars(dailyRes.klines),
+            weekly_bars: weeklyRes.klines.length >= 14 ? toBars(weeklyRes.klines) : undefined,
+            monthly_bars: monthlyRes.klines.length >= 14 ? toBars(monthlyRes.klines) : undefined,
           });
           blocksCollected += 1;
         }

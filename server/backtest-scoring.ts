@@ -2,7 +2,7 @@ import pl from 'nodejs-polars';
 import type { RankingRow } from '../src/types.js';
 import { round } from './format.js';
 import type { HistoricalBlockSeries, HistoricalMarketData } from './historical-market.js';
-import { classifyMarketState, volatilityTrendScore, type Bar, type ScoreStockConfig, type TrendAxis, type VolatilityClass, DEFAULT_SCORE_STOCK_CONFIG } from './scoring-engine.js';
+import { analyzeBlockTrend, volatilityTrendScore, type Bar, type ScoreStockConfig, type TrendAxis, type VolatilityClass, DEFAULT_SCORE_STOCK_CONFIG } from './scoring-engine.js';
 
 // ---------------------------------------------------------------------------
 // Vectorized backtest scoring: computes the full (stock × date) score matrix
@@ -53,14 +53,15 @@ function computeStockArrays(
 /**
  * Pre-compute rolling sector trend states for each date in the backtest range.
  * Returns Map<sector_code, Map<date, state_id>>.
- * Uses classifyMarketState on a sliding window of block bars (pure JS, few sectors).
+ *
+ * 与首页 Live 路径一致：使用 analyzeBlockTrend（日 + 周月交叉验证）。
+ * classifyMarketState 最多用 60 根日线；周月线在窗口范围内按"截止日 <= 当前回测日"过滤。
  */
 function computeSectorStates(
   blocks: HistoricalBlockSeries[],
   dates: string[],
 ): Map<string, Map<string, number>> {
   const result = new Map<string, Map<string, number>>();
-  const dateSet = new Set(dates);
   for (const block of blocks) {
     const bars: Bar[] = block.bars.map((b) => ({
       date: String(b[0]),
@@ -72,7 +73,27 @@ function computeSectorStates(
       amount: b[6],
       changePct: b[7],
     }));
-    // Build date → index lookup
+    const weeklyBars: Bar[] | undefined = block.weekly_bars?.map((b) => ({
+      date: String(b[0]),
+      open: b[1],
+      close: b[2],
+      high: b[3],
+      low: b[4],
+      volume: b[5],
+      amount: b[6],
+      changePct: b[7],
+    }));
+    const monthlyBars: Bar[] | undefined = block.monthly_bars?.map((b) => ({
+      date: String(b[0]),
+      open: b[1],
+      close: b[2],
+      high: b[3],
+      low: b[4],
+      volume: b[5],
+      amount: b[6],
+      changePct: b[7],
+    }));
+    // Build date → index lookup（compact 8 位）
     const indexByDate = new Map<string, number>();
     for (let i = 0; i < bars.length; i += 1) {
       const d = bars[i].date.replaceAll('-', '').slice(0, 8);
@@ -82,8 +103,17 @@ function computeSectorStates(
     for (const date of dates) {
       const endIdx = indexByDate.get(date);
       if (endIdx == null || endIdx < 19) continue;
-      const window = bars.slice(0, endIdx + 1);
-      const state = classifyMarketState(window);
+      // 仅取最近 60 根日线用于 classifyMarketState，避免 O(N²) 切片开销。
+      const window = bars.slice(Math.max(0, endIdx - 59), endIdx + 1);
+      // 周/月线按截止日过滤，保留全部历史以便 ADX 预热。
+      const filterUpTo = (target: string, source: Bar[] | undefined): Bar[] | undefined => {
+        if (!source?.length) return undefined;
+        const filtered = source.filter((b) => b.date.replaceAll('-', '').slice(0, 8) <= target);
+        return filtered.length >= 14 ? filtered : undefined;
+      };
+      const weeklyWindow = filterUpTo(date, weeklyBars);
+      const monthlyWindow = filterUpTo(date, monthlyBars);
+      const state = analyzeBlockTrend(window, weeklyWindow, monthlyWindow);
       if (state.state_id >= 1 && state.state_id <= 8) {
         stateMap.set(date, state.state_id);
       }

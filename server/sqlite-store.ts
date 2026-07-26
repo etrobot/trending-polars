@@ -22,6 +22,7 @@ import type {
 import { formatDateTime, round } from './format.js';
 import type { SectorTrendLookup } from './backtest-engine.js';
 import {
+  analyzeBlockTrend,
   classifyMarketState,
   distanceFromLowScore,
   klinesToBars,
@@ -33,6 +34,10 @@ import {
   compactDate,
   type DailyPriceCoverage,
   finiteNumber,
+  BLOCK_PERIOD_DAILY,
+  BLOCK_PERIOD_WEEKLY,
+  BLOCK_PERIOD_MONTHLY,
+  type BlockPeriod,
   isoDate,
   type LimitUpRecord,
   type RankingFactorRecord,
@@ -134,8 +139,9 @@ export class SqliteStore {
         INSERT INTO sector_trend_daily (
           date, sector_code, sector_name, state_id, state_name, trend,
           latest, ma5, ma20, near_high, volume_trend,
+          adx, plus_di, minus_di, downgraded, original_state_id, original_state_name,
           strategy_action, strategy_label, strategy_position, computed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(date, sector_code) DO UPDATE SET
           sector_name = excluded.sector_name,
           state_id = excluded.state_id,
@@ -146,6 +152,12 @@ export class SqliteStore {
           ma20 = excluded.ma20,
           near_high = excluded.near_high,
           volume_trend = excluded.volume_trend,
+          adx = excluded.adx,
+          plus_di = excluded.plus_di,
+          minus_di = excluded.minus_di,
+          downgraded = excluded.downgraded,
+          original_state_id = excluded.original_state_id,
+          original_state_name = excluded.original_state_name,
           strategy_action = excluded.strategy_action,
           strategy_label = excluded.strategy_label,
           strategy_position = excluded.strategy_position,
@@ -157,8 +169,13 @@ export class SqliteStore {
         const sectorName = textValue(block.name).trim();
         if (!sectorCode || !sectorName) continue;
         this.upsertSectorInfo(sectorCode, sectorName, computedAt);
-        const stateId = Math.min(7, Math.max(0, Math.trunc(numberValue(block.trend?.state_id, 5))));
+        const stateId = Math.min(8, Math.max(0, Math.trunc(numberValue(block.trend?.state_id, 5))));
         const stateName = STATE_NAMES[stateId] ?? textValue(block.trend?.state_name);
+        const trendExtra = block.trend as { downgraded?: boolean; adx?: number; plus_di?: number; minus_di?: number; original_state_id?: number; original_state_name?: string };
+        const downgraded = trendExtra?.downgraded ? 1 : 0;
+        const originalStateId = finiteNumber(trendExtra?.original_state_id);
+        const originalStateNameRaw = trendExtra?.original_state_name;
+        const originalStateName = originalStateNameRaw == null || originalStateNameRaw === '' ? null : String(originalStateNameRaw);
         insertTrend.run(
           date,
           sectorCode,
@@ -171,6 +188,12 @@ export class SqliteStore {
           finiteNumber(block.trend?.ma20),
           textValue(block.trend?.near_high),
           textValue(block.trend?.volume_trend),
+          finiteNumber(trendExtra?.adx),
+          finiteNumber(trendExtra?.plus_di),
+          finiteNumber(trendExtra?.minus_di),
+          downgraded,
+          originalStateId,
+          originalStateName,
           textValue(block.strategy?.action),
           textValue(block.strategy?.label),
           textValue(block.strategy?.position),
@@ -408,6 +431,12 @@ export class SqliteStore {
       ma20: finiteNumber(row.ma20),
       near_high: textValue(row.near_high),
       volume_trend: textValue(row.volume_trend),
+      adx: finiteNumber(row.adx),
+      plus_di: finiteNumber(row.plus_di),
+      minus_di: finiteNumber(row.minus_di),
+      downgraded: numberValue(row.downgraded),
+      original_state_id: finiteNumber(row.original_state_id),
+      original_state_name: finiteNumber(row.original_state_id) == null ? null : textValue(row.original_state_name),
       strategy_action: textValue(row.strategy_action),
       strategy_label: textValue(row.strategy_label),
       strategy_position: textValue(row.strategy_position),
@@ -417,18 +446,25 @@ export class SqliteStore {
 
   /**
    * 当 sector_trend_daily 缺少某板块的趋势数据时，从 block_daily_price 表
-   * 中读取该板块的日线行情并实时计算趋势分类，作为兜底。
+   * 中读取该板块的日/周/月线行情并实时计算趋势分类，作为兜底。
+   * 与首页 Live 路径一致，使用 analyzeBlockTrend 完成多周期交叉验证。
    * 返回 null 表示板块代码无效、数据不足或无法计算。
    */
   computeSectorTrendFromBlockPrices(sectorCode: string, date: string): SectorTrendLookup | null {
     if (!/^\d{6}$/.test(sectorCode)) return null;
     const targetDate = compactDate(date);
     if (!targetDate) return null;
-    const blockPrices = this.getBlockPrices(sectorCode, 250)
+    const dailyKlines = this.getBlockPrices(sectorCode, 250, BLOCK_PERIOD_DAILY)
       .filter((kline) => compactDate(kline.date) <= targetDate);
-    if (blockPrices.length < 20) return null;
-    const bars = klinesToBars(blockPrices);
-    const state = classifyMarketState(bars);
+    if (dailyKlines.length < 20) return null;
+    const weeklyKlines = this.getBlockPrices(sectorCode, 120, BLOCK_PERIOD_WEEKLY)
+      .filter((kline) => compactDate(kline.date) <= targetDate);
+    const monthlyKlines = this.getBlockPrices(sectorCode, 120, BLOCK_PERIOD_MONTHLY)
+      .filter((kline) => compactDate(kline.date) <= targetDate);
+    const dailyBars = klinesToBars(dailyKlines);
+    const weeklyBars = weeklyKlines.length >= 14 ? klinesToBars(weeklyKlines) : undefined;
+    const monthlyBars = monthlyKlines.length >= 14 ? klinesToBars(monthlyKlines) : undefined;
+    const state = analyzeBlockTrend(dailyBars, weeklyBars, monthlyBars);
     const sectorName = this.database.prepare(
       'SELECT name FROM sector_info WHERE code = ?',
     ).get(sectorCode);
@@ -865,15 +901,15 @@ export class SqliteStore {
     `).all(symbol).map((row) => compactDate(row.date)).filter(Boolean);
   }
 
-  private upsertBlockPricesWithinTransaction(blockCode: string, blockName: string, klines: KLineData[], timestamp: string): number {
+  private upsertBlockPricesWithinTransaction(blockCode: string, blockName: string, klines: KLineData[], timestamp: string, period: BlockPeriod = BLOCK_PERIOD_DAILY): number {
     if (!/^\d{6}$/.test(blockCode)) return 0;
     this.upsertSectorInfo(blockCode, blockName || blockCode, timestamp);
     const statement = this.database.prepare(`
       INSERT INTO block_daily_price (
-        block_code, block_name, date, open, close, high, low,
+        block_code, block_name, date, period, open, close, high, low,
         volume, amount, change_rate, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(block_code, date) DO UPDATE SET
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(block_code, date, period) DO UPDATE SET
         block_name = excluded.block_name,
         open = excluded.open,
         close = excluded.close,
@@ -892,6 +928,7 @@ export class SqliteStore {
         blockCode,
         blockName || blockCode,
         date,
+        period,
         kline.open,
         kline.close,
         kline.high,
@@ -906,12 +943,12 @@ export class SqliteStore {
     return count;
   }
 
-  upsertBlockPrices(blockCode: string, blockName: string, klines: KLineData[]): number {
+  upsertBlockPrices(blockCode: string, blockName: string, klines: KLineData[], period: BlockPeriod = BLOCK_PERIOD_DAILY): number {
     const timestamp = formatDateTime();
-    return this.transaction(() => this.upsertBlockPricesWithinTransaction(blockCode, blockName, klines, timestamp));
+    return this.transaction(() => this.upsertBlockPricesWithinTransaction(blockCode, blockName, klines, timestamp, period));
   }
 
-  getBlockPrices(blockCode: string, limit = 250): KLineData[] {
+  getBlockPrices(blockCode: string, limit = 250, period: BlockPeriod = BLOCK_PERIOD_DAILY): KLineData[] {
     if (!/^\d{6}$/.test(blockCode)) return [];
     const boundedLimit = Math.min(1000, Math.max(1, Math.trunc(limit)));
     return this.database.prepare(`
@@ -919,12 +956,23 @@ export class SqliteStore {
       FROM (
         SELECT date, open, close, high, low, volume, amount, change_rate
         FROM block_daily_price
-        WHERE block_code = ?
+        WHERE block_code = ? AND period = ?
         ORDER BY date DESC
         LIMIT ?
       )
       ORDER BY date ASC
-    `).all(blockCode, boundedLimit).map((row) => rowToKline(row));
+    `).all(blockCode, period, boundedLimit).map((row) => rowToKline(row));
+  }
+
+  /** 板块最新已存 K 线日期（按周期）；用于增量采集，避免重复请求。 */
+  getBlockLatestKlineDate(blockCode: string, period: BlockPeriod = BLOCK_PERIOD_DAILY): string | null {
+    if (!/^\d{6}$/.test(blockCode)) return null;
+    const row = this.database.prepare(`
+      SELECT date FROM block_daily_price
+      WHERE block_code = ? AND period = ?
+      ORDER BY date DESC LIMIT 1
+    `).get(blockCode, period);
+    return row ? compactDate(row.date) : null;
   }
 
   getAllStockPriceCoverage(dateFrom: string, dateTo: string): DailyPriceCoverage[] {
@@ -1000,7 +1048,7 @@ export class SqliteStore {
       }
       for (const block of data.blocks ?? []) {
         if (!/^\d{6}$/.test(block.block_code)) continue;
-        const klines = block.bars.map((bar) => ({
+        const toKline = (bar: HistoricalBar) => ({
           date: bar[0],
           open: bar[1],
           close: bar[2],
@@ -1009,8 +1057,14 @@ export class SqliteStore {
           volume: bar[5],
           amount: bar[6],
           changeRate: bar[7],
-        }));
-        this.upsertBlockPricesWithinTransaction(block.block_code, block.block_name, klines, timestamp);
+        });
+        this.upsertBlockPricesWithinTransaction(block.block_code, block.block_name, block.bars.map(toKline), timestamp, BLOCK_PERIOD_DAILY);
+        if (block.weekly_bars?.length) {
+          this.upsertBlockPricesWithinTransaction(block.block_code, block.block_name, block.weekly_bars.map(toKline), timestamp, BLOCK_PERIOD_WEEKLY);
+        }
+        if (block.monthly_bars?.length) {
+          this.upsertBlockPricesWithinTransaction(block.block_code, block.block_name, block.monthly_bars.map(toKline), timestamp, BLOCK_PERIOD_MONTHLY);
+        }
       }
       this.database.prepare(`
         INSERT INTO historical_snapshot (
@@ -1160,28 +1214,47 @@ export class SqliteStore {
       WHERE date BETWEEN ? AND ? AND sector_code != 'UNKNOWN'
     `).all(firstCompactDate, lastCompactDate).map((row) => textValue(row.sector_code));
     const blocks: HistoricalBlockSeries[] = [];
+    const weeklyEndDate = lastDate; // 周/月线的截止日和日线一致：取落在区间内的最后一条
+    const monthlyEndDate = lastDate;
     for (const blockCode of blockCodes) {
-      const rows = this.database.prepare(`
+      const dailyRows = this.database.prepare(`
         SELECT block_code, block_name, date, open, close, high, low,
                volume, amount, change_rate
         FROM block_daily_price
-        WHERE block_code = ? AND date BETWEEN ? AND ?
+        WHERE block_code = ? AND period = '01' AND date BETWEEN ? AND ?
         ORDER BY date ASC
       `).all(blockCode, firstDate, lastDate);
-      if (!rows.length) continue;
+      if (!dailyRows.length) continue;
+      const blockName = textValue(dailyRows[0].block_name, blockCode);
+      const toBar = (row: Record<string, unknown>): HistoricalBar => [
+        compactDate(row.date),
+        numberValue(row.open),
+        numberValue(row.close),
+        numberValue(row.high),
+        numberValue(row.low),
+        numberValue(row.volume),
+        numberValue(row.amount),
+        numberValue(row.change_rate),
+      ];
+      // 周/月线按截止日过滤后保留全部历史（含必要的预热）。
+      const weeklyRows = this.database.prepare(`
+        SELECT date, open, close, high, low, volume, amount, change_rate
+        FROM block_daily_price
+        WHERE block_code = ? AND period = '11' AND date <= ?
+        ORDER BY date ASC
+      `).all(blockCode, weeklyEndDate);
+      const monthlyRows = this.database.prepare(`
+        SELECT date, open, close, high, low, volume, amount, change_rate
+        FROM block_daily_price
+        WHERE block_code = ? AND period = '21' AND date <= ?
+        ORDER BY date ASC
+      `).all(blockCode, monthlyEndDate);
       blocks.push({
         block_code: blockCode,
-        block_name: textValue(rows[0].block_name, blockCode),
-        bars: rows.map((row): HistoricalBar => [
-          compactDate(row.date),
-          numberValue(row.open),
-          numberValue(row.close),
-          numberValue(row.high),
-          numberValue(row.low),
-          numberValue(row.volume),
-          numberValue(row.amount),
-          numberValue(row.change_rate),
-        ]),
+        block_name: blockName,
+        bars: dailyRows.map(toBar),
+        weekly_bars: weeklyRows.length ? weeklyRows.map(toBar) : undefined,
+        monthly_bars: monthlyRows.length ? monthlyRows.map(toBar) : undefined,
       });
     }
     return {

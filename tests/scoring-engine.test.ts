@@ -4,6 +4,7 @@ import {
   analyzeBlockTrend,
   blockStrategy,
   classifyMarketState,
+  computeADX,
   distanceFromLowScore,
   limitUpCount,
   scoreStock,
@@ -164,11 +165,11 @@ describe('classifyMarketState — 八种市场状态', () => {
   });
 
   it('flags bottom recovery after decline as 筑底成功', () => {
-    const decline = Array.from({ length: 50 }, () => -0.4);
-    const recovery = Array.from({ length: 10 }, () => 0.8);
+    const decline = Array.from({ length: 55 }, () => -0.4);
+    const recovery = Array.from({ length: 5 }, () => 0.8);
     const volumes = [
-      ...Array.from({ length: 50 }, () => 1_000_000),
-      ...Array.from({ length: 10 }, () => 1_600_000),
+      ...Array.from({ length: 55 }, () => 1_000_000),
+      ...Array.from({ length: 5 }, () => 1_800_000),
     ];
     const state = classifyMarketState(barsFromReturns(20, [...decline, ...recovery], volumes));
     expect(state.state_id).toBe(8);
@@ -189,8 +190,8 @@ describe('classifyMarketState — 八种市场状态', () => {
 describe('analyzeBlockTrend — 周月线交叉验证', () => {
   it('downgrades a rising daily trend to 阴跌不止 when weekly and monthly both fall', () => {
     const daily = steadyUp();
-    const weeklyDown = barsFromReturns(30, Array.from({ length: 12 }, () => -1.5));
-    const monthlyDown = barsFromReturns(40, Array.from({ length: 12 }, () => -2.5));
+    const weeklyDown = barsFromReturns(30, Array.from({ length: 20 }, () => -1.5));
+    const monthlyDown = barsFromReturns(40, Array.from({ length: 20 }, () => -2.5));
     expect(singlePeriodTrend(weeklyDown)).toBe('down');
     const result = analyzeBlockTrend(daily, weeklyDown, monthlyDown);
     expect(result.state_id).toBe(6);
@@ -275,5 +276,85 @@ describe('parseBlockTop — 同花顺涨停板块解析', () => {
     expect(parseBlockTop('not json')).toEqual([]);
     expect(parseBlockTop({ data: 'nope' })).toEqual([]);
     expect(parseBlockTop({})).toEqual([]);
+  });
+});
+
+describe('computeADX — Welles Wilder ADX/DI', () => {
+  it('returns zero values for insufficient bars', () => {
+    const short = barsFromReturns(100, Array.from({ length: 10 }, () => 0.5));
+    const adx = computeADX(short, short.length - 1, 14);
+    expect(adx.adx).toBe(0);
+    expect(adx.direction).toBe(0);
+  });
+
+  it('reports positive direction (+DI > -DI) in a steady uptrend', () => {
+    const up = barsFromReturns(100, Array.from({ length: 40 }, () => 0.6));
+    const adx = computeADX(up, up.length - 1, 14);
+    expect(adx.adx).toBeGreaterThan(15);
+    expect(adx.direction).toBeGreaterThan(0);
+    expect(adx.plusDI).toBeGreaterThan(adx.minusDI);
+  });
+
+  it('reports negative direction (-DI > +DI) in a steady downtrend', () => {
+    const down = barsFromReturns(100, Array.from({ length: 40 }, () => -0.6));
+    const adx = computeADX(down, down.length - 1, 14);
+    expect(adx.adx).toBeGreaterThan(15);
+    expect(adx.direction).toBeLessThan(0);
+    expect(adx.minusDI).toBeGreaterThan(adx.plusDI);
+  });
+
+  it('produces a low ADX in a noisy, range-bound series', () => {
+    // 在 0 附近随机震荡，没有明显趋势
+    const noisy: Bar[] = [];
+    let prevClose = 100;
+    for (let i = 0; i < 60; i += 1) {
+      const changePct = (Math.sin(i) + Math.cos(i * 1.7)) * 0.3;
+      const close = prevClose * (1 + changePct / 100);
+      noisy.push({
+        date: String(100000 + i),
+        open: prevClose,
+        close,
+        high: Math.max(prevClose, close) * 1.001,
+        low: Math.min(prevClose, close) * 0.999,
+        volume: 1_000_000,
+        amount: 0,
+        changePct,
+      });
+      prevClose = close;
+    }
+    const adx = computeADX(noisy, noisy.length - 1, 14);
+    expect(adx.adx).toBeLessThan(30);
+  });
+});
+
+describe('analyzeBlockTrend — 多周期升级/降级', () => {
+  it('upgrades a falling daily trend to 筑底成功 when weekly and monthly both rise', () => {
+    // 日线下跌但周月线均上升：底部共振信号
+    const dailyDown = barsFromReturns(100, Array.from({ length: 60 }, () => -0.3));
+    const weeklyUp = barsFromReturns(50, Array.from({ length: 20 }, () => 1.5));
+    const monthlyUp = barsFromReturns(60, Array.from({ length: 20 }, () => 2.5));
+    expect(singlePeriodTrend(weeklyUp)).toBe('up');
+    expect(singlePeriodTrend(monthlyUp)).toBe('up');
+    const result = analyzeBlockTrend(dailyDown, weeklyUp, monthlyUp);
+    expect(result.state_id).toBe(8);
+    expect(result.downgraded).toBe(true);
+    expect(result.original_state_id).toBe(6); // 日线原始为阴跌不止
+  });
+
+  it('suppresses state 8 when weekly and monthly both fall', () => {
+    // 日线 state 8（筑底） + 周月均下跌 → 应当降级为 6
+    const decline = Array.from({ length: 55 }, () => -0.4);
+    const recovery = Array.from({ length: 5 }, () => 0.8);
+    const volumes = [
+      ...Array.from({ length: 55 }, () => 1_000_000),
+      ...Array.from({ length: 5 }, () => 1_800_000),
+    ];
+    const dailyBars = barsFromReturns(20, [...decline, ...recovery], volumes);
+    const weeklyDown = barsFromReturns(50, Array.from({ length: 20 }, () => -1.5));
+    const monthlyDown = barsFromReturns(60, Array.from({ length: 20 }, () => -2.5));
+    const result = analyzeBlockTrend(dailyBars, weeklyDown, monthlyDown);
+    expect(result.state_id).toBe(6);
+    expect(result.downgraded).toBe(true);
+    expect(result.original_state_id).toBe(8);
   });
 });

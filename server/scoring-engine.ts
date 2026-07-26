@@ -105,6 +105,85 @@ export function trendStrength(bars: Bar[], endIndex: number, lookback = 20): num
   return mean > 0 ? slope / mean : 0;
 }
 
+// ---- ADX / +DI / -DI：趋势强度（不区分方向）+ 方向指示 -------------------
+// 经典 Welles Wilder 实现。ADX > 25 视为有趋势，+DI > -DI 为多头，反之空头。
+// 与 trendStrength（线性回归斜率）互补：trendStrength 对极端值敏感、ADX 更稳健。
+
+export interface AdxResult {
+  /** 平均趋向指数，0-100，> 25 视为有趋势。 */
+  adx: number;
+  /** 多头方向指标，0-100。 */
+  plusDI: number;
+  /** 空头方向指标，0-100。 */
+  minusDI: number;
+  /** +DI - -DI，正为多头、负为空头。 */
+  direction: number;
+}
+
+/**
+ * 计算 ADX/+DI/-DI。需要至少 period*2 根 K 线才稳定。
+ * 返回 endIndex 处的指标值；数据不足时返回 adx=0, direction=0。
+ */
+export function computeADX(bars: Bar[], endIndex: number, period = 14): AdxResult {
+  if (endIndex < period) return { adx: 0, plusDI: 0, minusDI: 0, direction: 0 };
+  // Wilder 平滑采用累计递推：从第 period 根开始累计，每次按 (prev*(period-1) + new) / period 滚动。
+  let prevTR = 0;
+  let prevPlusDM = 0;
+  let prevMinusDM = 0;
+  let adxValue = 0;
+  let hasDX = false;
+  for (let i = 1; i <= endIndex; i += 1) {
+    const cur = bars[i];
+    const prev = bars[i - 1];
+    const upMove = cur.high - prev.high;
+    const downMove = prev.low - cur.low;
+    const plusDM = upMove > downMove && upMove > 0 ? upMove : 0;
+    const minusDM = downMove > upMove && downMove > 0 ? downMove : 0;
+    const trueRange = Math.max(
+      cur.high - cur.low,
+      Math.abs(cur.high - prev.close),
+      Math.abs(cur.low - prev.close),
+    );
+    if (i < period) {
+      // 累计前 period-1 根，第 period 根开始做 Wilder 平均。
+      prevTR += trueRange;
+      prevPlusDM += plusDM;
+      prevMinusDM += minusDM;
+      continue;
+    }
+    if (i === period) {
+      prevTR += trueRange;
+      prevPlusDM += plusDM;
+      prevMinusDM += minusDM;
+    } else {
+      prevTR = (prevTR * (period - 1) + trueRange) / period;
+      prevPlusDM = (prevPlusDM * (period - 1) + plusDM) / period;
+      prevMinusDM = (prevMinusDM * (period - 1) + minusDM) / period;
+    }
+    if (prevTR <= 0) continue;
+    const plusDI = 100 * prevPlusDM / prevTR;
+    const minusDI = 100 * prevMinusDM / prevTR;
+    const sum = plusDI + minusDI;
+    const dx = sum > 0 ? 100 * Math.abs(plusDI - minusDI) / sum : 0;
+    if (!hasDX) {
+      // 第一个 DX 直接记下，等到再累积 period 个 DX 后开始 Wilder 平滑得到 ADX。
+      adxValue = dx;
+      hasDX = true;
+    } else {
+      adxValue = (adxValue * (period - 1) + dx) / period;
+    }
+  }
+  if (!hasDX) return { adx: 0, plusDI: 0, minusDI: 0, direction: 0 };
+  const lastPlusDI = prevTR > 0 ? 100 * prevPlusDM / prevTR : 0;
+  const lastMinusDI = prevTR > 0 ? 100 * prevMinusDM / prevTR : 0;
+  return {
+    adx: round(adxValue, 2),
+    plusDI: round(lastPlusDI, 2),
+    minusDI: round(lastMinusDI, 2),
+    direction: round(lastPlusDI - lastMinusDI, 2),
+  };
+}
+
 export function alignmentOf(
   ma5: number | null,
   ma10: number | null,
@@ -490,7 +569,16 @@ export interface MarketStateResult extends MarketState {
   ma20: number | null;
   near_high: string;
   volume_trend: string;
+  /** ADX 指标值，0-100，> 20 视为有趋势。 */
+  adx?: number;
+  /** +DI 多头方向指标。 */
+  plus_di?: number;
+  /** -DI 空头方向指标。 */
+  minus_di?: number;
   downgraded?: boolean;
+  /** 日线原始分类的 state_id；analyzeBlockTrend 在降级/升级时保留以供审计。 */
+  original_state_id?: number;
+  original_state_name?: string;
 }
 
 interface StateTemplate {
@@ -550,11 +638,60 @@ function buildStateResult(templateId: number, bars: Bar[], extra: Partial<Market
   };
 }
 
+/** 八态分类的阈值参数；供参数优化与测试覆盖。 */
+export interface MarketStateThresholds {
+  /** trendStrength（线性回归斜率/均价）超过此值视为上升。 */
+  risingStrength: number;
+  /** trendStrength 低于此值的负数视为下降。 */
+  fallingStrength: number;
+  /** ADX 高于此值视为有趋势（与 trendStrength 双确认）。 */
+  adxTrending: number;
+  /** ADX 方向（+DI - -DI）正负方向阈值，绝对值小于此值视为方向不明。 */
+  adxDirectionDeadZone: number;
+  /** 距 60 日高点小于此距离（百分比/100）视为「接近高点」。 */
+  nearHighDistance: number;
+  /** 距 60 日高点小于此负距离视为「回调中」。 */
+  pullbackDistance: number;
+  /** 5 日累计涨幅超过此值视为恐慌抛售。 */
+  panicReturn5: number;
+  /** 日收益率标准差超过此值视为恐慌抛售。 */
+  panicVolatility: number;
+  /** 量比低于此值视为缩量。 */
+  dryVolumeRatio: number;
+  /** 量比高于此值视为放量。 */
+  heavyVolumeRatio: number;
+  /** 「筑底成功」5 日累计涨幅上限。 */
+  bottomingMaxReturn5: number;
+  /** 「筑底成功」5 日累计涨幅下限。 */
+  bottomingMinReturn5: number;
+  /** 「筑底成功」距高点负距离下限（必须 <= 此负值）。 */
+  bottomingMinDistanceFromHigh: number;
+}
+
+export const DEFAULT_MARKET_STATE_THRESHOLDS: Readonly<MarketStateThresholds> = Object.freeze({
+  risingStrength: 0.003,
+  fallingStrength: -0.003,
+  adxTrending: 20,
+  adxDirectionDeadZone: 3,
+  nearHighDistance: -0.03,
+  pullbackDistance: -0.05,
+  panicReturn5: -0.08,
+  panicVolatility: 4.5,
+  dryVolumeRatio: 0.8,
+  heavyVolumeRatio: 1.1,
+  bottomingMaxReturn5: 0.08,
+  bottomingMinReturn5: 0.02,
+  bottomingMinDistanceFromHigh: -0.08,
+});
+
 /**
- * 八种市场状态分类：均线排列 → 趋势强度 → 距高点 → 量能 → 波动率的规则判定。
- * 这是本地启发式实现（ref-doc 只给出状态表，未给出精确阈值）。
+ * 八种市场状态分类：均线排列 + ADX → 距高点 → 量能 → 波动率。
+ * ADX 用于趋势确认：ADX 不足时即使 trendStrength 略偏也视为震荡市。
  */
-export function classifyMarketState(bars: Bar[]): MarketStateResult {
+export function classifyMarketState(
+  bars: Bar[],
+  thresholds: MarketStateThresholds = DEFAULT_MARKET_STATE_THRESHOLDS,
+): MarketStateResult {
   if (bars.length < 20) return buildStateResult(0, bars);
   const endIndex = bars.length - 1;
   const ma5 = movingAverage(bars, endIndex, 5);
@@ -563,6 +700,7 @@ export function classifyMarketState(bars: Bar[]): MarketStateResult {
   const ma60 = movingAverage(bars, endIndex, 60);
   const alignment = alignmentOf(ma5, ma10, ma20, ma60);
   const strength = trendStrength(bars, endIndex, 20);
+  const adx = computeADX(bars, endIndex, 14);
   const close = bars[endIndex].close;
   const high60 = Math.max(...bars.slice(Math.max(0, endIndex - 59), endIndex + 1).map((bar) => bar.high));
   const distanceFromHigh = high60 > 0 ? (close - high60) / high60 : 0;
@@ -571,53 +709,112 @@ export function classifyMarketState(bars: Bar[]): MarketStateResult {
   const volumeRatio = volumeTrendRatio(bars, endIndex);
   const volatility = standardDeviation(bars.slice(Math.max(0, endIndex - 19), endIndex + 1).map((bar) => bar.changePct));
 
-  const rising = alignment === 'bullish' || strength > 0.003;
-  const falling = alignment === 'bearish' || strength < -0.003;
+  // 趋势确认：均线排列明确 OR (trendStrength 越线 AND ADX 足够强)。
+  // ADX < thresholds.adxTrending 时降级为震荡市，避免在震荡市误判。
+  const adxTrending = adx.adx >= thresholds.adxTrending;
+  const adxBullish = adx.direction > thresholds.adxDirectionDeadZone;
+  const adxBearish = adx.direction < -thresholds.adxDirectionDeadZone;
+  const rising = alignment === 'bullish' || (strength > thresholds.risingStrength && adxTrending && adxBullish);
+  const falling = alignment === 'bearish' || (strength < thresholds.fallingStrength && adxTrending && adxBearish);
+
   const bottomingSuccess = !rising
-    && return5 > 0
-    && return5 <= 0.08
-    && volumeRatio >= 1.0
-    && distanceFromHigh <= -0.08
+    && return5 >= thresholds.bottomingMinReturn5
+    && return5 <= thresholds.bottomingMaxReturn5
+    && volumeRatio >= thresholds.heavyVolumeRatio
+    && distanceFromHigh <= thresholds.bottomingMinDistanceFromHigh
     && strength > -0.005;
 
-  if (bottomingSuccess) return buildStateResult(8, bars);
+  if (bottomingSuccess) {
+    return buildStateResult(8, bars, { adx: adx.adx, plus_di: adx.plusDI, minus_di: adx.minusDI });
+  }
 
   let stateId: number;
   if (rising && !falling) {
-    if (distanceFromHigh > -0.03) stateId = volumeRatio >= 0.9 ? 1 : 2;
-    else if (distanceFromHigh <= -0.05) stateId = 3;
-    else stateId = 1;
+    if (distanceFromHigh > thresholds.nearHighDistance) {
+      stateId = volumeRatio >= 0.9 ? 1 : 2;
+    } else if (distanceFromHigh <= thresholds.pullbackDistance) {
+      stateId = 3;
+    } else {
+      stateId = 1;
+    }
   } else if (falling && !rising) {
-    if (return5 <= -0.08 || volatility >= 4.5) stateId = 7;
-    else stateId = 6;
+    stateId = (return5 <= thresholds.panicReturn5 || volatility >= thresholds.panicVolatility) ? 7 : 6;
   } else {
-    stateId = volumeRatio < 0.8 ? 5 : 4;
+    stateId = volumeRatio < thresholds.dryVolumeRatio ? 5 : 4;
   }
-  return buildStateResult(stateId, bars);
+  return buildStateResult(stateId, bars, { adx: adx.adx, plus_di: adx.plusDI, minus_di: adx.minusDI });
 }
 
-/** 周/月线粗判断：斜率方向 → up / down / range。 */
+/** 周/月线粗判断：ADX 方向 + 斜率共振 → up / down / range。 */
 export function singlePeriodTrend(bars: Bar[]): TrendAxis {
-  if (bars.length < 5) return 'range';
-  const strength = trendStrength(bars, bars.length - 1, Math.min(bars.length, 12));
-  if (strength > 0.005) return 'up';
-  if (strength < -0.005) return 'down';
+  if (bars.length < 14) return 'range';
+  const endIndex = bars.length - 1;
+  const strength = trendStrength(bars, endIndex, Math.min(bars.length, 12));
+  const adx = computeADX(bars, endIndex, 14);
+  if (adx.adx < 15) return 'range'; // ADX 太低，方向不可信
+  const slopeUp = strength > 0.003 || adx.direction > 3;
+  const slopeDown = strength < -0.003 || adx.direction < -3;
+  if (slopeUp && !slopeDown) return 'up';
+  if (slopeDown && !slopeUp) return 'down';
   return 'range';
 }
 
 /**
  * 板块趋势分析：日线七态分类 + 周/月线交叉验证。
- * 日线上升但周、月线均下跌 → 降级为「阴跌不止」（ref-doc §3.2）。
+ *
+ * 多周期共振规则（周月线长度足够时生效）：
+ * 1. 日线上升 + 周月均下跌 → 降级为「阴跌不止」（日线反弹 trap）。
+ * 2. 日线 state 8（筑底成功） + 周月均下跌 → 抑制为「阴跌不止」（假底部）。
+ * 3. 日线下跌 + 周月均上升 → 升级为「筑底成功」（多周期底部共振）。
+ * 4. 其他情况保留日线分类。
  */
 export function analyzeBlockTrend(daily: Bar[], weekly?: Bar[], monthly?: Bar[]): MarketStateResult {
   const state = classifyMarketState(daily);
-  if (state.trend === '上升' && weekly?.length && monthly?.length) {
-    const weeklyTrend = singlePeriodTrend(weekly);
-    const monthlyTrend = singlePeriodTrend(monthly);
-    if (weeklyTrend === 'down' && monthlyTrend === 'down') {
-      return buildStateResult(6, daily, { downgraded: true });
-    }
+  const hasWeekly = (weekly?.length ?? 0) >= 14;
+  const hasMonthly = (monthly?.length ?? 0) >= 14;
+  if (!hasWeekly || !hasMonthly) return state;
+
+  const weeklyTrend = singlePeriodTrend(weekly!);
+  const monthlyTrend = singlePeriodTrend(monthly!);
+  const bothDown = weeklyTrend === 'down' && monthlyTrend === 'down';
+  const bothUp = weeklyTrend === 'up' && monthlyTrend === 'up';
+
+  // 1. 日线上升 + 周月均下跌 → 降级为「阴跌不止」。
+  if (state.trend === '上升' && bothDown) {
+    return buildStateResult(6, daily, {
+      downgraded: true,
+      original_state_id: state.state_id,
+      original_state_name: state.state_name,
+      adx: state.adx,
+      plus_di: state.plus_di,
+      minus_di: state.minus_di,
+    });
   }
+
+  // 2. 日线 state 8（筑底成功） + 周月均下跌 → 抑制为「阴跌不止」。
+  if (state.state_id === 8 && bothDown) {
+    return buildStateResult(6, daily, {
+      downgraded: true,
+      original_state_id: state.state_id,
+      original_state_name: state.state_name,
+      adx: state.adx,
+      plus_di: state.plus_di,
+      minus_di: state.minus_di,
+    });
+  }
+
+  // 3. 日线下跌 + 周月均上升 → 升级为「筑底成功」（多周期底部共振）。
+  if (state.trend === '下跌' && bothUp) {
+    return buildStateResult(8, daily, {
+      downgraded: true,
+      original_state_id: state.state_id,
+      original_state_name: state.state_name,
+      adx: state.adx,
+      plus_di: state.plus_di,
+      minus_di: state.minus_di,
+    });
+  }
+
   return state;
 }
 

@@ -30,6 +30,12 @@ export interface SectorTrendRecord {
   ma20: number | null;
   near_high: string;
   volume_trend: string;
+  adx: number | null;
+  plus_di: number | null;
+  minus_di: number | null;
+  downgraded: number;
+  original_state_id: number | null;
+  original_state_name: string | null;
   strategy_action: string;
   strategy_label: string;
   strategy_position: string;
@@ -61,6 +67,12 @@ export interface RankingFactorRecord {
 // Constants
 // ---------------------------------------------------------------------------
 
+/** 同花顺板块 K 线周期常量：01=日 / 11=周 / 21=月。 */
+export const BLOCK_PERIOD_DAILY = '01' as const;
+export const BLOCK_PERIOD_WEEKLY = '11' as const;
+export const BLOCK_PERIOD_MONTHLY = '21' as const;
+export type BlockPeriod = typeof BLOCK_PERIOD_DAILY | typeof BLOCK_PERIOD_WEEKLY | typeof BLOCK_PERIOD_MONTHLY;
+
 export const STATE_NAMES: Record<number, string> = {
   0: '数据不足',
   1: '主线主升',
@@ -70,6 +82,7 @@ export const STATE_NAMES: Record<number, string> = {
   5: '缩量无序',
   6: '阴跌不止',
   7: '恐慌暴跌',
+  8: '筑底成功',
 };
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,10 @@ import {
   type SectorTrendRecord,
   type StoredDailyPrice,
 } from './sqlite-store.js';
+import {
+  BLOCK_PERIOD_DAILY,
+  type BlockPeriod,
+} from './sqlite/helpers.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_DATA_DIR = path.join(MODULE_DIR, 'data');
@@ -271,7 +275,7 @@ export class DataStore {
 
   /**
    * 当 sector_trend_daily 缺少某板块趋势数据时，从 block_daily_price 表
-   * 实时计算该板块的日线趋势分类作为兜底。
+   * 读取该板块的日/周/月线行情，调用 analyzeBlockTrend 实时计算趋势分类作为兜底。
    * 返回 null 表示板块代码无效或数据不足。
    */
   async computeSectorTrendFromBlockPrices(
@@ -279,6 +283,18 @@ export class DataStore {
     date: string,
   ): Promise<{ sector_code: string; sector_name: string; state_id: number; state_name: string } | null> {
     return this.sqlite.computeSectorTrendFromBlockPrices(sectorCode, date);
+  }
+
+  async getBlockPrices(blockCode: string, limit = 250, period: BlockPeriod = BLOCK_PERIOD_DAILY): Promise<KLineData[]> {
+    return this.sqlite.getBlockPrices(blockCode, limit, period);
+  }
+
+  async upsertBlockPrices(blockCode: string, blockName: string, klines: KLineData[], period: BlockPeriod = BLOCK_PERIOD_DAILY): Promise<number> {
+    return this.sqlite.upsertBlockPrices(blockCode, blockName, klines, period);
+  }
+
+  async getBlockLatestKlineDate(blockCode: string, period: BlockPeriod = BLOCK_PERIOD_DAILY): Promise<string | null> {
+    return this.sqlite.getBlockLatestKlineDate(blockCode, period);
   }
 
   async getRankingFactorsForDate(date: string): Promise<RankingFactorRecord[]> {

@@ -1,11 +1,19 @@
 import { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 /** v16→17: 允许 state_id 为 0（数据不足），配合 CHECK 约束从 BETWEEN 1 AND 7 改为 0 AND 7。 */
 export function migrateV16(database: DatabaseSync): void {
   const version = database.prepare('PRAGMA user_version').get() as { user_version: number } | undefined;
   if (Number(version?.user_version ?? 0) >= 17) return;
+  // 检查 sector_trend_daily 是否已经按新 schema 创建（避免与 initializeSchema 冲突）。
+  const cols = database.prepare(`PRAGMA table_info(sector_trend_daily)`).all() as Array<{ name: string }>;
+  const hasAdxColumn = cols.some((c) => c.name === 'adx');
+  if (hasAdxColumn) {
+    // initializeSchema 已经建了带 adx 列的新表，CHECK 已经是 BETWEEN 0 AND 8，无需迁移。
+    database.exec(`PRAGMA user_version = 17;`);
+    return;
+  }
   database.exec(`
     CREATE TABLE sector_trend_daily_new (
       date TEXT NOT NULL,
@@ -25,13 +33,109 @@ export function migrateV16(database: DatabaseSync): void {
       computed_at TEXT NOT NULL,
       PRIMARY KEY (date, sector_code)
     ) WITHOUT ROWID;
-    INSERT INTO sector_trend_daily_new SELECT * FROM sector_trend_daily;
+    INSERT INTO sector_trend_daily_new
+      (date, sector_code, sector_name, state_id, state_name, trend, latest, ma5, ma20,
+       near_high, volume_trend, strategy_action, strategy_label, strategy_position, computed_at)
+    SELECT date, sector_code, sector_name, state_id, state_name, trend, latest, ma5, ma20,
+           near_high, volume_trend, strategy_action, strategy_label, strategy_position, computed_at
+    FROM sector_trend_daily;
     DROP TABLE sector_trend_daily;
     ALTER TABLE sector_trend_daily_new RENAME TO sector_trend_daily;
     -- 修复历史脏数据：state_name 与 state_id 不匹配的行
     UPDATE sector_trend_daily SET state_id = 0 WHERE state_name = '数据不足' AND state_id != 0;
     PRAGMA user_version = 17;
   `);
+}
+
+/**
+ * v18→19: 板块指数表支持日/周/月三周期，sector_trend_daily 允许 state_id=8（筑底成功）。
+ *
+ * - `block_daily_price` 增加 `period` 列（'01'=日 / '11'=周 / '21'=月），
+ *   主键扩展为 (block_code, date, period)；旧数据默认 '01'。
+ * - `sector_trend_daily` 的 CHECK 从 `BETWEEN 0 AND 7` 改为 `BETWEEN 0 AND 8`，
+ *   与 scoring-engine 的 STATE_TABLE 对齐。
+ * - 新增 `adx` / `plus_di` / `minus_di` / `downgraded` 字段，供审计与 UI 展示。
+ */
+export function migrateV18(database: DatabaseSync): void {
+  const version = database.prepare('PRAGMA user_version').get() as { user_version: number } | undefined;
+  if (Number(version?.user_version ?? 0) >= 19) return;
+
+  // ---- 1. block_daily_price 加 period 列并扩展主键 ----
+  const blockCols = database.prepare(`PRAGMA table_info(block_daily_price)`).all() as Array<{ name: string }>;
+  const blockHasPeriod = blockCols.some((c) => c.name === 'period');
+  if (!blockHasPeriod) {
+    // 旧表无 period 列：先 ADD COLUMN，再重建表加 CHECK 约束和复合主键。
+    database.exec(`ALTER TABLE block_daily_price ADD COLUMN period TEXT NOT NULL DEFAULT '01'`);
+    database.exec(`
+      DROP INDEX IF EXISTS idx_block_price_code_date;
+      CREATE TABLE block_daily_price_new (
+        block_code TEXT NOT NULL REFERENCES sector_info(code) ON UPDATE CASCADE,
+        block_name TEXT NOT NULL,
+        date TEXT NOT NULL,
+        period TEXT NOT NULL DEFAULT '01' CHECK (period IN ('01', '11', '21')),
+        open REAL NOT NULL,
+        close REAL NOT NULL,
+        high REAL NOT NULL,
+        low REAL NOT NULL,
+        volume REAL NOT NULL DEFAULT 0,
+        amount REAL NOT NULL DEFAULT 0,
+        change_rate REAL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (block_code, date, period)
+      ) WITHOUT ROWID;
+      INSERT INTO block_daily_price_new
+        (block_code, block_name, date, period, open, close, high, low, volume, amount, change_rate, created_at)
+      SELECT block_code, block_name, date, period, open, close, high, low, volume, amount, change_rate, created_at
+      FROM block_daily_price;
+      DROP TABLE block_daily_price;
+      ALTER TABLE block_daily_price_new RENAME TO block_daily_price;
+      CREATE INDEX IF NOT EXISTS idx_block_price_code_date ON block_daily_price(block_code, date);
+      CREATE INDEX IF NOT EXISTS idx_block_price_code_period_date ON block_daily_price(block_code, period, date);
+    `);
+  } else if (!blockCols.some((c) => c.name === 'created_at')) {
+    // initializeSchema 已经建了完整的新表，无需任何操作。
+  }
+
+  // ---- 2. sector_trend_daily 允许 state_id=8 + 新增 ADX/downgraded 字段 ----
+  const trendCols = database.prepare(`PRAGMA table_info(sector_trend_daily)`).all() as Array<{ name: string }>;
+  const trendHasAdx = trendCols.some((c) => c.name === 'adx');
+  if (!trendHasAdx) {
+    database.exec(`
+      CREATE TABLE sector_trend_daily_new (
+        date TEXT NOT NULL,
+        sector_code TEXT NOT NULL REFERENCES sector_info(code) ON UPDATE CASCADE,
+        sector_name TEXT NOT NULL,
+        state_id INTEGER NOT NULL CHECK (state_id BETWEEN 0 AND 8),
+        state_name TEXT NOT NULL,
+        trend TEXT NOT NULL DEFAULT '',
+        latest REAL,
+        ma5 REAL,
+        ma20 REAL,
+        near_high TEXT NOT NULL DEFAULT '',
+        volume_trend TEXT NOT NULL DEFAULT '',
+        adx REAL,
+        plus_di REAL,
+        minus_di REAL,
+        downgraded INTEGER NOT NULL DEFAULT 0,
+        original_state_id INTEGER,
+        original_state_name TEXT,
+        strategy_action TEXT NOT NULL DEFAULT '',
+        strategy_label TEXT NOT NULL DEFAULT '',
+        strategy_position TEXT NOT NULL DEFAULT '',
+        computed_at TEXT NOT NULL,
+        PRIMARY KEY (date, sector_code)
+      ) WITHOUT ROWID;
+      INSERT INTO sector_trend_daily_new
+        (date, sector_code, sector_name, state_id, state_name, trend, latest, ma5, ma20,
+         near_high, volume_trend, strategy_action, strategy_label, strategy_position, computed_at)
+      SELECT date, sector_code, sector_name, state_id, state_name, trend, latest, ma5, ma20,
+             near_high, volume_trend, strategy_action, strategy_label, strategy_position, computed_at
+      FROM sector_trend_daily;
+      DROP TABLE sector_trend_daily;
+      ALTER TABLE sector_trend_daily_new RENAME TO sector_trend_daily;
+    `);
+  }
+  database.exec(`PRAGMA user_version = 19;`);
 }
 
 /** v15: 移除 limit_up_record 中的冗余名称列，改由 JOIN info 表获取。 */
@@ -116,6 +220,7 @@ export function initializeSchema(database: DatabaseSync): void {
       block_code TEXT NOT NULL REFERENCES sector_info(code) ON UPDATE CASCADE,
       block_name TEXT NOT NULL,
       date TEXT NOT NULL,
+      period TEXT NOT NULL DEFAULT '01' CHECK (period IN ('01', '11', '21')),
       open REAL NOT NULL,
       close REAL NOT NULL,
       high REAL NOT NULL,
@@ -124,14 +229,14 @@ export function initializeSchema(database: DatabaseSync): void {
       amount REAL NOT NULL DEFAULT 0,
       change_rate REAL,
       created_at TEXT NOT NULL,
-      PRIMARY KEY (block_code, date)
+      PRIMARY KEY (block_code, date, period)
     ) WITHOUT ROWID;
 
     CREATE TABLE IF NOT EXISTS sector_trend_daily (
       date TEXT NOT NULL,
       sector_code TEXT NOT NULL REFERENCES sector_info(code) ON UPDATE CASCADE,
       sector_name TEXT NOT NULL,
-      state_id INTEGER NOT NULL CHECK (state_id BETWEEN 0 AND 7),
+      state_id INTEGER NOT NULL CHECK (state_id BETWEEN 0 AND 8),
       state_name TEXT NOT NULL,
       trend TEXT NOT NULL DEFAULT '',
       latest REAL,
@@ -139,6 +244,12 @@ export function initializeSchema(database: DatabaseSync): void {
       ma20 REAL,
       near_high TEXT NOT NULL DEFAULT '',
       volume_trend TEXT NOT NULL DEFAULT '',
+      adx REAL,
+      plus_di REAL,
+      minus_di REAL,
+      downgraded INTEGER NOT NULL DEFAULT 0,
+      original_state_id INTEGER,
+      original_state_name TEXT,
       strategy_action TEXT NOT NULL DEFAULT '',
       strategy_label TEXT NOT NULL DEFAULT '',
       strategy_position TEXT NOT NULL DEFAULT '',
@@ -240,6 +351,8 @@ export function initializeSchema(database: DatabaseSync): void {
       ON index_daily_price(symbol, date);
     CREATE INDEX IF NOT EXISTS idx_block_price_code_date
       ON block_daily_price(block_code, date);
+    CREATE INDEX IF NOT EXISTS idx_block_price_code_period_date
+      ON block_daily_price(block_code, period, date);
     CREATE INDEX IF NOT EXISTS idx_sector_trend_date
       ON sector_trend_daily(date);
     CREATE INDEX IF NOT EXISTS idx_ranking_factor_total
@@ -249,5 +362,6 @@ export function initializeSchema(database: DatabaseSync): void {
   `);
   migrateV15(database);
   migrateV16(database);
+  migrateV18(database);
   database.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
 }
