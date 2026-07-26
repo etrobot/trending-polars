@@ -5,3 +5,4 @@ coverage/
 server/data/
 *.log
 *.tsbuildinfo
+retry-claude.sh

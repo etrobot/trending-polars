@@ -58,11 +58,20 @@ export function migrateV16(database: DatabaseSync): void {
  */
 export function migrateV18(database: DatabaseSync): void {
   const version = database.prepare('PRAGMA user_version').get() as { user_version: number } | undefined;
-  if (Number(version?.user_version ?? 0) >= 19) return;
+  const currentVersion = Number(version?.user_version ?? 0);
 
   // ---- 1. block_daily_price 加 period 列并扩展主键 ----
   const blockCols = database.prepare(`PRAGMA table_info(block_daily_price)`).all() as Array<{ name: string }>;
   const blockHasPeriod = blockCols.some((c) => c.name === 'period');
+
+  // ---- 2. sector_trend_daily 允许 state_id=8 + 新增 ADX/downgraded 字段 ----
+  const trendCols = database.prepare(`PRAGMA table_info(sector_trend_daily)`).all() as Array<{ name: string }>;
+  const trendHasAdx = trendCols.some((c) => c.name === 'adx');
+
+  // 版本号已达标且 schema 已正确应用，才跳过；否则基于实际 schema 状态决定是否迁移，
+  // 以修复 user_version 与 schema 不一致的破损状态（例如迁移中途失败但版本号已写入）。
+  if (currentVersion >= 19 && blockHasPeriod && trendHasAdx) return;
+
   if (!blockHasPeriod) {
     // 旧表无 period 列：先 ADD COLUMN，再重建表加 CHECK 约束和复合主键。
     database.exec(`ALTER TABLE block_daily_price ADD COLUMN period TEXT NOT NULL DEFAULT '01'`);
@@ -96,9 +105,6 @@ export function migrateV18(database: DatabaseSync): void {
     // initializeSchema 已经建了完整的新表，无需任何操作。
   }
 
-  // ---- 2. sector_trend_daily 允许 state_id=8 + 新增 ADX/downgraded 字段 ----
-  const trendCols = database.prepare(`PRAGMA table_info(sector_trend_daily)`).all() as Array<{ name: string }>;
-  const trendHasAdx = trendCols.some((c) => c.name === 'adx');
   if (!trendHasAdx) {
     database.exec(`
       CREATE TABLE sector_trend_daily_new (
