@@ -41,7 +41,9 @@
 | `latest` | number\|null | 最新价 |
 | `is_st` | bool | 是否 ST |
 
-**数据流向**：`fetchBlockTop()` → `collectLimitUpAnalysis()`（app.ts）→ 板块 K 线与涨停个股 K 线采集 → 指数 K 线采集 → 趋势分类 → 批量写入 SQLite 的 `stock_info` / `sector_info` / `limit_up_record` / `sector_trend_daily` / `stock_daily_price` / `index_daily_price`，同时刷新 `analysis.json` 缓存
+**数据流向**：`fetchBlockTop()` → `MarketService.refreshLimitUpAnalysis()`（`server/app/market-service.ts`）→ 板块 K 线与涨停个股 K 线采集 → 指数 K 线采集 → 趋势分类 → 批量写入 SQLite 的 `stock_info` / `sector_info` / `limit_up_record` / `sector_trend_daily` / `stock_daily_price` / `index_daily_price`，同时刷新 `analysis.json` 缓存
+
+> `GET /api/analysis?refresh=1` 与 `POST /api/analysis/collect` 当前都走 `MarketService.refreshLimitUpAnalysis()`，路由层只在 `/server/app/routes.ts` 中授权和分发。
 
 **回测采集扩展**：`collectHistoricalMarketData()` 现在还会采集回测日期范围内的历史 `block_top` 涨停记录和板块指数日线（`block_daily_price`），用于回测中的板块趋势滚动计算。调用方可传入 `existingLimitUpRecords`/`existingBlockSeries` 跳过网络请求，从已有 SQLite 数据加载。
 
@@ -244,11 +246,11 @@ v15 迁移移除了 `limit_up_record` 表中的冗余列 `stock_name` 和 `secto
 
 ### 4.4 `sector_trend_daily` 表变更
 
-v16 迁移将 `state_id` 的 CHECK 约束从 `BETWEEN 1 AND 7` 扩展为 `BETWEEN 0 AND 7`，允许 `0` 表示"数据不足"状态。同时修复了 `state_name` 与 `state_id` 不匹配的历史脏数据。
+v16 迁移将 `state_id` 的 CHECK 约束从 `BETWEEN 1 AND 7` 扩展为 `BETWEEN 0 AND 7`，允许 `0` 表示"数据不足"状态。v18 起又允许 `state_id=8`（"筑底成功"），与 `STATE_NAMES`（`server/sqlite/helpers.ts`）和 `scoring-engine.ts` 的 `STATE_TABLE` 对齐。同时修复了 `state_name` 与 `state_id` 不匹配的历史脏数据。
 
 ### 4.5 数据迁移流程
 
-数据库版本从 v14 升级到 v17，迁移流程：
+数据库版本从 v14 升级到 v18，迁移流程：
 
 ```typescript
 // v15: 移除 limit_up_record 冗余列
@@ -261,7 +263,12 @@ INSERT INTO sector_trend_daily_new SELECT * FROM sector_trend_daily;
 DROP TABLE sector_trend_daily;
 ALTER TABLE sector_trend_daily_new RENAME TO sector_trend_daily;
 UPDATE sector_trend_daily SET state_id = 0 WHERE state_name = '数据不足';
+
+// v18: 最终版本号 — 不再扩充表，仅提示约束上限为 8。
+PRAGMA user_version = 18;
 ```
+
+迁移入口集中在 `server/sqlite/schema.ts` 的 `initializeSchema()`（PRAGMA + 建表 + `migrateV15/migrateV16`），逻辑层在 `server/sqlite/helpers.ts` 维护 `STATE_NAMES` / `LimitUpRecord` 等共享类型与工具函数，避免再回到 `sqlite-store.ts` 中混杂维护。
 
 ---
 

@@ -11,6 +11,7 @@ import type {
   RankingRow,
 } from '../src/types.js';
 import type { HistoricalMarketData, KLineData } from './historical-market.js';
+import type { ParamOptimizeResult } from './backtest-param-optimizer.js';
 import { formatDateTime } from './format.js';
 import {
   SqliteStore,
@@ -348,6 +349,19 @@ export class DataStore {
   savePaperTradingState(state: PaperTradingRuntimeState): Promise<void> {
     this.sqlite.saveInstructions(state.instructions ?? []);
     return writeJson(path.join(this.runtime, 'paper-trading-state.json'), state);
+  }
+
+  saveOptimizeResult(result: ParamOptimizeResult): Promise<void> {
+    return writeJson(path.join(this.runtime, 'optimize-result.json'), result);
+  }
+
+  async loadOptimizeResult(): Promise<ParamOptimizeResult | null> {
+    try {
+      return await readJson<ParamOptimizeResult>(path.join(this.runtime, 'optimize-result.json'));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
   }
 
   private async backtestFiles(dir: string): Promise<string[]> {

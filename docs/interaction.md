@@ -285,14 +285,20 @@ POST /api/ranking/compute            # 校验/补采需求日期行情后异步�
 
 # ==== 回测 ====
 POST /api/backtest/collect?days=20   # 采集历史数据
-POST /api/backtest/run?days=20       # 校验/补采所需区间后运行回测
-POST /api/backtest/optimize?days=20  # 两阶段参数优化（scoreStock + 回测参数）
+POST /api/backtest/run?mode=current&days=20  # 当前方案回测，校验/补采所需区间后运行
+POST /api/backtest/run?mode=random&strategy_count=20  # 随机参数组合回测（1–200 组）
+POST /api/backtest/optimize?days=20  # 两阶段参数优化（scoreStock + 回测参数 + 因子权重）
                                       # 任务进度通过 WebSocket（type=task_progress）推送
                                       # 完成后从 /api/tasks/:taskId.result 读取 OptimizedParams / validation
 GET /api/backtest/list               # 回测列表
 GET /api/backtest/:runId             # 回测详情
 DELETE /api/backtest/:runId          # 删除回测（支持前端勾选批量并发 DELETE）
 # 应用参数：前端使用任务 result.optimized，结果本身可由优化详情 modal 直接回填
+# /api/backtest/run 通用参数（mode 默认 random）：
+#   max_hold_days / max_positions / position_size_pct /
+#   take_profit_pct / stop_loss_pct /
+#   trend_weight_pct / volume_price_weight_pct /
+#   distance_from_low_weight_pct / volatility_weight_pct （1–100）
 
 
 # ==== 基准指数对照 ====
@@ -309,7 +315,9 @@ POST /api/simulated-trading/cancel        # 撤单
 POST /api/simulated-trading/automation/toggle  # 启用/禁用自动化
 POST /api/simulated-trading/automation/pause-today  # 暂停当天
 POST /api/simulated-trading/automation/resume       # 恢复
-POST /api/simulated-trading/automation/run-window   # 手动执行窗口（--confirm SIMULATED）
+POST /api/simulated-trading/automation/run-window   # 手动执行窗口
+                                                     # body: { window: "open"|"near_close"|"close"|"post_close" }
+                                                     # 等价调度器的 run-window；immediate 触发可在开盘窗口下重跑已完成的窗口
 POST /api/simulated-trading/monitor/run   # 手动执行账户监控
 
 # ==== 审计日志 ====

@@ -2,7 +2,7 @@
 
 > **Node 实现约束**：项目使用 Node.js 22.13+ 内置的 `node:sqlite`（`DatabaseSync`），数据库位于 `server/data/trending.db`。`server/data/` 整体加入 `.gitignore`，仓库和 Git 历史不保存行情、排行、账户状态或回测数据。
 
-**数据库版本**：v17
+**数据库版本**：v18
 
 ## 1. 数据存储架构
 
@@ -301,7 +301,7 @@ try {
 
 ### 4.3 数据迁移流程
 
-数据库版本从 v14 升级到 v17：
+数据库版本从 v14 升级到 v18：
 
 ```typescript
 // v15: 移除 limit_up_record 冗余列
@@ -315,9 +315,11 @@ DROP TABLE sector_trend_daily;
 ALTER TABLE sector_trend_daily_new RENAME TO sector_trend_daily;
 UPDATE sector_trend_daily SET state_id = 0 WHERE state_name = '数据不足';
 
-// v17: 最终版本号
-PRAGMA user_version = 17;
+// v18: state_id 允许 8（'筑底成功'，与 STATE_NAMES 对齐）；不再改表结构
+PRAGMA user_version = 18;
 ```
+
+迁移入口集中在 `server/sqlite/schema.ts` 的 `initializeSchema()`（PRAGMA + 建表 + `migrateV15/migrateV16`），逻辑层在 `server/sqlite/helpers.ts` 维护 `STATE_NAMES` / `LimitUpRecord` 等共享类型。
 
 ## 5. 缓存策略
 

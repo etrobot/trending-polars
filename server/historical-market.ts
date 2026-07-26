@@ -96,6 +96,20 @@ interface CollectionOptions {
 }
 
 export const HISTORICAL_WARMUP_DAYS = 70;
+/** 回测窗口下限（交易日）。与 MA60 等评分指标无关，预热由 HISTORICAL_WARMUP_DAYS 保证。 */
+export const MIN_BACKTEST_DAYS = 5;
+/** 回测窗口上限（交易日）。750 ≈ 3 年，MA60 等指标在任意窗口长度下均可逐日计算。 */
+export const MAX_BACKTEST_DAYS = 750;
+
+export function normalizeBacktestDays(
+  value: number | undefined | null,
+  fallback = 20,
+  min = MIN_BACKTEST_DAYS,
+): number {
+  const days = Math.trunc(Number(value ?? fallback));
+  if (!Number.isFinite(days)) return Math.min(MAX_BACKTEST_DAYS, Math.max(min, fallback));
+  return Math.min(MAX_BACKTEST_DAYS, Math.max(min, days));
+}
 
 export interface HistoricalCoverageReport {
   usable: boolean;
@@ -126,7 +140,7 @@ export function assessHistoricalMarketCoverage(
   options: { days: number; asOfDate: string },
 ): HistoricalCoverageReport {
   const requestedAsOfDate = compactDate(options.asOfDate);
-  const requiredDays = Math.min(60, Math.max(1, Math.trunc(options.days)));
+  const requiredDays = normalizeBacktestDays(options.days, 1, 1);
   const universe = uniqueUniverse(rankings);
   const minimumCoveredStocks = universe.length
     ? Math.min(universe.length, Math.min(20, Math.max(2, Math.floor(universe.length * 0.2))))
@@ -689,7 +703,7 @@ export async function collectHistoricalMarketData(
   const universe = uniqueUniverse(rankings);
   if (!universe.length) throw new Error('当前股票池为空，无法采集历史行情');
 
-  const requestedDays = Math.min(60, Math.max(5, Math.trunc(options.days)));
+  const requestedDays = normalizeBacktestDays(options.days);
   const limit = requestedDays + HISTORICAL_WARMUP_DAYS + 5;
   const endDate = compactDate(options.asOfDate);
   await audit.info('market_data', 'collection_started', {

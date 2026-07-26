@@ -45,18 +45,31 @@ npm test
 ```
 trending-polars/
 ├── server/               # 后端服务
-│   ├── app.ts           # API 路由
-│   ├── index.ts         # HTTP + WebSocket 入口
-│   ├── scoring-engine.ts    # 四维评分 + 七态分类
-│   ├── polars-engine.ts     # 排行榜查询
-│   ├── backtest-engine.ts   # 回测引擎（日内循环）
-│   ├── backtest-scoring.ts  # 向量化评分预计算（Polars 单次遍历）
-│   ├── benchmark.ts         # 基准指数对照曲线（搜狐数据源）
-│   ├── paper-trading.ts     # 模拟交易
-│   ├── trading-strategy.ts  # 交易策略
-│   ├── historical-market.ts # 行情采集
-│   ├── ths-simulated-broker.ts  # 同花顺桥接
-│   └── data/            # 运行时数据（gitignore）
+│   ├── app.ts           # 入口：装载服务、注册路由、错误处理
+│   ├── app/             # 应用拆分后的子模块
+│   │   ├── market-service.ts   # 市场采集 / 行情覆盖 / PaperTrading 上下文
+│   │   └── routes.ts           # 所有 /api/* 路由注册
+│   ├── index.ts         # HTTP + WebSocket 启动入口
+│   ├── scoring-engine.ts        # 四维评分 + 0/1–8 状态分类 + 板块策略矩阵
+│   ├── polars-engine.ts         # 排行榜查询 / 排序 / 情绪聚合
+│   ├── backtest-engine.ts       # 回测引擎（日内循环）+ prepareBacktestContext / quickSimulateBacktest
+│   ├── backtest-scoring.ts      # 向量化评分预计算（Polars 单次遍历）
+│   ├── backtest-param-optimizer.ts  # 两阶段参数优化（评分 + 交易参数）
+│   ├── benchmark.ts             # 基准指数对照曲线（搜狐数据源）
+│   ├── paper-trading.ts         # 模拟交易：计划 / 执行 / 调度 / 监控
+│   ├── paper-trading/helpers.ts # 时钟、判断、状态机纯函数
+│   ├── trading-strategy.ts      # 选股 / 仓位 / 止盈止损
+│   ├── historical-market.ts     # 行情采集
+│   ├── ths-simulated-broker.ts  # 同花顺 AppleScript 桥接（含 K 线报价回退）
+│   ├── audit-log.ts             # JSONL 审计日志
+│   ├── tasks.ts                 # 异步任务管理 / WebSocket 广播
+│   ├── format.ts                # 日期 / 数字工具函数
+│   ├── data-store.ts            # 数据门面：SQLite + 旧 JSON 种子导入
+│   ├── sqlite-store.ts          # node:sqlite 仓储层
+│   ├── sqlite/                  # SQLite schema / 类型 / 工具拆分
+│   │   ├── schema.ts            # 建表迁移（v15/v16 → SCHEMA_VERSION=18）
+│   │   └── helpers.ts           # 类型与共用工具函数
+│   └── data/                    # 运行时数据（gitignore，含 trending.db、runtime/）
 ├── src/                  # React 前端
 │   ├── pages/           # 页面组件
 │   └── components/      # 通用组件

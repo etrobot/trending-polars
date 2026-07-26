@@ -4,6 +4,8 @@ import {
   BLOCK_KLINE_URL,
   fetchAdjustedKlines,
   fetchBlockKlines,
+  MAX_BACKTEST_DAYS,
+  normalizeBacktestDays,
   parseBlockKlines,
   parseEastmoneyAdjustedKlines,
   parseSinaKlines,
@@ -17,6 +19,12 @@ afterEach(() => {
 });
 
 describe('market kline sources', () => {
+  it('allows backtest windows up to MAX_BACKTEST_DAYS without tying them to MA60', () => {
+    expect(normalizeBacktestDays(750)).toBe(750);
+    expect(normalizeBacktestDays(900)).toBe(MAX_BACKTEST_DAYS);
+    expect(normalizeBacktestDays(4)).toBe(5);
+  });
+
   it('verifies actual per-stock date coverage instead of snapshot metadata alone', () => {
     const history = historicalFixture('20260722');
     const rankings = history.stocks.map((stock, index) => ({

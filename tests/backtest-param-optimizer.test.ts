@@ -18,8 +18,10 @@ describe('backtest param optimizer', () => {
     }
   }, 30_000);
 
-  it('rejects when sample size is too small', () => {
+  it('clamps days to minimum 5 and still produces a result', () => {
     const fixture = historicalFixture();
-    expect(() => optimizeStrategyParams(fixture, { days: 5 })).toThrow(/样本不足/);
+    const result = optimizeStrategyParams(fixture, { days: 2 });
+    expect(result.days).toBe(5); // clamped to min 5
+    expect(result.validation.totalReturnPct).toBeDefined();
   });
 });

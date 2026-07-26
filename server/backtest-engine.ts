@@ -2,7 +2,7 @@ import pl from 'nodejs-polars';
 import type { BacktestResult, BacktestTrade, EquityPoint, RankingRow } from '../src/types.js';
 import { computeBacktestScores } from './backtest-scoring.js';
 import { compactDate, formatDateTime, round } from './format.js';
-import type { HistoricalMarketData } from './historical-market.js';
+import { normalizeBacktestDays, type HistoricalMarketData } from './historical-market.js';
 import {
   prepareSeries,
   scoreStock,
@@ -586,7 +586,7 @@ export function runPolarsBacktest(
     scoringConfig?: ScoreStockConfig;
   },
 ): BacktestResult {
-  const days = Math.min(60, Math.max(5, Math.trunc(options.days || 20)));
+  const days = normalizeBacktestDays(options.days);
   const strategy = createT1StrategyConfig({
     maxHoldDays: Math.max(1, Math.trunc(options.maxHoldDays || 5)),
     maxPositions: Math.max(1, Math.trunc(options.maxPositions ?? DEFAULT_T1_STRATEGY.maxPositions)),
@@ -664,7 +664,7 @@ export function runRandomizedBacktest(
     scoringConfig?: ScoreStockConfig;
   },
 ): BacktestResult[] {
-  const days = Math.min(60, Math.max(5, Math.trunc(options.days || 20)));
+  const days = normalizeBacktestDays(options.days);
   const strategyCount = Math.min(200, Math.max(1, Math.trunc(options.strategyCount || 20)));
   const bounds = {
     maxHoldDays: Math.min(60, Math.max(1, Math.trunc(options.maxHoldDaysUpper || DEFAULT_T1_STRATEGY.maxHoldDays))),

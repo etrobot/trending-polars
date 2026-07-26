@@ -38,7 +38,7 @@
 
 **技术栈**：TypeScript + Node.js 22.13+ · Express 5 · React 19 · Tailwind CSS 4 · nodejs-polars · `node:sqlite` · WebSocket (ws) · AppleScript 桥接
 
-**数据库版本**：v17（`block_daily_price`、`paper_instruction` 表，`limit_up_record` 去冗余列）
+**数据库版本**：v18（`block_daily_price`、`paper_instruction` 表，`limit_up_record` 去冗余列，`sector_trend_daily.state_id` 允许 0/state_id=8「筑底成功」合法）
 
 ---
 
@@ -46,24 +46,29 @@
 
 | 模块 | 文件 | 职责 |
 |------|------|------|
-| API 路由 | `server/app.ts` | Express 路由、中间件、服务组合、涨停采集流水线 |
+| 服务装配 | `server/app.ts` | 装载 `Store/Audit/Tasks/Paper/MarketService`、注册路由、错误处理 |
+| 市场服务 | `server/app/market-service.ts` | 指数/板块/涨停采集、行情覆盖验证、PaperTrading 上下文、随机游走种子 |
+| API 路由 | `server/app/routes.ts` | 所有 `/api/*` 路由注册；任务、回测、模拟交易、审计 |
 | 服务入口 | `server/index.ts` | HTTP + WebSocket 服务器启动 |
 | 混合数据存储 | `server/data-store.ts` | SQLite 门面、旧 JSON 种子迁移、缓存/状态/回测归档 |
-| SQLite 仓储 | `server/sqlite-store.ts` | `node:sqlite` 建表迁移、WAL、事务批量 upsert、结构化查询 |
+| SQLite 仓储 | `server/sqlite-store.ts` | `node:sqlite` 批量 upsert、结构化查询；PRAGMA 与状态查询 |
+| SQLite schema | `server/sqlite/schema.ts` | 建表、迁移 `migrateV15/migrateV16`，`SCHEMA_VERSION=18` |
+| SQLite 工具 | `server/sqlite/helpers.ts` | 类型定义、值转换（`LimitUpRecord`、`STATE_NAMES`、类型工具） |
 | 行情采集 | `server/historical-market.ts` | 多源 K 线、板块 K 线、涨停排行采集 |
-| 评分引擎 | `server/scoring-engine.ts` | 四维多因子评分、七态市场分类、板块趋势分析、策略矩阵 |
+| 评分引擎 | `server/scoring-engine.ts` | 四维多因子评分 + 八态市场分类 + 板块趋势分析；导出可配置 `ScoreStockConfig` |
 | 排行榜查询 | `server/polars-engine.ts` | 排行榜查询/排序/筛选、情绪聚合、重算 |
-| 向量化回测评分 | `server/backtest-scoring.ts` | 单次 Polars 遍历计算全量股票×日期评分矩阵，替代逐日逐股 scoreStock 循环 |
+| 向量化回测评分 | `server/backtest-scoring.ts` | 单次 Polars 遍历计算全量股票×日期评分矩阵，替代逐日逐股 `scoreStock` 循环 |
 | 基准指数对照 | `server/benchmark.ts` | 从搜狐获取指数日线，归一化生成与回测叠加的 benchmark 净值曲线 |
 | 交易策略 | `server/trading-strategy.ts` | 参数配置、选股过滤、仓位计算、止盈止损；不负责涨停判定 |
-| 回测引擎 | `server/backtest-engine.ts` | 历史回测、日内循环、评分驱动；导出 `prepareBacktestContext` / `quickSimulateBacktest` 供参数优化复用 |
-| 参数优化 | `server/backtest-param-optimizer.ts` | 两阶段优化：先校准 scoreStock 评分参数，再网格搜索回测交易参数，目标为完整回测收益 |
+| 回测引擎 | `server/backtest-engine.ts` | `runPolarsBacktest`/`runRandomizedBacktest`；导出 `prepareBacktestContext` / `quickSimulateBacktest` 供参数优化复用 |
+| 参数优化 | `server/backtest-param-optimizer.ts` | 两阶段优化：先校准 `scoreStock` 评分参数，再网格搜索回测交易参数，目标为完整回测收益 |
 | 模拟交易 | `server/paper-trading.ts` | 交易计划、执行、调度、监控 |
-| 同花顺桥接 | `server/ths-simulated-broker.ts` | AppleScript 调用、持仓解析 |
+| 模拟交易辅助 | `server/paper-trading/helpers.ts` | 时钟、市场强弱、执行窗口、内存状态机等纯函数 |
+| 同花顺桥接 | `server/ths-simulated-broker.ts` | AppleScript 调用、持仓解析；`quote()` 在 UI 失败时回退到 `fetchAdjustedKlines` |
+| AppleScript 桥接 | `scripts/ths_order_dry_run.applescript` | 提交前 `refreshSimulationConnection()`、窗口校验、委托/撤单回查；报价失败回退到 K 线 |
 | 审计日志 | `server/audit-log.ts` | JSONL 日志、查询、轮转 |
 | 任务注册 | `server/tasks.ts` | 异步任务管理、进度跟踪、WebSocket 广播 |
 | 格式化 | `server/format.ts` | 日期、数字工具函数 |
-| AppleScript | `scripts/ths_order_dry_run.applescript` | 同花顺模拟练习 GUI 操作 |
 | 开发脚本 | `scripts/dev.mjs` | 并行启动 API + Vite 开发服务器 |
 
 ---

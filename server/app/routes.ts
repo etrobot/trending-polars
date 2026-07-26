@@ -7,7 +7,7 @@ import { runPolarsBacktest, runRandomizedBacktest, sectorTrendLookupMap } from '
 import { optimizeStrategyParams } from '../backtest-param-optimizer.js';
 import { fetchSohuIndexKlines, buildBenchmarkCurve } from '../benchmark.js';
 import { compactDate, formatDateTime, round } from '../format.js';
-import { fetchAdjustedKlines, fetchBlockKlines, type BlockKlinePeriod } from '../historical-market.js';
+import { fetchAdjustedKlines, fetchBlockKlines, MAX_BACKTEST_DAYS, MIN_BACKTEST_DAYS, type BlockKlinePeriod } from '../historical-market.js';
 import { queryRankings } from '../polars-engine.js';
 import { normalizeScoreStockConfig } from '../scoring-engine.js';
 import type { TaskRegistry } from '../tasks.js';
@@ -354,7 +354,7 @@ export function registerRoutes(
 
   // Backtest
   app.post('/api/backtest/collect', asyncHandler(async (request, response) => {
-    const days = numberParam(request.query.days, 20, 5, 60);
+    const days = numberParam(request.query.days, 20, MIN_BACKTEST_DAYS, MAX_BACKTEST_DAYS);
     const requestedDate = marketDateParam(request.query.date);
     const task = tasks.start('backtest_collect', `构建近 ${days} 日历史样本`, async ({ progress, cancelled, traceId }) => {
       const ranking = await store.getRankingUniverse();
@@ -384,7 +384,7 @@ export function registerRoutes(
 
   app.post('/api/backtest/run', asyncHandler(async (request, response) => {
     const mode = String(request.query.mode ?? 'random') === 'current' ? 'current' : 'random';
-    const days = numberParam(request.query.days, 20, 5, 60);
+    const days = numberParam(request.query.days, 20, MIN_BACKTEST_DAYS, MAX_BACKTEST_DAYS);
     const strategyCount = numberParam(request.query.strategy_count, 20, 1, 200);
     const maxHoldDays = numberParam(request.query.max_hold_days, 5, 1, 60);
     const maxPositions = numberParam(request.query.max_positions, 10, 1, 20);
@@ -517,7 +517,7 @@ export function registerRoutes(
   }));
 
   app.post('/api/backtest/optimize', asyncHandler(async (request, response) => {
-    const days = numberParam(request.query.days, 20, 5, 60);
+    const days = numberParam(request.query.days, 20, MIN_BACKTEST_DAYS, MAX_BACKTEST_DAYS);
     const requestedDate = marketDateParam(request.query.date);
     const taskLabel = `参数优化（近 ${days} 日距60日低点表现）`;
     const task = tasks.start('backtest_optimize', taskLabel, async ({ progress, cancelled, traceId }) => {
@@ -549,6 +549,8 @@ export function registerRoutes(
         traceId,
         data: { days, scoring: result.scoring, optimized: result.optimized, validation: result.validation },
       });
+      // 持久化到文件，供前端随时读取
+      await store.saveOptimizeResult(result);
       return {
         ...result,
         collected: prepared.collected,
@@ -560,6 +562,15 @@ export function registerRoutes(
 
   app.get('/api/backtest/list', asyncHandler(async (_request, response) => {
     response.json(await store.listBacktests());
+  }));
+
+  app.get('/api/backtest/optimize-result', asyncHandler(async (_request, response) => {
+    const result = await store.loadOptimizeResult();
+    if (!result) {
+      response.status(404).json({ error: 'no optimize result found' });
+      return;
+    }
+    response.json(result);
   }));
 
   app.get('/api/backtest/:runId', asyncHandler(async (request, response) => {

@@ -9,6 +9,9 @@ import {
   fetchAdjustedKlines,
   fetchBlockKlines,
   fetchBlockTop,
+  MAX_BACKTEST_DAYS,
+  MIN_BACKTEST_DAYS,
+  normalizeBacktestDays,
   type BlockKlinePeriod,
   type BlockTopData,
   type HistoricalMarketData,
@@ -335,7 +338,7 @@ export class MarketService {
     }
 
     options.progress?.(3, `覆盖不足，开始获取 ${requestedDate} 前 ${options.days} 日个股行情`);
-    const requestedDays = Math.min(60, Math.max(5, Math.trunc(options.days)));
+    const requestedDays = normalizeBacktestDays(options.days);
     const tradingDays = history?.calendar?.slice(-requestedDays) ?? [];
     const existingLimitUpRecords = tradingDays.length > 0
       ? await this.store.loadLimitUpRecordsForDateRange(tradingDays[0], tradingDays.at(-1) ?? requestedDate)

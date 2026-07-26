@@ -48,10 +48,11 @@ df_daily (K线)
   └─ 输出七种状态之一
 ```
 
-**七种市场状态**：
+**七种市场状态**（实际引擎加上 0/8，一共暴露 9 类，详见下方表格）：
 
 | ID | 名称 | 趋势 | 仓位建议 | 信号 |
 |----|------|------|---------|------|
+| 0 | 数据不足 | 未知 | 0成 | empty |
 | 1 | 主线主升 | 上升 | 7-9成 | buy |
 | 2 | 高位滞涨 | 上升 | 3-5成 | sell |
 | 3 | 首次回调 | 上升 | 3-5成 | sell |
@@ -59,11 +60,15 @@ df_daily (K线)
 | 5 | 缩量无序 | 横盘 | 0成 | empty |
 | 6 | 阴跌不止 | 下跌 | 0成 | empty |
 | 7 | 恐慌暴跌 | 下跌 | 0-1成 | empty |
+| 8 | 筑底成功 | 横盘 | 1成 | buy |
 
 **分类规则**（`classifyMarketState()`）：
 - 上升趋势（`bullish` 排列或 `trendStrength > 0.003`）：距高点 3% 内且量比≥0.9 → 主线主升；距高点 3% 内且缩量 → 高位滞涨；距高点≥5% → 首次回调
 - 下跌趋势（`bearish` 排列或 `trendStrength < -0.003`）：5日跌幅≥8% 或波动率≥4.5 → 恐慌暴跌；否则 → 阴跌不止
 - 横盘：量比<0.8 → 缩量无序；否则 → 箱体震荡
+- **筑底成功**（state 8）：不上升也不下跌 + 5 日涨幅>0 且 ≤8% + 量比≥1.0 + 距高点 ≤-8% + 趋势强度>-0.005 → 视为底部反转（仓位建议 1 成，由 `assessMarketTiming()` 计为偏强）
+
+> `state_id=8` 在表 `sector_trend_daily` 由 v18 起不再被 CHECK 约束拒绝；`server/sqlite/helpers.ts` 的 `STATE_NAMES` 与 `scoring-engine.ts` 的 `STATE_TABLE` 同步暴露该状态。
 
 ### 1.3 板块趋势分析 —— `server/scoring-engine.ts`
 
@@ -101,6 +106,7 @@ df_daily (K线)
 | 5-缩量无序 | 休息 0成 | 休息 0成 |
 | 6-阴跌不止 | 回避 0成 | 回避 0成 |
 | 7-恐慌暴跌 | 超跌反弹 0-1成 | 回避 0成 |
+| 8-筑底成功 | 筑底成功 1成 | 筑底成功 1成 |
 
 ### 1.5 市场情绪分类 —— `server/polars-engine.ts`
 
@@ -228,7 +234,7 @@ Phase 2: 四维评分计算（scoreStock()）
 ```
 1. 并发采集历史日线（Semaphore 12 → 24）
    ├─ 获取交易日历（sh000001 日线作为基准）
-   └─ 并发拉取每只股票 60+70 天真实日线（多源降级链路）
+   └─ 并发拉取每只股票「回测天数 + 70」天真实日线（多源降级链路）
    → 单事务持久化到 stock_daily_price / index_daily_price / historical_snapshot
 
 2. 回测时段涨停记录采集
@@ -304,6 +310,15 @@ Phase 2: 四维评分计算（scoreStock()）
 | 滑点 | 5bps | 买入上浮 0.05%，卖出下浮 0.05% |
 | 佣金 | 3bps | 最低 5 元 |
 | 印花税 | 5bps | 仅卖出时收取 |
+
+**因子加权**（`FactorWeights`，`backtest-engine.ts`）：回测对每个评分项叠加线性权重，组合权重在 `applyFactorWeights()` 中按 `× 权重/100` 缩放后排总分，搜索空间可在 `POST /api/backtest/run` 通过 `trend_weight_pct / volume_price_weight_pct / distance_from_low_weight_pct / volatility_weight_pct`（范围 1–100）覆盖，默认均为 100%：
+
+| 权重字段 | 默认 | 作用维度 |
+|----------|------|----------|
+| `trendWeightPct` | 100 | 维度 1：K 线趋势评分 |
+| `volumePriceWeightPct` | 100 | 维度 2：价量配合评分 |
+| `distanceFromLowWeightPct` | 100 | 维度 3：距 60 日低点评分 |
+| `volatilityTrendWeightPct` | 100 | 维度 4：波动率-趋势适配评分 |
 
 **回测主循环**：
 
@@ -386,7 +401,7 @@ for each date in 交易日:
 
 **核心接口**：`optimizeStrategyParams(history, { days? }) → ParamOptimizeResult`
 
-**输入**：与 `runPolarsBacktest` 相同的 `HistoricalMarketData`（可在 `/api/backtest/optimize` 接口传 `days`，默认 20，区间 5–60）。
+**输入**：与 `runPolarsBacktest` 相同的 `HistoricalMarketData`（可在 `/api/backtest/optimize` 接口传 `days`，默认 20，区间 5–750）。回测窗口长度与 MA60 等评分指标独立，指标预热由 `HISTORICAL_WARMUP_DAYS`（70 日）保证。
 
 **输出结构**（同时回传给前端 + 持久化到任务结果）：
 
@@ -454,6 +469,14 @@ POST /api/backtest/optimize?days=20&date=YYYYMMDD
      ├─ 0–55% ：marketService.ensureHistoricalCoverage()（必要时补采行情）
      ├─ 58%   ：「阶段1：优化 scoreStock 评分参数」
      └─ 90%   ：「阶段2：网格搜索回测交易参数」
+  → 完成后从 GET /api/tasks/:taskId.result 读取：
+     ├─ scoring.{config, scoreCorrelation, topBottomSpreadPct,
+     │           distanceBucketStats[], sweetSpotLabels[]}
+     ├─ optimized: { maxHoldDays, maxPositions, positionSizePct,
+     │               takeProfitPct, stopLossPct, trendWeightPct, ... }
+     ├─ validation:  { totalReturnPct, winRate, maxDrawdownPct, totalTrades }
+     ├─ baseline/beatBaseline/methodology
+     └─ 也可在 WebSocket `/ws/tasks` 收到 `type=task_progress` 实时进度
 ```
 
 **前端展示**（`src/pages/BacktestPage.tsx`）：
@@ -490,17 +513,31 @@ POST /api/backtest/optimize?days=20&date=YYYYMMDD
 | 阴跌不止 | 0成 |
 | 恐慌暴跌 | 0-1成 |
 
-**市场强弱判断**（`assessMarketTiming()`）：
+**市场强弱判断**（`assessMarketTiming()`，`server/paper-trading/helpers.ts`）：
 
 ```
-弱市条件（任一满足）：
-  1. 情绪 cold
-  2. 宽基指数中有处于恐慌/阴跌状态
-  3. 风险指数 ≥ 30% 且 风险指数 ≥ 偏强指数
+指数口径（默认生效，1–8 视为有效）：
+  - risk_indices    = state_id ∈ {6,7} 的指数数
+  - bullish_indices = state_id ∈ {1,2,3,8} 的指数数
+  - risk_threshold  = ceil(valid_indices × 0.3)
+
+有 marketAverageChange 时：
+  - 弱市 ← 上一交易日全市场平均涨幅 ≤ 0
+
+无 marketAverageChange 时：
+  - 弱市 ← 任一满足：
+       1. sentiment = cold
+       2. broadRiskIndices（宽基代码: sh000001/sz399001/sz399006/
+          sh000300/sh000905/sh000016/sh000688 中出现 6/7）> 0
+       3. valid_indices>0 && risk_indices ≥ risk_threshold
+                          && risk_indices ≥ bullish_indices
+  - 否则为强市，defaultReason 写入 overview.plan.market_reason
 
 强市 → 买入开盘执行、卖出临近收盘执行
 弱市 → 买入临近收盘执行、卖出开盘执行
 ```
+
+> `state_id=8`（筑底成功）被算作偏强指数；`state_id=0`（数据不足）会从有效统计中剔除。
 
 ### 4.2 交易计划构建 —— `buildExitSignals()` + `buildEntrySignals()`
 
@@ -554,12 +591,12 @@ PaperMarketContext
 
 ```typescript
 T1StrategyConfig {
-  maxHoldDays: 7,           // 最大持有天数
-  maxPositions: 5,         // 最大持仓数量
-  stopLossPct: -15,          // 止损线
-  takeProfitPct: 20,        // 止盈线
+  maxHoldDays: 5,           // 最大持有天数
+  maxPositions: 10,         // 最大持仓数量
+  stopLossPct: -5,          // 止损线
+  takeProfitPct: 15,        // 止盈线
   maxEntriesPerDay: 2,      // 每日最多新增持仓
-  positionSizePct: 20,      // 单票仓位比例
+  positionSizePct: 10,      // 单票仓位比例
   maxCandidates: 5,         // 排行榜候选数量
   lotSize: 100,             // 每手股数
   slippageRate: 0.0005,     // 滑点 5bps
@@ -568,6 +605,9 @@ T1StrategyConfig {
   stampTaxRate: 0.0005,     // 印花税 5bps（仅卖出）
 }
 ```
+
+> 上述默认值来自 `trading-strategy.ts` 的 `DEFAULT_T1_STRATEGY = Object.freeze(...)`。
+> `paper-trading.ts` 默认在 `maxEntriesPerDay` / `maxCandidates` 不显式传入时，会自动把"日新增上限"提到 `maxEntriesPerDay ≥ maxPositions`，"候选上限"提到 `max(maxCandidates, maxPositions*3)`，以保证实盘计划能补足目标仓位。
 
 **辅助函数**（`trading-strategy.ts`）：
 - `rankEntryCandidates(rows, excludedCodes, limit)` — 过滤 `accumulate`/`trade` 策略，按总分排序取前 N
@@ -596,22 +636,24 @@ T1StrategyConfig {
   ├─ 判断当前属于哪个窗口
   ├─ 检查该窗口是否已触发（completed_windows 记录）
   │
-  ├─ 开盘窗口:
+  ├─ 开盘窗口 (9:31 - 10:00):
   │     ├─ 读取账户 → 执行卖出信号
   │     └─ 如果市场强 → 执行买入信号
   │
-  ├─ 临收盘窗口:
+  ├─ 临收盘窗口 (14:55 - 15:00):
   │     └─ 如果市场弱 → 执行买入信号
   │
-  ├─ 收盘决策:
+  ├─ 收盘决策 (15:05+):
   │     └─ 生成下个交易日信号（卖出+买入）
   │
-  └─ 盘后核对:
+  └─ 盘后核对 (15:10+):
         └─ 清理过期信号 + 核对持仓
 
   非窗口时段:
     每 60 秒执行一次账户监控
     （仅交易时段 9:25-15:20）
+  │
+  └─ 任意窗口失败 → last_error 写回 state 并把自动化冷却 5 分钟重试
 ```
 
 ### 5.3 自动化状态持久化
