@@ -457,6 +457,75 @@ describe('Trending Polars API', () => {
       distance_from_low_weight_pct: 70,
       volatility_weight_pct: 100,
     });
+    expect(typeof result.body.config.scoring_config_json).toBe('string');
+  });
+
+  it('applies a saved backtest strategy to simulated trading', async () => {
+    const started = await http.post('/api/backtest/run?mode=current&days=10&max_hold_days=4&max_positions=6&position_size_pct=12&take_profit_pct=18&stop_loss_pct=6&date=20260722').expect(202);
+    const task = await waitForTask(started.body.task_id);
+    expect(task.status).toBe('completed');
+    const runId = task.result.run_id;
+    const applied = await http.post('/api/simulated-trading/strategy/apply-backtest').send({ run_id: runId }).expect(200);
+    expect(applied.body).toMatchObject({
+      ok: true,
+      run_id: runId,
+      strategy: {
+        maxHoldDays: 4,
+        maxPositions: 6,
+        positionSizePct: 12,
+        takeProfitPct: 18,
+        stopLossPct: -6,
+      },
+      plan: {
+        max_hold_days: 4,
+        max_positions: 6,
+        position_size_pct: 12,
+        take_profit_pct: 18,
+        stop_loss_pct: -6,
+      },
+      ranking: {
+        trendWeightPct: 100,
+        volumePriceWeightPct: 100,
+        distanceFromLowWeightPct: 100,
+        volatilityTrendWeightPct: 100,
+      },
+      ranking_recomputed: true,
+    });
+    const savedRankingConfig = await store.getRankingConfig();
+    expect(savedRankingConfig).toMatchObject({
+      applied_backtest_run_id: runId,
+      factor_weights: {
+        trendWeightPct: 100,
+        volumePriceWeightPct: 100,
+        distanceFromLowWeightPct: 100,
+        volatilityTrendWeightPct: 100,
+      },
+    });
+    const overview = await http.get('/api/simulated-trading/overview').expect(200);
+    expect(overview.body.plan).toMatchObject({
+      position_size_pct: 12,
+      max_positions: 6,
+      max_hold_days: 4,
+      stop_loss_pct: -6,
+      take_profit_pct: 18,
+    });
+    const bootstrap = await http.get('/api/simulated-trading/bootstrap').expect(200);
+    expect(bootstrap.body.overview.plan).toMatchObject({
+      position_size_pct: 12,
+      max_positions: 6,
+      max_hold_days: 4,
+      stop_loss_pct: -6,
+      take_profit_pct: 18,
+    });
+    const state = await http.get('/api/simulated-trading/state').expect(200);
+    expect(state.body.applied_backtest_run_id).toBe(runId);
+    expect(state.body.strategy_config).toMatchObject({
+      maxHoldDays: 4,
+      maxPositions: 6,
+      positionSizePct: 12,
+      takeProfitPct: 18,
+      stopLossPct: -6,
+    });
   });
 
   it('serves the simulated-trading page bootstrap without waiting for or querying Tonghuashun', async () => {

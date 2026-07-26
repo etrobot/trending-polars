@@ -1,18 +1,29 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowDown,
+  ArrowUp,
   CirclePause,
   CirclePlay,
   ClipboardCheck,
   RefreshCw,
   ShieldCheck,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { Modal } from '../components/Modal';
 import { PageHeaderActions } from '../components/HeaderActions';
 import { Button, EmptyState, LoadingPanel, Pagination, SectionHeading } from '../components/Ui';
 import { api, formatMoney, pctColor } from '../lib/api';
-import type { AutomationState, PaperOverview, PaperPlanHistoryItem, TradingWindow } from '../types';
+import type { AutomationState, BacktestListItem, PaperOverview, PaperPlanHistoryItem, TradingWindow } from '../types';
 
 const HISTORY_PAGE_SIZE = 15;
+const BACKTEST_HISTORY_PAGE_SIZE = 15;
+
+function historyItemTitle(item: BacktestListItem) {
+  if (item.mode === 'random' && (item.strategy_count ?? 1) > 1) {
+    return `随机组合 ${item.combo_index}/${item.strategy_count}`;
+  }
+  return item.mode === 'current' ? '当前方案' : '随机组合';
+}
 
 function historyStatusTone(status: string): string {
   if (status.includes('成交')) return 'text-green';
@@ -75,6 +86,14 @@ export function SimulatedTradingPage() {
   const [connected, setConnected] = useState(false);
   const [planTab, setPlanTab] = useState<'pending' | 'executed'>('pending');
   const [historyPage, setHistoryPage] = useState(1);
+  const [backtestHistoryOpen, setBacktestHistoryOpen] = useState(false);
+  const [backtestHistory, setBacktestHistory] = useState<BacktestListItem[]>([]);
+  const [backtestHistoryLoading, setBacktestHistoryLoading] = useState(false);
+  const [backtestHistoryPage, setBacktestHistoryPage] = useState(1);
+  const [backtestSortColumn, setBacktestSortColumn] = useState<'win_rate' | 'total_return_pct' | null>(null);
+  const [backtestSortDirection, setBacktestSortDirection] = useState<'asc' | 'desc'>('desc');
+  const [applyingBacktestRunId, setApplyingBacktestRunId] = useState('');
+  const [notice, setNotice] = useState('');
   const refreshInFlight = useRef<Promise<void> | null>(null);
 
   const loadBootstrap = useCallback(async () => {
@@ -110,6 +129,123 @@ export function SimulatedTradingPage() {
   useEffect(() => {
     void loadBootstrap().finally(() => refreshAccount());
   }, [loadBootstrap, refreshAccount]);
+
+  const loadBacktestHistory = useCallback(async () => {
+    setBacktestHistoryLoading(true);
+    try {
+      const items = await api<BacktestListItem[]>('/api/backtest/list');
+      console.log('[simulated-trading] backtest history loaded', items.length);
+      setBacktestHistory(items);
+      setError('');
+      return items;
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+      return [];
+    } finally {
+      setBacktestHistoryLoading(false);
+    }
+  }, []);
+
+  const openBacktestHistory = () => {
+    setBacktestHistoryPage(1);
+    setBacktestSortColumn(null);
+    setBacktestSortDirection('desc');
+    setBacktestHistoryOpen(true);
+    void loadBacktestHistory();
+  };
+
+  const closeBacktestHistory = () => {
+    setBacktestHistoryOpen(false);
+    setBacktestHistoryPage(1);
+    setApplyingBacktestRunId('');
+  };
+
+  const applyBacktestParams = async (runId: string) => {
+    setApplyingBacktestRunId(runId);
+    setError('');
+    try {
+      const applied = await api<{
+        ok: boolean;
+        run_id: string;
+        strategy: Record<string, number>;
+        plan: {
+          target_position_pct: number;
+          position_size_pct: number;
+          max_positions: number;
+          max_entries_per_day: number;
+          max_hold_days: number;
+          stop_loss_pct: number;
+          take_profit_pct: number;
+        };
+        ranking?: {
+          trendWeightPct: number;
+          volumePriceWeightPct: number;
+          distanceFromLowWeightPct: number;
+          volatilityTrendWeightPct: number;
+        };
+        ranking_recomputed?: boolean;
+        ranking_message?: string;
+      }>(
+        '/api/simulated-trading/strategy/apply-backtest',
+        { method: 'POST', body: JSON.stringify({ run_id: runId }) },
+      );
+      console.log('[simulated-trading] applied backtest params', applied);
+      const weights = applied.ranking;
+      const weightSummary = weights
+        ? `排行权重 趋势${weights.trendWeightPct}% 价量${weights.volumePriceWeightPct}% 距低点${weights.distanceFromLowWeightPct}% 波动${weights.volatilityTrendWeightPct}%`
+        : '';
+      setNotice(`已加载回测参数（${runId}）${weightSummary ? `；${weightSummary}` : ''}${applied.ranking_recomputed ? '；排行已重算' : applied.ranking_message ? `；${applied.ranking_message}` : ''}；退出规则 ${applied.plan.stop_loss_pct}% / +${applied.plan.take_profit_pct}% / ${applied.plan.max_hold_days}d`);
+      setBacktestHistoryOpen(false);
+      setOverview((prev) => (prev ? {
+        ...prev,
+        plan: {
+          ...prev.plan,
+          ...applied.plan,
+        },
+      } : prev));
+      await loadBootstrap();
+      setOverview((prev) => (prev ? {
+        ...prev,
+        plan: {
+          ...prev.plan,
+          ...applied.plan,
+        },
+      } : prev));
+    } catch (applyError) {
+      setError(applyError instanceof Error ? applyError.message : String(applyError));
+    } finally {
+      setApplyingBacktestRunId('');
+    }
+  };
+
+  const sortedBacktestHistory = useMemo(() => {
+    if (!backtestSortColumn) return backtestHistory;
+    return [...backtestHistory].sort((a, b) => {
+      const valA = a[backtestSortColumn];
+      const valB = b[backtestSortColumn];
+      return backtestSortDirection === 'asc' ? valA - valB : valB - valA;
+    });
+  }, [backtestHistory, backtestSortColumn, backtestSortDirection]);
+
+  const paginatedBacktestHistory = useMemo(() => {
+    const totalPages = Math.max(1, Math.ceil(sortedBacktestHistory.length / BACKTEST_HISTORY_PAGE_SIZE));
+    const safePage = Math.min(backtestHistoryPage, totalPages);
+    const offset = (safePage - 1) * BACKTEST_HISTORY_PAGE_SIZE;
+    return {
+      items: sortedBacktestHistory.slice(offset, offset + BACKTEST_HISTORY_PAGE_SIZE),
+      page: safePage,
+      totalPages,
+    };
+  }, [sortedBacktestHistory, backtestHistoryPage]);
+
+  const toggleBacktestSort = (column: 'win_rate' | 'total_return_pct') => {
+    if (backtestSortColumn === column) {
+      setBacktestSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setBacktestSortColumn(column);
+      setBacktestSortDirection('desc');
+    }
+  };
 
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -198,12 +334,14 @@ export function SimulatedTradingPage() {
         <Button variant="secondary" className="shrink-0 whitespace-nowrap" disabled={busy || !automation} onClick={() => void toggleAutomation()}>{automation?.enabled ? <CirclePause className="h-3.5 w-3.5" /> : <CirclePlay className="h-3.5 w-3.5" />}自动化：{automation?.enabled ? '开' : '关'}</Button>
         <Button variant="ghost" className="shrink-0 whitespace-nowrap" disabled={busy || !automation?.enabled} onClick={() => void pause()}>{automation?.paused_today ? '恢复今日' : '暂停今日'}</Button>
         <Button variant="secondary" className="shrink-0 whitespace-nowrap" disabled={connecting} onClick={() => void refreshAccount()}><RefreshCw className={`h-3.5 w-3.5 ${connecting ? 'animate-spin' : ''}`} />{connecting ? '同步中' : '刷新账户'}</Button>
+        <Button variant="ghost" className="shrink-0 whitespace-nowrap" disabled={busy} onClick={openBacktestHistory}><SlidersHorizontal className="h-3.5 w-3.5" />加载回测参数</Button>
         <Button variant="ghost" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} onClick={() => confirmWindow('post_close')}>盘后核对</Button>
         <Button variant="secondary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} onClick={() => confirmWindow('close')}><ClipboardCheck className="h-3.5 w-3.5" />收盘决策</Button>
         <Button variant="primary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} title="根据当前时间自动判断并执行对应窗口" onClick={() => confirmWindow('auto')}><ClipboardCheck className="h-3.5 w-3.5" />立即执行</Button>
       </PageHeaderActions>
       <div className="terminal-page">
       {error && <div className="border border-accent-red-soft bg-accent-red-soft px-3 py-2 text-[11px] leading-4 text-trading-up">{error}</div>}
+      {notice && <div className="border border-line bg-surface-elevated px-3 py-2 text-[11px] leading-4 text-ink">{notice}</div>}
       {!overview && <LoadingPanel label="页面已就绪，正在后台连接同花顺模拟账户…" />}
       {overview && account && plan && (
       <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_300px]">
@@ -251,19 +389,79 @@ export function SimulatedTradingPage() {
             ['单票仓位', `${plan.position_size_pct}%`],
             ['持仓上限', `${plan.max_positions} 只`],
             ['市场情绪', plan.sentiment === 'hot' ? '热' : plan.sentiment === 'normal' ? '中性' : '冷'],
-            ['待执行指令', `${plan.orders.length} 个`],
-            ['已执行计划', `${executedHistory.length} 条`],
-            ['策略日期', plan.ranking_date],
-            ['自动执行', automation?.next_window ?? '—'],
+            ['策略日期', plan.ranking_date]
           ].map(([label, value]) => <tr key={label}><td className="text-muted">{label}</td><td className="text-right font-mono text-ink">{value}</td></tr>)}</tbody></table></section>
 
-          <section className="panel p-3.5"><h2 className="font-display text-base text-ink">风控</h2><div className="mt-3 space-y-2">{[['成交时序', '行情好买开盘 / 卖临收盘；行情弱相反'], ['单票上限', `基准资金 ${plan.position_size_pct}%`], ['持仓上限', `${plan.max_positions} 只`], ['每日新增', `≤ ${plan.max_entries_per_day} 只`], ['退出规则', `-5 / +15 / ${plan.max_hold_days}d`], ['执行工具', '同花顺 AppleScript']].map(([label, detail]) => <div key={label} className="flex items-center justify-between border-b border-line-soft pb-1.5 text-[11px] last:border-0 last:pb-0"><span className="text-muted">{label}</span><span className="font-mono text-ink">{detail}</span></div>)}</div></section>
+          <section className="panel p-3.5"><h2 className="font-display text-base text-ink">风控</h2><div className="mt-3 space-y-2">{[['成交时序', '行情好买开盘 / 卖临收盘；行情弱相反'], ['单票上限', `基准资金 ${plan.position_size_pct}%`], ['持仓上限', `${plan.max_positions} 只`], ['每日新增', `≤ ${plan.max_entries_per_day} 只`], ['退出规则', `${plan.stop_loss_pct}% / +${plan.take_profit_pct}% / ${plan.max_hold_days}d`]].map(([label, detail]) => <div key={label} className="flex items-center justify-between border-b border-line-soft pb-1.5 text-[11px] last:border-0 last:pb-0"><span className="text-muted">{label}</span><span className="font-mono text-ink">{detail}</span></div>)}</div></section>
         </aside>
       </section>
       )}
 
       <Modal open={executeOpen} onClose={() => setExecuteOpen(false)} title={selectedWindow === 'auto' ? '确认立即执行' : selectedWindow === 'close' ? '确认运行收盘决策' : '确认运行盘后核对'} description={selectedWindow === 'auto' ? '系统将根据当前时间自动判断并执行对应窗口（开盘/临收盘/收盘决策/盘后核对）。' : 'Node.js 交易核心会运行所选策略窗口；AppleScript 仅查询和操作同花顺"模拟练习"。'}>
         <div className="space-y-3"><div className="flex justify-end gap-2"><Button variant="secondary" onClick={() => setExecuteOpen(false)}>取消</Button><Button variant="danger" disabled={busy} onClick={() => void execute()}>确认执行</Button></div></div>
+      </Modal>
+
+      <Modal
+        open={backtestHistoryOpen}
+        onClose={closeBacktestHistory}
+        title="回测历史"
+        description="选择一条回测记录，将其策略参数应用到模拟交易。"
+        width="max-w-4xl"
+      >
+        {backtestHistoryLoading ? (
+          <LoadingPanel label="正在读取回测历史…" />
+        ) : (
+          <div className="table-scroll border border-line">
+            <table className="data-table min-w-[820px]">
+              <thead>
+                <tr>
+                  <th>类型</th>
+                  <th>时间</th>
+                  <th>周期</th>
+                  <th className="cursor-pointer select-none text-right" onClick={() => toggleBacktestSort('total_return_pct')}>
+                    收益率
+                    {backtestSortColumn === 'total_return_pct' ? (backtestSortDirection === 'asc' ? <ArrowUp className="ml-0.5 inline-block h-3 w-3" /> : <ArrowDown className="ml-0.5 inline-block h-3 w-3" />) : null}
+                  </th>
+                  <th className="cursor-pointer select-none text-right" onClick={() => toggleBacktestSort('win_rate')}>
+                    胜率
+                    {backtestSortColumn === 'win_rate' ? (backtestSortDirection === 'asc' ? <ArrowUp className="ml-0.5 inline-block h-3 w-3" /> : <ArrowDown className="ml-0.5 inline-block h-3 w-3" />) : null}
+                  </th>
+                  <th className="text-right">交易</th>
+                  <th>参数</th>
+                  <th className="w-24"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {backtestHistory.length === 0 ? (
+                  <tr><td colSpan={8}><EmptyState title="暂无回测记录" description="请先在回测页运行一次策略回测。" /></td></tr>
+                ) : paginatedBacktestHistory.items.map((item) => (
+                  <tr key={item.run_id}>
+                    <td className="font-mono text-[11px] text-ink">{historyItemTitle(item)}</td>
+                    <td className="font-mono text-[11px] text-muted">{item.timestamp}</td>
+                    <td className="font-mono text-[11px] text-muted">{item.date_range}</td>
+                    <td className={`text-right font-mono text-[11px] ${pctColor(item.total_return_pct)}`}>{item.total_return_pct > 0 ? '+' : ''}{item.total_return_pct.toFixed(2)}%</td>
+                    <td className={`text-right font-mono text-[11px] ${pctColor(item.win_rate - 50)}`}>{item.win_rate.toFixed(1)}%</td>
+                    <td className="text-right font-mono text-[11px] text-muted">{item.total_trades}</td>
+                    <td className="font-mono text-[11px] text-muted">{[item.position_size_pct ? `${item.position_size_pct}%` : null, item.max_positions ? `${item.max_positions}只` : null, item.max_hold_days ? `${item.max_hold_days}天` : null].filter(Boolean).join(' ')}</td>
+                    <td className="w-24">
+                      <Button
+                        variant="secondary"
+                        className="h-7 px-2 text-[11px]"
+                        disabled={Boolean(applyingBacktestRunId)}
+                        onClick={() => void applyBacktestParams(item.run_id)}
+                      >
+                        {applyingBacktestRunId === item.run_id ? '应用中' : '应用'}
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {paginatedBacktestHistory.totalPages > 1 ? (
+              <Pagination page={paginatedBacktestHistory.page} pages={paginatedBacktestHistory.totalPages} onPage={setBacktestHistoryPage} />
+            ) : null}
+          </div>
+        )}
       </Modal>
       </div>
     </>

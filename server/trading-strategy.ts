@@ -41,6 +41,40 @@ export function createT1StrategyConfig(overrides: Partial<T1StrategyConfig> = {}
   };
 }
 
+export function strategyFromBacktestConfig(
+  config: Record<string, number | string | null | undefined>,
+): Partial<T1StrategyConfig> {
+  const overrides: Partial<T1StrategyConfig> = {};
+  const maxHoldDays = Number(config.max_hold_days);
+  const maxPositions = Number(config.max_positions);
+  const positionSizePct = Number(config.position_size_pct);
+  const takeProfitPct = Number(config.take_profit_pct);
+  const stopLossRaw = Number(config.stop_loss_pct);
+  const maxEntriesPerDay = Number(config.max_positions_per_day);
+
+  if (Number.isFinite(maxHoldDays) && maxHoldDays > 0) overrides.maxHoldDays = Math.trunc(maxHoldDays);
+  if (Number.isFinite(maxPositions) && maxPositions > 0) overrides.maxPositions = Math.trunc(maxPositions);
+  if (Number.isFinite(positionSizePct) && positionSizePct > 0) overrides.positionSizePct = Math.trunc(positionSizePct);
+  if (Number.isFinite(takeProfitPct) && takeProfitPct > 0) overrides.takeProfitPct = Math.trunc(takeProfitPct);
+  if (Number.isFinite(stopLossRaw) && stopLossRaw !== 0) {
+    overrides.stopLossPct = stopLossRaw > 0 ? -Math.abs(Math.trunc(stopLossRaw)) : Math.trunc(stopLossRaw);
+  }
+  if (Number.isFinite(maxEntriesPerDay) && maxEntriesPerDay > 0) overrides.maxEntriesPerDay = Math.trunc(maxEntriesPerDay);
+  return overrides;
+}
+
+export function serializeStrategyConfig(config: T1StrategyConfig) {
+  return {
+    maxHoldDays: config.maxHoldDays,
+    maxPositions: config.maxPositions,
+    stopLossPct: config.stopLossPct,
+    takeProfitPct: config.takeProfitPct,
+    maxEntriesPerDay: config.maxEntriesPerDay,
+    positionSizePct: config.positionSizePct,
+    maxCandidates: config.maxCandidates,
+  };
+}
+
 export function rankEntryCandidates(
   rows: RankingRow[],
   excludedCodes: ReadonlySet<string> = new Set(),

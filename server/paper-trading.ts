@@ -22,6 +22,8 @@ import {
   DEFAULT_T1_STRATEGY,
   exitSignalReason,
   rankEntryCandidates,
+  serializeStrategyConfig,
+  strategyFromBacktestConfig,
   tradingDayDistance,
   type T1StrategyConfig,
 } from './trading-strategy.js';
@@ -71,7 +73,8 @@ export class PaperTradingService extends EventEmitter {
   private monitorRetryAfter = 0;
   private lastMonitorAt = 0;
   private readonly stateStore: PaperTradingStateStore;
-  private readonly strategy: T1StrategyConfig;
+  private strategy: T1StrategyConfig;
+  private strategyHydratedFromState = false;
   private readonly now: () => Date;
   private readonly schedulerIntervalMs: number;
   private readonly accountMonitorIntervalMs: number;
@@ -125,6 +128,54 @@ export class PaperTradingService extends EventEmitter {
 
   async getRuntimeState(): Promise<PaperTradingRuntimeState> {
     return structuredClone(await this.getState());
+  }
+
+  applyBacktestStrategy(
+    runId: string,
+    config: Record<string, number | string | null | undefined>,
+    traceId: string = randomUUID(),
+  ) {
+    return this.exclusive(async () => {
+      const overrides = strategyFromBacktestConfig(config);
+      if (!Object.keys(overrides).length) {
+        throw new Error('回测记录中没有可应用的策略参数');
+      }
+      const maxPositions = Math.max(
+        1,
+        Math.trunc(overrides.maxPositions ?? this.strategy.maxPositions),
+      );
+      this.strategy = createT1StrategyConfig({
+        ...this.strategy,
+        ...overrides,
+        maxEntriesPerDay: overrides.maxEntriesPerDay
+          ?? Math.max(DEFAULT_T1_STRATEGY.maxEntriesPerDay, maxPositions),
+        maxCandidates: Math.max(this.strategy.maxCandidates, maxPositions * 3),
+      });
+      const state = await this.getState();
+      state.strategy_config = serializeStrategyConfig(this.strategy);
+      state.applied_backtest_run_id = runId;
+      this.recordEvent(state, 'system', 'strategy_applied', `已加载回测参数 ${runId}`);
+      await this.persist(state);
+      const activeStrategy = this.resolveActiveStrategy(state);
+      const plan = this.planStrategyFields(activeStrategy);
+      console.log('[paper] applied backtest strategy', {
+        run_id: runId,
+        strategy: state.strategy_config,
+        plan,
+      });
+      await this.audit.info('paper_trading', 'strategy_applied_from_backtest', {
+        traceId,
+        data: { run_id: runId, strategy: state.strategy_config, plan },
+      });
+      const payload = {
+        ok: true,
+        run_id: runId,
+        strategy: state.strategy_config,
+        plan,
+      };
+      this.broadcast('status', payload);
+      return payload;
+    });
   }
 
   toggle(enabled: boolean, traceId: string = randomUUID()) {
@@ -435,12 +486,35 @@ export class PaperTradingService extends EventEmitter {
     });
   }
 
+  private resolveActiveStrategy(state: PaperTradingRuntimeState): T1StrategyConfig {
+    if (!state.strategy_config) return this.strategy;
+    const maxPositions = Math.max(1, Math.trunc(state.strategy_config.maxPositions));
+    return createT1StrategyConfig({
+      ...this.strategy,
+      ...state.strategy_config,
+      maxCandidates: Math.max(state.strategy_config.maxCandidates, maxPositions * 3),
+    });
+  }
+
+  private planStrategyFields(strategy: T1StrategyConfig) {
+    return {
+      target_position_pct: Math.min(100, strategy.maxPositions * strategy.positionSizePct),
+      position_size_pct: strategy.positionSizePct,
+      max_positions: strategy.maxPositions,
+      max_entries_per_day: strategy.maxEntriesPerDay,
+      max_hold_days: strategy.maxHoldDays,
+      stop_loss_pct: strategy.stopLossPct,
+      take_profit_pct: strategy.takeProfitPct,
+    };
+  }
+
   private composeOverview(
     state: PaperTradingRuntimeState,
     snapshot: SimulatedAccountSnapshot,
     context: PaperMarketContext,
     connection: PaperOverview['connection'],
   ): PaperOverview {
+    const strategy = this.resolveActiveStrategy(state);
     const clock = shanghaiClock(this.now());
     const timing = assessMarketTiming(context);
     const totalMarketValue = round(snapshot.positions.reduce((sum, item) => sum + item.market_value, 0), 2);
@@ -486,16 +560,12 @@ export class PaperTradingService extends EventEmitter {
         pnl_summary: { amount: pnlAmount, pct: costBasis ? round(pnlAmount / costBasis * 100, 2) : 0 },
       },
       plan: {
-        target_position_pct: Math.min(100, this.strategy.maxPositions * this.strategy.positionSizePct),
-        position_size_pct: this.strategy.positionSizePct,
-        max_positions: this.strategy.maxPositions,
-        max_entries_per_day: this.strategy.maxEntriesPerDay,
-        max_hold_days: this.strategy.maxHoldDays,
+        ...this.planStrategyFields(strategy),
         engine_version: PAPER_ENGINE_VERSION,
         methodology: '当日收盘生成信号；行情好时次日开盘买入、临近收盘卖出，行情不好时开盘卖出、临近收盘买入；策略判断全部由 Node.js 完成，AppleScript 只负责同花顺模拟账户查询与委托执行。',
         sentiment: timing.sentiment,
         ranking_date: context.rankingDate,
-        market_reason: `当前行情${timing.weak ? '偏弱（卖出开盘、买入临收盘）' : '可交易（买入开盘、卖出临收盘）'}；${timing.reason}。最多持仓 ${this.strategy.maxPositions} 只、单票 ${this.strategy.positionSizePct}%、每日最多新增 ${this.strategy.maxEntriesPerDay} 只、止损 ${this.strategy.stopLossPct}%、止盈 +${this.strategy.takeProfitPct}%、最长持有 ${this.strategy.maxHoldDays} 个交易日。`,
+        market_reason: `当前行情${timing.weak ? '偏弱（卖出开盘、买入临收盘）' : '可交易（买入开盘、卖出临收盘）'}；${timing.reason}。最多持仓 ${strategy.maxPositions} 只、单票 ${strategy.positionSizePct}%、每日最多新增 ${strategy.maxEntriesPerDay} 只、止损 ${strategy.stopLossPct}%、止盈 +${strategy.takeProfitPct}%、最长持有 ${strategy.maxHoldDays} 个交易日。`,
         orders: planOrders,
         history,
         skipped,
@@ -1293,12 +1363,22 @@ export class PaperTradingService extends EventEmitter {
     return this.marketDataProvider(window, traceId);
   }
 
+  private hydrateStrategyFromState(stored: PaperTradingRuntimeState) {
+    if (!stored.strategy_config) return;
+    this.strategy = this.resolveActiveStrategy(stored);
+    this.strategyHydratedFromState = true;
+    console.log('[paper] restored strategy from state', {
+      run_id: stored.applied_backtest_run_id ?? null,
+      strategy: stored.strategy_config,
+    });
+  }
+
   private getState(): Promise<PaperTradingRuntimeState> {
     if (!this.statePromise) {
       this.statePromise = this.stateStore.load().then((stored) => {
         const timestamp = shanghaiClock(this.now()).timestamp;
         if (!stored || stored.schema_version !== 1) return defaultState(timestamp);
-        return {
+        const state = {
           ...defaultState(timestamp),
           ...stored,
           engine_version: PAPER_ENGINE_VERSION,
@@ -1310,6 +1390,8 @@ export class PaperTradingService extends EventEmitter {
           tracked_positions: stored.tracked_positions ?? [],
           events: stored.events ?? [],
         };
+        this.hydrateStrategyFromState(state);
+        return state;
       });
     }
     return this.statePromise;

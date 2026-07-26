@@ -3,13 +3,14 @@ import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import type { AnalysisData } from '../../src/types.js';
 import { guardDetachedPromise, type AuditLevel, type AuditLoggerLike } from '../audit-log.js';
-import { runPolarsBacktest, runRandomizedBacktest, sectorTrendLookupMap } from '../backtest-engine.js';
+import { runPolarsBacktest, runRandomizedBacktest } from '../backtest-engine.js';
 import { optimizeStrategyParams } from '../backtest-param-optimizer.js';
 import { fetchSohuIndexKlines, buildBenchmarkCurve } from '../benchmark.js';
 import { compactDate, formatDateTime, round } from '../format.js';
 import { fetchAdjustedKlines, fetchBlockKlines, MAX_BACKTEST_DAYS, MIN_BACKTEST_DAYS, type BlockKlinePeriod } from '../historical-market.js';
 import { queryRankings } from '../polars-engine.js';
 import { normalizeScoreStockConfig } from '../scoring-engine.js';
+import { rankingConfigFromBacktest } from '../ranking-config.js';
 import type { TaskRegistry } from '../tasks.js';
 import { ThsSimulatedBrokerError } from '../ths-simulated-broker.js';
 import { MarketService, analysisWithStats, priceRows, averageRankingChange } from './market-service.js';
@@ -262,56 +263,13 @@ export function registerRoutes(
     const task = tasks.start('ranking_compute', '计算多因子排行榜', async ({ progress, cancelled, traceId }) => {
       const source = await store.getRankingUniverse();
       if (!source.rankings.length) throw new Error('当前股票池为空，无法获取个股行情并计算排行');
-      await audit.info('factor_ranking', 'ranking_started', {
-        traceId,
-        data: { requested_date: requestedDate, source_date: source.date, source_timestamp: source.timestamp, rows: source.rankings.length },
-      });
-      const prepared = await marketService.ensureHistoricalCoverage({
-        rankings: source.rankings,
+      return marketService.computeAndSaveRanking({
+        requestedDate,
         days,
-        asOfDate: requestedDate,
         traceId,
         cancelled,
-        progress: (value, message) => progress(value * 0.72, message),
+        progress,
       });
-      if (cancelled()) return null;
-      progress(76, `按 ${prepared.history.as_of_date} 行情计算截面因子`);
-      const sectorTrendsByCode = await marketService.enrichSectorTrends(
-          sectorTrendLookupMap(await store.getSectorTrendsForDate(prepared.history.as_of_date)),
-          source.rankings,
-          prepared.history.as_of_date,
-        );
-        const rankings = historicalCrossSectionRankings(
-        prepared.history,
-        prepared.history.as_of_date,
-        source.rankings,
-        sectorTrendsByCode,
-      );
-      if (!rankings.length) throw new Error(`${prepared.history.as_of_date} 行情不足，无法生成截面排行`);
-      const computed = {
-        timestamp: formatDateTime(),
-        date: prepared.history.as_of_date,
-        total_stocks: rankings.length,
-        rankings,
-      };
-      progress(90, '保存策略分层与全市场排名');
-      await store.saveRanking(computed);
-      await audit.info('factor_ranking', 'ranking_completed', {
-        traceId,
-        data: {
-          ranking_date: computed.date,
-          total_stocks: computed.total_stocks,
-          top_rankings: computed.rankings.slice(0, 50),
-          database: store.databasePath,
-          tables: ['ranking_factor', 'stock_ranking'],
-        },
-      });
-      return {
-        date: computed.date,
-        total_stocks: computed.total_stocks,
-        collected: prepared.collected,
-        message: `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成 ${computed.date} 截面排行（${computed.total_stocks} 只）`,
-      };
     });
     response.status(202).json({ task_id: task.id, status: 'started', message: '排行计算已启动' });
   }));
@@ -737,6 +695,52 @@ export function registerRoutes(
         error,
       });
       response.status(error instanceof ThsSimulatedBrokerError ? 409 : 400).json({ ok: false, error: error instanceof Error ? error.message : String(error) });
+    }
+  }));
+
+  app.post('/api/simulated-trading/strategy/apply-backtest', asyncHandler(async (request, response) => {
+    const runId = String(request.body?.run_id ?? '').trim();
+    if (!runId) {
+      response.status(400).json({ ok: false, error: 'run_id 不能为空' });
+      return;
+    }
+    const backtest = await store.getBacktest(runId);
+    if (!backtest) {
+      response.status(404).json({ ok: false, error: '回测记录不存在', run_id: runId });
+      return;
+    }
+    const traceId = String(response.locals.traceId);
+    try {
+      const applied = await paper.applyBacktestStrategy(runId, backtest.config, traceId);
+      const rankingConfig = rankingConfigFromBacktest(runId, backtest.config);
+      await store.saveRankingConfig(rankingConfig);
+      console.log('[paper] saved ranking config from backtest', {
+        run_id: runId,
+        factor_weights: rankingConfig.factor_weights,
+        has_custom_scoring: Boolean(backtest.config.scoring_config_json),
+      });
+      const source = await store.getRankingUniverse();
+      let ranking: Awaited<ReturnType<MarketService['computeAndSaveRanking']>> | null = null;
+      if (source.rankings.length) {
+        ranking = await marketService.computeAndSaveRanking({
+          requestedDate: source.date,
+          traceId,
+          rankingConfig,
+        });
+      }
+      response.json({
+        ...applied,
+        ranking: rankingConfig.factor_weights,
+        ranking_recomputed: Boolean(ranking),
+        ranking_message: ranking?.message ?? '股票池为空，排行参数已保存但未重算',
+      });
+    } catch (error) {
+      await audit.error('paper_trading', 'apply_backtest_strategy_failed', {
+        traceId,
+        data: { run_id: runId },
+        error,
+      });
+      response.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) });
     }
   }));
 

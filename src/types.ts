@@ -276,6 +276,8 @@ export interface PaperOverview {
     max_positions: number;
     max_entries_per_day: number;
     max_hold_days: number;
+    stop_loss_pct: number;
+    take_profit_pct: number;
     engine_version: string;
     methodology: string;
     sentiment: string;
@@ -347,6 +349,16 @@ export interface PaperAccountObservation {
   orders: PaperOrder[];
 }
 
+export interface PaperStrategyConfigSnapshot {
+  maxHoldDays: number;
+  maxPositions: number;
+  stopLossPct: number;
+  takeProfitPct: number;
+  maxEntriesPerDay: number;
+  positionSizePct: number;
+  maxCandidates: number;
+}
+
 export interface PaperTradingRuntimeState {
   schema_version: 1;
   engine_version: string;
@@ -358,5 +370,7 @@ export interface PaperTradingRuntimeState {
   last_account_observation?: PaperAccountObservation;
   events: PaperTradingEvent[];
   last_signal_date?: string;
+  strategy_config?: PaperStrategyConfigSnapshot;
+  applied_backtest_run_id?: string;
   updated_at: string;
 }

@@ -75,12 +75,15 @@ interface FactorWeights {
   volatilityTrendWeightPct: number;
 }
 
+export type { FactorWeights };
+
 interface BacktestRunMeta {
   mode: 'current' | 'random';
   batchSize?: number;
   comboIndex?: number;
   batchRunId?: string;
   factorWeights?: FactorWeights;
+  scoringConfig?: ScoreStockConfig;
   bounds?: {
     maxHoldDays: number;
     maxPositions: number;
@@ -103,6 +106,8 @@ const DEFAULT_FACTOR_WEIGHTS: FactorWeights = {
   volatilityTrendWeightPct: 100,
 };
 
+export { DEFAULT_FACTOR_WEIGHTS };
+
 function normalizeFactorWeights(weights?: Partial<FactorWeights>): FactorWeights {
   return {
     trendWeightPct: Math.min(100, Math.max(1, Math.trunc(weights?.trendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.trendWeightPct))),
@@ -111,6 +116,8 @@ function normalizeFactorWeights(weights?: Partial<FactorWeights>): FactorWeights
     volatilityTrendWeightPct: Math.min(100, Math.max(1, Math.trunc(weights?.volatilityTrendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct))),
   };
 }
+
+export { normalizeFactorWeights };
 
 function applyFactorWeights(rows: RankingRow[], weights: FactorWeights): RankingRow[] {
   const trendMul = weights.trendWeightPct / 100;
@@ -210,12 +217,20 @@ function sectorContextForRanking(
 }
 
 /** Build the complete as-of-date cross section from persisted K lines. */
+export interface CrossSectionRankingOptions {
+  scoringConfig?: ScoreStockConfig;
+  factorWeights?: FactorWeights;
+}
+
 export function historicalCrossSectionRankings(
   history: HistoricalMarketData,
   date: string,
   previousRows: RankingRow[] = [],
   sectorTrendsByCode: Map<string, SectorTrendLookup> = new Map(),
+  options: CrossSectionRankingOptions = {},
 ): RankingRow[] {
+  const scoringConfig = options.scoringConfig ?? DEFAULT_SCORE_STOCK_CONFIG;
+  const factorWeights = options.factorWeights ?? DEFAULT_FACTOR_WEIGHTS;
   const targetDate = date.replaceAll('-', '').slice(0, 8);
   const previousByCode = new Map(previousRows.map((row) => [row.stock_code, row]));
   const exactLimitUpDates = limitUpDatesByCode(history);
@@ -225,6 +240,7 @@ export function historicalCrossSectionRankings(
       prepareSeries(stock),
       targetDate,
       sectorContextForRanking(previous, sectorTrendsByCode, exactLimitUpDates.get(stock.stock_code)),
+      scoringConfig,
     );
     if (!row) return [];
     return [{
@@ -234,9 +250,10 @@ export function historicalCrossSectionRankings(
       reason_info: previous?.reason_info,
     }];
   });
-  return scored
+  const ranked = scored
     .sort((left, right) => right.total_score - left.total_score || left.stock_code.localeCompare(right.stock_code))
     .map((row, index) => ({ ...row, rank: index + 1 }));
+  return applyFactorWeights(ranked, factorWeights);
 }
 
 export function historicalStrategyCandidates(history: HistoricalMarketData, date: string): RankingRow[] {
@@ -564,6 +581,7 @@ function buildResult(
       slippage_bps: strategy.slippageRate * 10_000,
       commission_bps: strategy.commissionRate * 10_000,
       stamp_tax_bps: strategy.stampTaxRate * 10_000,
+      scoring_config_json: meta?.scoringConfig ? JSON.stringify(meta.scoringConfig) : null,
     },
     trades: simulation.trades,
     equity_curve: simulation.equityCurve,
@@ -621,6 +639,7 @@ export function runPolarsBacktest(
     batchSize: 1,
     comboIndex: 1,
     factorWeights,
+    scoringConfig,
   });
 }
 
@@ -721,6 +740,7 @@ export function runRandomizedBacktest(
       batchRunId,
       bounds,
       factorWeights,
+      scoringConfig,
     }));
     console.log('[backtest] random combo done', {
       combo_index: index + 1,

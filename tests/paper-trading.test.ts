@@ -642,4 +642,54 @@ describe('Node T+1 paper-trading core', () => {
     expect(audit.records.some((record) => record.event === 'previous_close_plan_backfilled')).toBe(false);
     expect(audit.records.some((record) => record.event === 'account_only_sync')).toBe(true);
   });
+
+  it('applies backtest strategy parameters and persists them in runtime state', async () => {
+    const stateStore = new TestStateStore();
+    const audit = new RecordingAudit();
+    const service = new PaperTradingService(new FlowBroker(), {
+      stateStore,
+      audit,
+      now: () => new Date('2026-07-24T10:00:00+08:00'),
+    });
+
+    const applied = await service.applyBacktestStrategy('test-run-001', {
+      max_hold_days: 7,
+      max_positions: 4,
+      position_size_pct: 15,
+      take_profit_pct: 20,
+      stop_loss_pct: -8,
+      max_positions_per_day: 2,
+    }, 'trace-apply');
+
+    expect(applied).toMatchObject({
+      ok: true,
+      run_id: 'test-run-001',
+      strategy: {
+        maxHoldDays: 7,
+        maxPositions: 4,
+        positionSizePct: 15,
+        takeProfitPct: 20,
+        stopLossPct: -8,
+        maxEntriesPerDay: 2,
+      },
+      plan: {
+        max_hold_days: 7,
+        max_positions: 4,
+        position_size_pct: 15,
+        take_profit_pct: 20,
+        stop_loss_pct: -8,
+        max_entries_per_day: 2,
+      },
+    });
+    expect(stateStore.state?.applied_backtest_run_id).toBe('test-run-001');
+    expect(stateStore.state?.strategy_config).toMatchObject({
+      maxHoldDays: 7,
+      maxPositions: 4,
+      positionSizePct: 15,
+      takeProfitPct: 20,
+      stopLossPct: -8,
+      maxEntriesPerDay: 2,
+    });
+    expect(audit.records.some((record) => record.event === 'strategy_applied_from_backtest')).toBe(true);
+  });
 });

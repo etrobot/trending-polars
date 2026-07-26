@@ -12,6 +12,7 @@ import type {
 } from '../src/types.js';
 import type { HistoricalMarketData, KLineData } from './historical-market.js';
 import type { ParamOptimizeResult } from './backtest-param-optimizer.js';
+import type { RankingRuntimeConfig } from './ranking-config.js';
 import { formatDateTime } from './format.js';
 import {
   SqliteStore,
@@ -358,6 +359,19 @@ export class DataStore {
   async loadOptimizeResult(): Promise<ParamOptimizeResult | null> {
     try {
       return await readJson<ParamOptimizeResult>(path.join(this.runtime, 'optimize-result.json'));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+      throw error;
+    }
+  }
+
+  saveRankingConfig(config: RankingRuntimeConfig): Promise<void> {
+    return writeJson(path.join(this.runtime, 'ranking-config.json'), config);
+  }
+
+  async getRankingConfig(): Promise<RankingRuntimeConfig | null> {
+    try {
+      return await readJson<RankingRuntimeConfig>(path.join(this.runtime, 'ranking-config.json'));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw error;

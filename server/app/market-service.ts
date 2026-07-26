@@ -21,6 +21,7 @@ import { resolveLatestTradingDate } from '../index-bootstrap.js';
 import { queryRankings, refreshAnalysis } from '../polars-engine.js';
 import { analyzeBlockTrend, blockStrategy, classifyMarketState, klinesToBars } from '../scoring-engine.js';
 import type { DataStore } from '../data-store.js';
+import { defaultRankingRuntimeConfig, type RankingRuntimeConfig } from '../ranking-config.js';
 
 // ---------------------------------------------------------------------------
 // Reusable helpers
@@ -488,6 +489,91 @@ export class MarketService {
       if (trend) sectorTrendsByCode.set(code, trend);
     });
     return sectorTrendsByCode;
+  }
+
+  async computeAndSaveRanking(options: {
+    requestedDate: string;
+    days?: number;
+    traceId: string;
+    rankingConfig?: RankingRuntimeConfig | null;
+    cancelled?: () => boolean;
+    progress?: (value: number, message: string) => void;
+  }) {
+    const days = normalizeBacktestDays(options.days ?? 20);
+    const source = await this.store.getRankingUniverse();
+    if (!source.rankings.length) throw new Error('当前股票池为空，无法获取个股行情并计算排行');
+    const rankingConfig = options.rankingConfig ?? await this.store.getRankingConfig() ?? defaultRankingRuntimeConfig();
+    console.log('[ranking] compute started', {
+      requested_date: options.requestedDate,
+      source_date: source.date,
+      rows: source.rankings.length,
+      factor_weights: rankingConfig.factor_weights,
+      applied_backtest_run_id: rankingConfig.applied_backtest_run_id ?? null,
+    });
+    await this.audit.info('factor_ranking', 'ranking_started', {
+      traceId: options.traceId,
+      data: {
+        requested_date: options.requestedDate,
+        source_date: source.date,
+        source_timestamp: source.timestamp,
+        rows: source.rankings.length,
+        factor_weights: rankingConfig.factor_weights,
+        applied_backtest_run_id: rankingConfig.applied_backtest_run_id ?? null,
+      },
+    });
+    const prepared = await this.ensureHistoricalCoverage({
+      rankings: source.rankings,
+      days,
+      asOfDate: options.requestedDate,
+      traceId: options.traceId,
+      cancelled: options.cancelled ?? (() => false),
+      progress: (value, message) => options.progress?.(value * 0.72, message),
+    });
+    if (options.cancelled?.()) return null;
+    options.progress?.(76, `按 ${prepared.history.as_of_date} 行情计算截面因子`);
+    const sectorTrendsByCode = await this.enrichSectorTrends(
+      sectorTrendLookupMap(await this.store.getSectorTrendsForDate(prepared.history.as_of_date)),
+      source.rankings,
+      prepared.history.as_of_date,
+    );
+    const rankings = historicalCrossSectionRankings(
+      prepared.history,
+      prepared.history.as_of_date,
+      source.rankings,
+      sectorTrendsByCode,
+      {
+        scoringConfig: rankingConfig.scoring_config,
+        factorWeights: rankingConfig.factor_weights,
+      },
+    );
+    if (!rankings.length) throw new Error(`${prepared.history.as_of_date} 行情不足，无法生成截面排行`);
+    const computed = {
+      timestamp: formatDateTime(),
+      date: prepared.history.as_of_date,
+      total_stocks: rankings.length,
+      rankings,
+    };
+    options.progress?.(90, '保存策略分层与全市场排名');
+    await this.store.saveRanking(computed);
+    await this.audit.info('factor_ranking', 'ranking_completed', {
+      traceId: options.traceId,
+      data: {
+        ranking_date: computed.date,
+        total_stocks: computed.total_stocks,
+        top_rankings: computed.rankings.slice(0, 50),
+        factor_weights: rankingConfig.factor_weights,
+        applied_backtest_run_id: rankingConfig.applied_backtest_run_id ?? null,
+        database: this.store.databasePath,
+        tables: ['ranking_factor', 'stock_ranking'],
+      },
+    });
+    return {
+      date: computed.date,
+      total_stocks: computed.total_stocks,
+      collected: prepared.collected,
+      factor_weights: rankingConfig.factor_weights,
+      message: `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成 ${computed.date} 截面排行（${computed.total_stocks} 只）`,
+    };
   }
 
   async loadPaperContextFromStore(traceId: string = randomUUID()) {
