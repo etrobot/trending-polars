@@ -185,6 +185,27 @@
 
 写入时在一个事务内完成股票/板块基础信息、KV 因子和冗余排行表的批量写入。读取优先从 `ranking_factor` 重建结果，按 `total_score` 动态排名；若因子表为空才降级读取 `stock_ranking`。旧版 `ranking.json` 会在数据库为空时自动导入一次。
 
+### 3.1 排行运行时配置 —— `server/ranking-config.ts`
+
+排行计算支持从回测优化结果回填因子权重和评分配置，持久化为 `data/runtime/ranking-config.json`。
+
+**结构**（`RankingRuntimeConfig`）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `factor_weights` | `FactorWeights` | 四维因子权重（`trendWeightPct` / `volumePriceWeightPct` / `distanceFromLowWeightPct` / `volatilityTrendWeightPct`） |
+| `scoring_config` | `ScoreStockConfig` | 评分参数配置（距低点分档阈值、趋势参数、波动率矩阵） |
+| `applied_backtest_run_id` | string? | 来源回测 run_id，便于溯源 |
+| `updated_at` | string | 更新时间戳 |
+
+**来源优先级**：`POST /api/ranking/compute` 显式传入 > `ranking-config.json` 已保存配置 > `defaultRankingRuntimeConfig()`（默认权重 + 默认评分配置）。
+
+**写入时机**：`POST /api/simulated-trading/strategy/apply-backtest` 同时保存排行配置和策略参数，并触发排行重算。
+
+### 3.2 优化结果持久化
+
+`data/runtime/optimize-result.json` 保存最近一次参数优化完整结果（`ParamOptimizeResult`），可通过 `GET /api/backtest/optimize-result` 读取。内容包含阶段 1 评分配置、阶段 2 交易参数、验证指标、基线对比等（详见 `logic.md` §3.4 输出结构）。
+
 ---
 
 ## 4. SQLite 运维

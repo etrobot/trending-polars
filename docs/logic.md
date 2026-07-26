@@ -498,8 +498,26 @@ POST /api/backtest/optimize?days=20&date=YYYYMMDD
 |------|------|------|
 | 缓存分析结果 | `server/data/runtime/analysis.json` | 指数仓位建议 |
 | 排行榜 | `server/data/trending.db`：`ranking_factor` + `stock_ranking` | 选股标的；`runtime/ranking.json` 仅作最新缓存 |
+| 排行配置 | `server/data/runtime/ranking-config.json` | 因子权重 + 评分配置（可从回测优化回填） |
 | 市场情绪 | `analysis.json` 中的 sentiment | 买卖门控 |
 | 历史行情快照 | `server/data/trending.db`：`stock_daily_price` + `index_daily_price` + `historical_snapshot` | 收盘决策时重排行（`historicalStrategyCandidates()`） |
+
+**排行配置来源链**（`MarketService.computeAndSaveRanking()`）：
+
+```
+POST /api/ranking/compute 显式传入 rankingConfig
+  │
+  ├─ 有 → 使用传入配置
+  └─ 无 → 读取 data/runtime/ranking-config.json
+           │
+           ├─ 有 → 使用已保存配置（含因子权重 + 评分配置 + 回测来源 run_id）
+           └─ 无 → defaultRankingRuntimeConfig()（默认权重 + 默认评分配置）
+```
+
+`POST /api/simulated-trading/strategy/apply-backtest` 会同时：
+1. 调用 `paper.applyBacktestStrategy()` 将回测交易参数写入模拟交易策略
+2. 调用 `rankingConfigFromBacktest()` 提取因子权重 + 评分配置 → `saveRankingConfig()`
+3. 若股票池非空，调用 `computeAndSaveRanking()` 按新配置重算截面排行
 
 **大盘指数仓位映射**（`assessMarketTiming()` 在 `paper-trading.ts`）：
 

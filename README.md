@@ -47,16 +47,18 @@ trending-polars/
 ├── server/               # 后端服务
 │   ├── app.ts           # 入口：装载服务、注册路由、错误处理
 │   ├── app/             # 应用拆分后的子模块
-│   │   ├── market-service.ts   # 市场采集 / 行情覆盖 / PaperTrading 上下文
+│   │   ├── market-service.ts   # 市场采集 / 行情覆盖 / PaperTrading 上下文 / 排行计算
 │   │   └── routes.ts           # 所有 /api/* 路由注册
-│   ├── index.ts         # HTTP + WebSocket 启动入口
+│   ├── index.ts         # HTTP + WebSocket 启动入口；启动时补全上证指数历史
+│   ├── index-bootstrap.ts      # 上证指数历史补全 / 交易日历解析 / resolveLatestTradingDate
 │   ├── scoring-engine.ts        # 四维评分 + 0/1–8 状态分类 + 板块策略矩阵
 │   ├── polars-engine.ts         # 排行榜查询 / 排序 / 情绪聚合
+│   ├── ranking-config.ts        # RankingRuntimeConfig：因子权重 + 评分配置 + 回测来源
 │   ├── backtest-engine.ts       # 回测引擎（日内循环）+ prepareBacktestContext / quickSimulateBacktest
 │   ├── backtest-scoring.ts      # 向量化评分预计算（Polars 单次遍历）
 │   ├── backtest-param-optimizer.ts  # 两阶段参数优化（评分 + 交易参数）
 │   ├── benchmark.ts             # 基准指数对照曲线（搜狐数据源）
-│   ├── paper-trading.ts         # 模拟交易：计划 / 执行 / 调度 / 监控
+│   ├── paper-trading.ts         # 模拟交易：计划 / 执行 / 调度 / 监控 / applyBacktestStrategy
 │   ├── paper-trading/helpers.ts # 时钟、判断、状态机纯函数
 │   ├── trading-strategy.ts      # 选股 / 仓位 / 止盈止损
 │   ├── historical-market.ts     # 行情采集
@@ -64,7 +66,7 @@ trending-polars/
 │   ├── audit-log.ts             # JSONL 审计日志
 │   ├── tasks.ts                 # 异步任务管理 / WebSocket 广播
 │   ├── format.ts                # 日期 / 数字工具函数
-│   ├── data-store.ts            # 数据门面：SQLite + 旧 JSON 种子导入
+│   ├── data-store.ts            # 数据门面：SQLite + 旧 JSON 种子导入 + 排行配置
 │   ├── sqlite-store.ts          # node:sqlite 仓储层
 │   ├── sqlite/                  # SQLite schema / 类型 / 工具拆分
 │   │   ├── schema.ts            # 建表迁移（v15/v16 → SCHEMA_VERSION=18）
@@ -72,7 +74,9 @@ trending-polars/
 │   └── data/                    # 运行时数据（gitignore，含 trending.db、runtime/）
 ├── src/                  # React 前端
 │   ├── pages/           # 页面组件
-│   └── components/      # 通用组件
+│   ├── components/      # 通用组件（AppShell / Modal / Charts / Pills / Ui / HeaderActions）
+│   ├── context/         # React 上下文（TasksContext：任务进度订阅）
+│   └── lib/             # 工具库（api.ts：后端 API 封装）
 ├── scripts/              # 脚本
 │   └── ths_order_dry_run.applescript
 ├── tests/                # 测试

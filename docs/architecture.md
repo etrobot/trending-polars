@@ -47,22 +47,24 @@
 | 模块 | 文件 | 职责 |
 |------|------|------|
 | 服务装配 | `server/app.ts` | 装载 `Store/Audit/Tasks/Paper/MarketService`、注册路由、错误处理 |
-| 市场服务 | `server/app/market-service.ts` | 指数/板块/涨停采集、行情覆盖验证、PaperTrading 上下文、随机游走种子 |
+| 市场服务 | `server/app/market-service.ts` | 指数/板块/涨停采集、行情覆盖验证、PaperTrading 上下文、排行计算（含 RankingRuntimeConfig） |
 | API 路由 | `server/app/routes.ts` | 所有 `/api/*` 路由注册；任务、回测、模拟交易、审计 |
-| 服务入口 | `server/index.ts` | HTTP + WebSocket 服务器启动 |
-| 混合数据存储 | `server/data-store.ts` | SQLite 门面、旧 JSON 种子迁移、缓存/状态/回测归档 |
+| 服务入口 | `server/index.ts` | HTTP + WebSocket 服务器启动；启动时补全上证指数历史 |
+| 启动引导 | `server/index-bootstrap.ts` | 上证指数历史补全、交易日历解析、`resolveLatestTradingDate()` |
+| 混合数据存储 | `server/data-store.ts` | SQLite 门面、旧 JSON 种子迁移、缓存/状态/回测归档/排行配置 |
 | SQLite 仓储 | `server/sqlite-store.ts` | `node:sqlite` 批量 upsert、结构化查询；PRAGMA 与状态查询 |
 | SQLite schema | `server/sqlite/schema.ts` | 建表、迁移 `migrateV15/migrateV16`，`SCHEMA_VERSION=18` |
 | SQLite 工具 | `server/sqlite/helpers.ts` | 类型定义、值转换（`LimitUpRecord`、`STATE_NAMES`、类型工具） |
 | 行情采集 | `server/historical-market.ts` | 多源 K 线、板块 K 线、涨停排行采集 |
 | 评分引擎 | `server/scoring-engine.ts` | 四维多因子评分 + 八态市场分类 + 板块趋势分析；导出可配置 `ScoreStockConfig` |
 | 排行榜查询 | `server/polars-engine.ts` | 排行榜查询/排序/筛选、情绪聚合、重算 |
+| 排行配置 | `server/ranking-config.ts` | `RankingRuntimeConfig`（因子权重 + 评分配置 + 回测来源）；从回测结果提取配置、默认配置生成 |
 | 向量化回测评分 | `server/backtest-scoring.ts` | 单次 Polars 遍历计算全量股票×日期评分矩阵，替代逐日逐股 `scoreStock` 循环 |
 | 基准指数对照 | `server/benchmark.ts` | 从搜狐获取指数日线，归一化生成与回测叠加的 benchmark 净值曲线 |
 | 交易策略 | `server/trading-strategy.ts` | 参数配置、选股过滤、仓位计算、止盈止损；不负责涨停判定 |
 | 回测引擎 | `server/backtest-engine.ts` | `runPolarsBacktest`/`runRandomizedBacktest`；导出 `prepareBacktestContext` / `quickSimulateBacktest` 供参数优化复用 |
 | 参数优化 | `server/backtest-param-optimizer.ts` | 两阶段优化：先校准 `scoreStock` 评分参数，再网格搜索回测交易参数，目标为完整回测收益 |
-| 模拟交易 | `server/paper-trading.ts` | 交易计划、执行、调度、监控 |
+| 模拟交易 | `server/paper-trading.ts` | 交易计划、执行、调度、监控；`applyBacktestStrategy()` 从回测结果应用策略参数 |
 | 模拟交易辅助 | `server/paper-trading/helpers.ts` | 时钟、市场强弱、执行窗口、内存状态机等纯函数 |
 | 同花顺桥接 | `server/ths-simulated-broker.ts` | AppleScript 调用、持仓解析；`quote()` 在 UI 失败时回退到 `fetchAdjustedKlines` |
 | AppleScript 桥接 | `scripts/ths_order_dry_run.applescript` | 提交前 `refreshSimulationConnection()`、窗口校验、委托/撤单回查；报价失败回退到 K 线 |
@@ -107,6 +109,8 @@ const closes = bars.slice(0, barIndex + 1).map((bar) => bar.close);
 | SQLite | 股票/板块/涨停/日行情/板块指数日线/板块趋势/排行因子/指令 | 结构化持久化，数据库为准 |
 | 基础目录 | `analysis.json` / `ranking.json` | 首次启动兼容导入种子 |
 | 运行时缓存 | `analysis.json` / `ranking.json` | 最新计算结果缓存，可重建 |
+| 排行配置 | `ranking-config.json` | 因子权重 + 评分配置 + 回测来源，可从优化结果回填 |
+| 优化结果 | `optimize-result.json` | 最近一次参数优化完整结果 |
 | 状态文件 | 自动化状态、交易日志 | 持久化，跨重启 |
 | 内存字典 | 回测预加载 | 回测期间 |
 

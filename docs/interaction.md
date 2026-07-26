@@ -240,6 +240,25 @@ paperSockets: 连接时发送 { type: "status", connected: true }，后续事件
 | 排行榜 | `/ranking` | 多因子评分排行（搜索/筛选/排序） | `RankingPage.tsx` |
 | 回测 | `/backtest` | 策略回测与结果展示（净值曲线 + benchmark 叠加） | `BacktestPage.tsx` |
 | 模拟交易 | `/simulated-trading` | 资金/持仓/计划/委托/执行 | `SimulatedTradingPage.tsx` |
+| 404 | `*` | 页面不存在提示 | `NotFoundPage.tsx` |
+
+**前端通用组件**：
+
+| 组件 | 文件 | 用途 |
+|------|------|------|
+| `AppShell` | `components/AppShell.tsx` | 全局布局（导航 + 头部 + 内容区） |
+| `HeaderActions` | `components/HeaderActions.tsx` | 头部操作区 Portal（各页面注入按钮） |
+| `Modal` | `components/Modal.tsx` | 通用弹窗 |
+| `Charts` | `components/Charts.tsx` | 净值曲线等图表 |
+| `Pills` | `components/Pills.tsx` | 标签/徽章 |
+| `Ui` | `components/Ui.tsx` | 通用 UI 原子组件（按钮、输入框等） |
+
+**前端上下文与工具**：
+
+| 模块 | 文件 | 用途 |
+|------|------|------|
+| `TasksContext` | `context/TasksContext.tsx` | 异步任务进度 WebSocket 订阅与状态共享 |
+| `api` | `lib/api.ts` | 后端 API 封装 |
 
 ---
 
@@ -291,6 +310,7 @@ POST /api/backtest/optimize?days=20  # 两阶段参数优化（scoreStock + 回�
                                       # 任务进度通过 WebSocket（type=task_progress）推送
                                       # 完成后从 /api/tasks/:taskId.result 读取 OptimizedParams / validation
 GET /api/backtest/list               # 回测列表
+GET /api/backtest/optimize-result    # 最近一次参数优化结果
 GET /api/backtest/:runId             # 回测详情
 DELETE /api/backtest/:runId          # 删除回测（支持前端勾选批量并发 DELETE）
 # 应用参数：前端使用任务 result.optimized，结果本身可由优化详情 modal 直接回填
@@ -319,6 +339,9 @@ POST /api/simulated-trading/automation/run-window   # 手动执行窗口
                                                      # body: { window: "open"|"near_close"|"close"|"post_close" }
                                                      # 等价调度器的 run-window；immediate 触发可在开盘窗口下重跑已完成的窗口
 POST /api/simulated-trading/monitor/run   # 手动执行账户监控
+POST /api/simulated-trading/strategy/apply-backtest  # 从回测结果应用策略参数 + 保存排行配置 + 重算排行
+                                                     # body: { run_id: string }
+                                                     # 返回: { ok, run_id, strategy, plan, ranking, ranking_recomputed, ranking_message }
 
 # ==== 审计日志 ====
 GET /api/audit/logs?level=error&component=paper_trading
