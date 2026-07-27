@@ -321,9 +321,12 @@ describe('Node T+1 paper-trading core', () => {
 
     now = new Date('2026-07-24T09:31:00+08:00');
     const open = await service.runWindow('open', market);
+    // 仓位按总分分档缩放（scoreScaledSizing）：80 分 → 系数 0.8 → 10% × 0.8 = 8% 额度 → 800 股。
+    // 第二笔在扣除第一笔占用后按剩余现金计算，所以少于第一笔。
+    // 这条链路过去是断的 —— positionRatioForScore 只被测试引用，实盘一律用固定 10%（1000 股）。
     expect(open.results.map((order) => [order.side, order.stock_code, order.quantity])).toEqual([
-      ['buy', '600001', 1000],
-      ['buy', '000002', 800],
+      ['buy', '600001', 800],
+      ['buy', '000002', 700],
     ]);
     expect(broker.placed).toHaveLength(2);
 

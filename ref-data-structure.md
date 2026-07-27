@@ -2,7 +2,7 @@
 
 > **Node 实现约束**：项目使用 Node.js 22.13+ 内置的 `node:sqlite`（`DatabaseSync`），数据库位于 `server/data/trending.db`。`server/data/` 整体加入 `.gitignore`，仓库和 Git 历史不保存行情、排行、账户状态或回测数据。
 
-**数据库版本**：v18
+**数据库版本**：v20
 
 ## 1. 数据存储架构
 
@@ -61,17 +61,21 @@ block_daily_price (block_code, block_name, date, open, close, high, low,
 -- 板块每日趋势判读表（state_id 范围 0-7，0=数据不足）
 sector_trend_daily (date, sector_code, sector_name, state_id, state_name,
                     trend, latest, ma5, ma20, near_high, volume_trend,
+                    adx, plus_di, minus_di,
+                    downgraded, adjust_direction, original_state_id, original_state_name,
                     strategy_action, strategy_label, strategy_position, computed_at)
 
 -- 排行榜因子表（灵活 KV 存储）
 ranking_factor (date, stock_code, factor_name, val_numeric, val_text)
 
 -- 排行榜表（向下兼容）
-stock_ranking (date, stock_code, stock_name, rank, total_score, ...)
+stock_ranking (date, stock_code, stock_name, rank, total_score,
+               trend_score, volume_price_score, position_score, volatility_trend_score,
+               relative_strength_score, relative_strength_label, relative_strength_pct, ...)
 
 -- 模拟交易指令表（持久化，重启不丢失）
 paper_instruction (id, side, stock_code, signal_date, signal_price, quantity,
-                   rank, strategy_label, reason, execution_window,
+                   rank, signal_score, reason, execution_window,
                    status, created_at, submitted_at, completed_at, broker_status, execution_price)
 
 -- 最新排行榜与历史行情快照元数据
@@ -301,7 +305,7 @@ try {
 
 ### 4.3 数据迁移流程
 
-数据库版本从 v14 升级到 v18：
+数据库版本从 v14 升级到 v20：
 
 ```typescript
 // v15: 移除 limit_up_record 冗余列
@@ -315,11 +319,28 @@ DROP TABLE sector_trend_daily;
 ALTER TABLE sector_trend_daily_new RENAME TO sector_trend_daily;
 UPDATE sector_trend_daily SET state_id = 0 WHERE state_name = '数据不足';
 
-// v18: state_id 允许 8（'筑底成功'，与 STATE_NAMES 对齐）；不再改表结构
-PRAGMA user_version = 18;
+// v18→19: block_daily_price 加 period 列（日/周/月）；sector_trend_daily
+//          state_id 允许 8（'筑底成功'）+ 新增 adx/plus_di/minus_di/downgraded
+ALTER TABLE block_daily_price ADD COLUMN period TEXT NOT NULL DEFAULT '01';
+
+// v19→20: 评分从四维扩到五维，多周期改写方向可审计，指令记录信号分
+ALTER TABLE stock_ranking     ADD COLUMN relative_strength_score REAL;
+ALTER TABLE stock_ranking     ADD COLUMN relative_strength_label TEXT NOT NULL DEFAULT '';
+ALTER TABLE stock_ranking     ADD COLUMN relative_strength_pct   REAL;
+ALTER TABLE sector_trend_daily ADD COLUMN adjust_direction       TEXT;
+ALTER TABLE paper_instruction  ADD COLUMN signal_score           REAL;
+PRAGMA user_version = 20;
 ```
 
-迁移入口集中在 `server/sqlite/schema.ts` 的 `initializeSchema()`（PRAGMA + 建表 + `migrateV15/migrateV16`），逻辑层在 `server/sqlite/helpers.ts` 维护 `STATE_NAMES` / `LimitUpRecord` 等共享类型。
+v20 三处新增的动机：
+
+- `relative_strength_*`：新增维度 5「相对强度」（个股 N 日收益 − 上证指数同期收益）。
+  旧行没有这一列，读取时按中性分处理。
+- `adjust_direction`：过去多周期交叉验证无论**升级**还是**降级**都写 `downgraded=1`，审计时分不清方向。
+  现在 `downgraded` 只表示降级，方向由 `adjust_direction`（`'up'` / `'down'`）记录。
+- `signal_score`：仓位改为按评分分档缩放后，执行时必须拿到与计划时同一个总分，否则计划量与成交量会不一致。
+
+迁移入口集中在 `server/sqlite/schema.ts` 的 `initializeSchema()`（PRAGMA + 建表 + `migrateV15/V16/V18/V19`），逻辑层在 `server/sqlite/helpers.ts` 维护 `STATE_NAMES` / `LimitUpRecord` 等共享类型。
 
 ## 5. 缓存策略
 

@@ -25,6 +25,7 @@ export function factorWeightsFromBacktestConfig(
     volumePriceWeightPct: Number(config.volume_price_weight_pct),
     distanceFromLowWeightPct: Number(config.distance_from_low_weight_pct),
     volatilityTrendWeightPct: Number(config.volatility_weight_pct),
+    relativeStrengthWeightPct: Number(config.relative_strength_weight_pct),
   });
 }
 

@@ -4,13 +4,18 @@ import { computeBacktestScores } from './backtest-scoring.js';
 import { compactDate, formatDateTime, round } from './format.js';
 import { normalizeBacktestDays, type HistoricalMarketData } from './historical-market.js';
 import {
+  compareByScore,
   prepareSeries,
   scoreStock,
+  DIMENSION_MAX,
+  RAW_SCORE_MAX,
+  SCORE_SCALE,
   type PreparedSeries,
   type SectorContext,
   type ScoreStockConfig,
   DEFAULT_SCORE_STOCK_CONFIG,
 } from './scoring-engine.js';
+import { benchmarkReturns } from './backtest-scoring.js';
 import {
   calculateEntrySize,
   commission,
@@ -36,6 +41,8 @@ interface EntryOrder {
   stockName: string;
   rank: number;
   signalDate: string;
+  /** 信号日总分；用于按评分缩放仓位（scoreScaledSizing）。 */
+  totalScore: number;
 }
 
 interface BacktestContext {
@@ -73,6 +80,8 @@ interface FactorWeights {
   /** 距60日低点（position_score）权重 */
   distanceFromLowWeightPct: number;
   volatilityTrendWeightPct: number;
+  /** 相对强度（relative_strength_score）权重 */
+  relativeStrengthWeightPct: number;
 }
 
 export type { FactorWeights };
@@ -94,6 +103,7 @@ interface BacktestRunMeta {
     volumePriceWeightPct: number;
     distanceFromLowWeightPct: number;
     volatilityTrendWeightPct: number;
+    relativeStrengthWeightPct: number;
   };
 }
 
@@ -104,37 +114,72 @@ const DEFAULT_FACTOR_WEIGHTS: FactorWeights = {
   volumePriceWeightPct: 100,
   distanceFromLowWeightPct: 100,
   volatilityTrendWeightPct: 100,
+  relativeStrengthWeightPct: 100,
 };
 
 export { DEFAULT_FACTOR_WEIGHTS };
 
+/**
+ * 因子权重范围。归一化之后权重可以「加强」而不只是「削弱」某个维度，
+ * 所以上界放到 200（100 为中性）。旧的 [1,100] 上限让优化器只能往下调，
+ * 相当于把「强调 trend」和「削弱其它三维」混为一谈。
+ */
+const MIN_FACTOR_WEIGHT_PCT = 1;
+const MAX_FACTOR_WEIGHT_PCT = 200;
+
+function clampWeightPct(value: number | undefined, fallback: number): number {
+  const numeric = Math.trunc(value ?? fallback);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(MAX_FACTOR_WEIGHT_PCT, Math.max(MIN_FACTOR_WEIGHT_PCT, numeric));
+}
+
 function normalizeFactorWeights(weights?: Partial<FactorWeights>): FactorWeights {
   return {
-    trendWeightPct: Math.min(100, Math.max(1, Math.trunc(weights?.trendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.trendWeightPct))),
-    volumePriceWeightPct: Math.min(100, Math.max(1, Math.trunc(weights?.volumePriceWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct))),
-    distanceFromLowWeightPct: Math.min(100, Math.max(1, Math.trunc(weights?.distanceFromLowWeightPct ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct))),
-    volatilityTrendWeightPct: Math.min(100, Math.max(1, Math.trunc(weights?.volatilityTrendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct))),
+    trendWeightPct: clampWeightPct(weights?.trendWeightPct, DEFAULT_FACTOR_WEIGHTS.trendWeightPct),
+    volumePriceWeightPct: clampWeightPct(weights?.volumePriceWeightPct, DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct),
+    distanceFromLowWeightPct: clampWeightPct(weights?.distanceFromLowWeightPct, DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct),
+    volatilityTrendWeightPct: clampWeightPct(weights?.volatilityTrendWeightPct, DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct),
+    relativeStrengthWeightPct: clampWeightPct(weights?.relativeStrengthWeightPct, DEFAULT_FACTOR_WEIGHTS.relativeStrengthWeightPct),
   };
 }
 
-export { normalizeFactorWeights };
+export { normalizeFactorWeights, MIN_FACTOR_WEIGHT_PCT, MAX_FACTOR_WEIGHT_PCT };
 
+/**
+ * 按因子权重重算总分并重新排名。
+ *
+ * 权重是**归一化**的：加权和会被除以「本组权重下的理论满分」再放大回 SCORE_SCALE（100 分制），
+ * 所以调权重只改变五维的相对影响，不改变总分量纲。
+ *
+ * 这一点是必须的 —— 下游全是绝对阈值（rankEntryCandidates 的入场线、
+ * strategyForScore 的 70/55/40/25/10 分档）。若按旧写法直接乘 pct/100，权重只能往下调，
+ * 总分就只会缩水：例如 (trend 70, distance 70) 会把理论满分压到 82，40 分的入场线
+ * 等效变成原口径的 48.8 分。于是参数优化器搜索权重时，同时改变了「因子相对权重」和
+ * 「绝对入场门槛」两件事，两个效应完全纠缠，搜出来的最优权重无法解释。
+ *
+ * 全 100（默认值）时结果与未加权的 scoreStock 完全一致。
+ */
 function applyFactorWeights(rows: RankingRow[], weights: FactorWeights): RankingRow[] {
   const trendMul = weights.trendWeightPct / 100;
   const volumeMul = weights.volumePriceWeightPct / 100;
   const fromLowMul = weights.distanceFromLowWeightPct / 100;
   const volatilityMul = weights.volatilityTrendWeightPct / 100;
+  const strengthMul = weights.relativeStrengthWeightPct / 100;
+  const maxWeighted = DIMENSION_MAX.trend * trendMul
+    + DIMENSION_MAX.volumePrice * volumeMul
+    + DIMENSION_MAX.distanceFromLow * fromLowMul
+    + DIMENSION_MAX.volatilityTrend * volatilityMul
+    + DIMENSION_MAX.relativeStrength * strengthMul;
+  const normalizer = maxWeighted > 0 ? SCORE_SCALE / maxWeighted : 1;
   const rescored = rows.map((row) => {
-    const totalScore = round(
-      row.trend_score * trendMul
-        + Number(row.volume_price_score ?? row.volume_score ?? 0) * volumeMul
-        + Number(row.position_score ?? 0) * fromLowMul
-        + Number(row.volatility_trend_score ?? 0) * volatilityMul,
-      1,
-    );
-    return { ...row, total_score: totalScore };
+    const weighted = row.trend_score * trendMul
+      + Number(row.volume_price_score ?? row.volume_score ?? 0) * volumeMul
+      + Number(row.position_score ?? 0) * fromLowMul
+      + Number(row.volatility_trend_score ?? 0) * volatilityMul
+      + Number(row.relative_strength_score ?? 0) * strengthMul;
+    return { ...row, total_score: round(weighted * normalizer, 1) };
   });
-  rescored.sort((left, right) => right.total_score - left.total_score || left.stock_code.localeCompare(right.stock_code));
+  rescored.sort(compareByScore);
   for (let index = 0; index < rescored.length; index += 1) rescored[index].rank = index + 1;
   return rescored;
 }
@@ -169,11 +214,21 @@ function candidatesAtDate(series: PreparedSeries[], date: string, exactLimitUpDa
   return records.map((row, index) => ({ ...row, rank: index + 1 }));
 }
 
-function trendAxisFromState(stateId: number | undefined, alignment: string | undefined): 'up' | 'range' | 'down' {
-  if (stateId != null && [1, 2, 3, 8].includes(stateId)) return 'up';
-  if (stateId != null && [6, 7].includes(stateId)) return 'down';
-  if (stateId != null && [4, 5].includes(stateId)) return 'range';
-  return alignment === 'bullish' ? 'up' : alignment === 'bearish' ? 'down' : 'range';
+/**
+ * 板块 state_id → 趋势轴。
+ *
+ * 拿不到板块状态时返回 undefined，**不得**回退到个股自身的均线排列：
+ * `sector.trend` 会同时驱动维度 1 的板块加分（±4）和维度 4 的趋势轴，用个股
+ * alignment 冒充板块趋势等于把同一个信号重复计入 2~3 次（bullish 白拿 +4 与
+ * 更高的波动率矩阵列），且与向量化回测路径（sector_state_id=0 → bonus 0）不一致。
+ * 维度 4 的 alignment 回退由 scoreStock 内部完成，两条路径口径一致。
+ */
+function trendAxisFromState(stateId: number | undefined): 'up' | 'range' | 'down' | undefined {
+  if (stateId == null) return undefined;
+  if ([1, 2, 3, 8].includes(stateId)) return 'up';
+  if ([6, 7].includes(stateId)) return 'down';
+  if ([4, 5].includes(stateId)) return 'range';
+  return undefined;
 }
 
 export interface SectorTrendLookup {
@@ -193,26 +248,29 @@ function sectorContextForRanking(
   previous: RankingRow | undefined,
   sectorTrendsByCode: Map<string, SectorTrendLookup>,
   limitUpDates: ReadonlySet<string> | undefined,
+  benchmarkReturnPct: number | null | undefined,
 ): SectorContext {
   const sectorCode = String(previous?.sector_code ?? '').trim();
   const trend = sectorCode ? sectorTrendsByCode.get(sectorCode) : undefined;
   if (trend) {
     return {
-      trend: trendAxisFromState(trend.state_id, previous?.alignment),
+      trend: trendAxisFromState(trend.state_id),
       trendName: trend.state_name,
       stateId: trend.state_id,
       code: trend.sector_code,
       name: trend.sector_name || previous?.sector_name,
       limitUpDates,
+      benchmarkReturnPct,
     };
   }
   return {
-    trend: trendAxisFromState(previous?.sector_trend_state_id, previous?.alignment),
+    trend: trendAxisFromState(previous?.sector_trend_state_id),
     trendName: previous?.sector_trend_name,
     stateId: previous?.sector_trend_state_id,
     code: previous?.sector_code,
     name: previous?.sector_name,
     limitUpDates,
+    benchmarkReturnPct,
   };
 }
 
@@ -234,12 +292,14 @@ export function historicalCrossSectionRankings(
   const targetDate = date.replaceAll('-', '').slice(0, 8);
   const previousByCode = new Map(previousRows.map((row) => [row.stock_code, row]));
   const exactLimitUpDates = limitUpDatesByCode(history);
+  // 维度 5 的基准：与向量化回测取同一条上证指数曲线、同一 lookback。
+  const benchmarkReturnPct = benchmarkReturns(history, scoringConfig.relativeStrength.lookback).get(targetDate);
   const scored = history.stocks.flatMap((stock): RankingRow[] => {
     const previous = previousByCode.get(stock.stock_code);
     const row = scoreStock(
       prepareSeries(stock),
       targetDate,
-      sectorContextForRanking(previous, sectorTrendsByCode, exactLimitUpDates.get(stock.stock_code)),
+      sectorContextForRanking(previous, sectorTrendsByCode, exactLimitUpDates.get(stock.stock_code), benchmarkReturnPct),
       scoringConfig,
     );
     if (!row) return [];
@@ -251,7 +311,7 @@ export function historicalCrossSectionRankings(
     }];
   });
   const ranked = scored
-    .sort((left, right) => right.total_score - left.total_score || left.stock_code.localeCompare(right.stock_code))
+    .sort(compareByScore)
     .map((row, index) => ({ ...row, rank: index + 1 }));
   return applyFactorWeights(ranked, factorWeights);
 }
@@ -368,7 +428,7 @@ function simulateBacktest(
       if (exactLimitUpCodes.get(date)?.has(order.stockCode)) continue;
 
       const fillPrice = round(bar.open * (1 + strategy.slippageRate), 3);
-      const sizing = calculateEntrySize(cash, INITIAL_CAPITAL, fillPrice, strategy);
+      const sizing = calculateEntrySize(cash, INITIAL_CAPITAL, fillPrice, strategy, order.totalScore);
       if (!sizing) continue;
       cash = round(cash - sizing.totalCost, 2);
       positions.set(order.stockCode, {
@@ -428,7 +488,7 @@ function simulateBacktest(
       const heldOrOrdered = new Set([...positions.keys(), ...pendingEntries.map((order) => order.stockCode)]);
       const availableSlots = Math.max(0, strategy.maxPositions - positions.size);
       const dayScores = applyFactorWeights(scoreMap.get(date) ?? [], factorWeights);
-      pendingEntries = rankEntryCandidates(dayScores, new Set(), DEFAULT_T1_STRATEGY.maxCandidates)
+      pendingEntries = rankEntryCandidates(dayScores, new Set(), DEFAULT_T1_STRATEGY.maxCandidates, strategy.minEntryScore)
         .filter((candidate) => !heldOrOrdered.has(candidate.stock_code))
         .slice(0, Math.min(strategy.maxEntriesPerDay, availableSlots))
         .map((candidate) => ({
@@ -436,6 +496,7 @@ function simulateBacktest(
           stockName: candidate.stock_name,
           rank: candidate.rank,
           signalDate: date,
+          totalScore: Number(candidate.total_score ?? 0),
         }));
     }
   }
@@ -521,6 +582,7 @@ function buildResult(
     volume_price_weight_pct: meta?.factorWeights?.volumePriceWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct,
     distance_from_low_weight_pct: meta?.factorWeights?.distanceFromLowWeightPct ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct,
     volatility_weight_pct: meta?.factorWeights?.volatilityTrendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct,
+    relative_strength_weight_pct: meta?.factorWeights?.relativeStrengthWeightPct ?? DEFAULT_FACTOR_WEIGHTS.relativeStrengthWeightPct,
     total_return_pct: summary.totalReturnPct,
     trades: summary.totalTrades,
   });
@@ -574,10 +636,12 @@ function buildResult(
       volume_price_weight_pct: meta?.factorWeights?.volumePriceWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct,
       distance_from_low_weight_pct: meta?.factorWeights?.distanceFromLowWeightPct ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct,
       volatility_weight_pct: meta?.factorWeights?.volatilityTrendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct,
+      relative_strength_weight_pct: meta?.factorWeights?.relativeStrengthWeightPct ?? DEFAULT_FACTOR_WEIGHTS.relativeStrengthWeightPct,
       trend_weight_upper_pct: meta?.bounds?.trendWeightPct ?? meta?.factorWeights?.trendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.trendWeightPct,
       volume_price_weight_upper_pct: meta?.bounds?.volumePriceWeightPct ?? meta?.factorWeights?.volumePriceWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct,
       distance_from_low_weight_upper_pct: meta?.bounds?.distanceFromLowWeightPct ?? meta?.factorWeights?.distanceFromLowWeightPct ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct,
       volatility_weight_upper_pct: meta?.bounds?.volatilityTrendWeightPct ?? meta?.factorWeights?.volatilityTrendWeightPct ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct,
+      relative_strength_weight_upper_pct: meta?.bounds?.relativeStrengthWeightPct ?? meta?.factorWeights?.relativeStrengthWeightPct ?? DEFAULT_FACTOR_WEIGHTS.relativeStrengthWeightPct,
       slippage_bps: strategy.slippageRate * 10_000,
       commission_bps: strategy.commissionRate * 10_000,
       stamp_tax_bps: strategy.stampTaxRate * 10_000,
@@ -601,6 +665,7 @@ export function runPolarsBacktest(
     volumePriceWeightPct?: number;
     distanceFromLowWeightPct?: number;
     volatilityTrendWeightPct?: number;
+    relativeStrengthWeightPct?: number;
     scoringConfig?: ScoreStockConfig;
   },
 ): BacktestResult {
@@ -617,6 +682,7 @@ export function runPolarsBacktest(
     volumePriceWeightPct: options.volumePriceWeightPct,
     distanceFromLowWeightPct: options.distanceFromLowWeightPct,
     volatilityTrendWeightPct: options.volatilityTrendWeightPct,
+    relativeStrengthWeightPct: options.relativeStrengthWeightPct,
   });
   const scoringConfig = options.scoringConfig ?? DEFAULT_SCORE_STOCK_CONFIG;
   console.log('[backtest] runPolarsBacktest current scheme', {
@@ -630,6 +696,7 @@ export function runPolarsBacktest(
     volumePriceWeightPct: factorWeights.volumePriceWeightPct,
     distanceFromLowWeightPct: factorWeights.distanceFromLowWeightPct,
     volatilityTrendWeightPct: factorWeights.volatilityTrendWeightPct,
+    relativeStrengthWeightPct: factorWeights.relativeStrengthWeightPct,
     scoring_config: 'custom',
   });
   const context = buildBacktestContext(history, days, scoringConfig);
@@ -680,6 +747,7 @@ export function runRandomizedBacktest(
     volumePriceWeightPctUpper?: number;
     distanceFromLowWeightPctUpper?: number;
     volatilityTrendWeightPctUpper?: number;
+    relativeStrengthWeightPctUpper?: number;
     scoringConfig?: ScoreStockConfig;
   },
 ): BacktestResult[] {
@@ -694,7 +762,8 @@ export function runRandomizedBacktest(
     trendWeightPct: Math.min(100, Math.max(1, Math.trunc(options.trendWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.trendWeightPct))),
     volumePriceWeightPct: Math.min(100, Math.max(1, Math.trunc(options.volumePriceWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct))),
     distanceFromLowWeightPct: Math.min(100, Math.max(1, Math.trunc(options.distanceFromLowWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct))),
-    volatilityTrendWeightPct: Math.min(100, Math.max(1, Math.trunc(options.volatilityTrendWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct))),
+    volatilityTrendWeightPct: clampWeightPct(options.volatilityTrendWeightPctUpper, DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct),
+    relativeStrengthWeightPct: clampWeightPct(options.relativeStrengthWeightPctUpper, DEFAULT_FACTOR_WEIGHTS.relativeStrengthWeightPct),
   };
   const scoringConfig = options.scoringConfig ?? DEFAULT_SCORE_STOCK_CONFIG;
   console.log('[backtest] runRandomizedBacktest start', { days, strategyCount, bounds, scoring_config: 'custom' });
@@ -714,6 +783,7 @@ export function runRandomizedBacktest(
     bounds.volumePriceWeightPct,
     bounds.distanceFromLowWeightPct,
     bounds.volatilityTrendWeightPct,
+    bounds.relativeStrengthWeightPct,
   ].join('|'));
   const rng = createRng(seed);
   const results: BacktestResult[] = [];
@@ -726,12 +796,15 @@ export function runRandomizedBacktest(
       takeProfitPct: randomInt(rng, 1, bounds.takeProfitPct),
       positionSizePct: randomInt(rng, 1, bounds.positionSizePct),
     });
-    const factorWeights = {
+    // 必须给齐每一个权重字段：漏一个会让 applyFactorWeights 里的 NaN 传染到 total_score，
+    // 于是所有候选都过不了入场线、整批随机组合零成交（而不是报错）。
+    const factorWeights: FactorWeights = normalizeFactorWeights({
       trendWeightPct: randomInt(rng, 1, bounds.trendWeightPct),
       volumePriceWeightPct: randomInt(rng, 1, bounds.volumePriceWeightPct),
       distanceFromLowWeightPct: randomInt(rng, 1, bounds.distanceFromLowWeightPct),
       volatilityTrendWeightPct: randomInt(rng, 1, bounds.volatilityTrendWeightPct),
-    };
+      relativeStrengthWeightPct: randomInt(rng, 1, bounds.relativeStrengthWeightPct),
+    });
     const simulation = simulateBacktest(context, strategy, factorWeights);
     results.push(buildResult(history, context, strategy, simulation, {
       mode: 'random',
@@ -749,6 +822,7 @@ export function runRandomizedBacktest(
       volume_price_weight_pct: factorWeights.volumePriceWeightPct,
       distance_from_low_weight_pct: factorWeights.distanceFromLowWeightPct,
       volatility_weight_pct: factorWeights.volatilityTrendWeightPct,
+      relative_strength_weight_pct: factorWeights.relativeStrengthWeightPct,
       total_return_pct: results.at(-1)?.summary.total_return_pct,
       run_id: results.at(-1)?.run_id,
     });
@@ -786,6 +860,9 @@ export function quickSimulateBacktest(
     volumePriceWeightPct?: number;
     distanceFromLowWeightPct?: number;
     volatilityTrendWeightPct?: number;
+    /** backtest-param-optimizer 的 OptimizedStrategyParams 用的是这个短名。 */
+    volatilityWeightPct?: number;
+    relativeStrengthWeightPct?: number;
   },
 ): BacktestQuickSummary {
   const strategy = createT1StrategyConfig({
@@ -799,7 +876,10 @@ export function quickSimulateBacktest(
     trendWeightPct: options.trendWeightPct,
     volumePriceWeightPct: options.volumePriceWeightPct,
     distanceFromLowWeightPct: options.distanceFromLowWeightPct,
-    volatilityTrendWeightPct: options.volatilityTrendWeightPct,
+    // 优化器一直传的是 volatilityWeightPct，而这里只读 volatilityTrendWeightPct，
+    // 于是波动率权重被静默丢弃、恒为默认值 —— 两个名字都接受以消除这个断点。
+    volatilityTrendWeightPct: options.volatilityTrendWeightPct ?? options.volatilityWeightPct,
+    relativeStrengthWeightPct: options.relativeStrengthWeightPct,
   });
   const simulation = simulateBacktest(context, strategy, factorWeights);
   const summary = summarizeSimulation(simulation);

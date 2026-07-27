@@ -19,7 +19,7 @@ import {
 } from '../historical-market.js';
 import { resolveLatestTradingDate } from '../index-bootstrap.js';
 import { queryRankings, refreshAnalysis } from '../polars-engine.js';
-import { analyzeBlockTrend, blockStrategy, classifyMarketState, klinesToBars } from '../scoring-engine.js';
+import { analyzeBlockTrend, blockStrategy, classifyMarketState, klinesToBars, DEFAULT_SCORE_STOCK_CONFIG, type MarketStateThresholds } from '../scoring-engine.js';
 import type { DataStore } from '../data-store.js';
 import {
   BLOCK_PERIOD_DAILY,
@@ -95,9 +95,14 @@ export function buildBlockAnalysis(
   daily: KLineData[],
   weekly: KLineData[],
   monthly: KLineData[],
+  marketLimitUpTotal?: number,
+  thresholds: MarketStateThresholds = DEFAULT_SCORE_STOCK_CONFIG.marketState,
 ): BlockAnalysis {
-  const trend = analyzeBlockTrend(klinesToBars(daily), klinesToBars(weekly), klinesToBars(monthly));
-  const strategy = blockStrategy(trend.state_id, block.limit_up_num, block.continuous_plate_num);
+  const trend = analyzeBlockTrend(klinesToBars(daily), klinesToBars(weekly), klinesToBars(monthly), thresholds);
+  const strategy = blockStrategy(trend.state_id, block.limit_up_num, block.continuous_plate_num, {
+    marketLimitUpTotal,
+    higherTimeframe: trend.higher_timeframe,
+  });
   const stockList: LimitUpStock[] = block.stock_list.map((stock) => ({
     code: stock.code,
     name: stock.name,
@@ -125,6 +130,16 @@ export function buildBlockAnalysis(
       latest: trend.latest ?? undefined,
       ma5: trend.ma5,
       ma20: trend.ma20,
+      // 审计字段：过去在这里被丢弃，导致 sector_trend_daily 的 adx/downgraded 恒为默认值。
+      adx: trend.adx,
+      plus_di: trend.plus_di,
+      minus_di: trend.minus_di,
+      downgraded: trend.downgraded,
+      adjusted: trend.adjusted,
+      adjust_direction: trend.adjust_direction,
+      original_state_id: trend.original_state_id,
+      original_state_name: trend.original_state_name,
+      confirmations: trend.confirmations,
     },
     strategy: { action: strategy.action, label: strategy.label, position: strategy.position },
     stock_list: stockList,
@@ -198,6 +213,9 @@ export class MarketService {
   ): Promise<{ analysis: AnalysisData; blocks: number; blocks_with_klines: number; source: 'ths-limit-up' | 'none' }> {
     const { blocks: tops, source } = await fetchBlockTop(date);
     if (!tops.length) return { analysis: base, blocks: 0, blocks_with_klines: 0, source };
+    // 全市场涨停总数：blockStrategy 用它把板块热度相对化（冷市场 5 家已是主线，
+    // 热市场 5 家很普通），而不是拿固定阈值 5 一刀切。
+    const marketLimitUpTotal = tops.reduce((sum, item) => sum + Number(item.limit_up_num ?? 0), 0);
     const results: BlockAnalysis[] = [];
     let cursor = 0;
     let done = 0;
@@ -258,7 +276,7 @@ export class MarketService {
           }
         }
         if (dailyKlines.length >= 20) blocksWithKlines += 1;
-        results.push(buildBlockAnalysis(block, dailyKlines, weeklyKlines, monthlyKlines));
+        results.push(buildBlockAnalysis(block, dailyKlines, weeklyKlines, monthlyKlines, marketLimitUpTotal));
         done += 1;
         options.progress?.(done / tops.length * 100, `板块趋势分类 ${done}/${tops.length}`);
       }

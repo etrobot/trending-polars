@@ -1,6 +1,7 @@
 import pl from 'nodejs-polars';
 import type { RankingRow } from '../src/types.js';
 import { round } from './format.js';
+import { positionRatioForScore } from './scoring-engine.js';
 
 export interface T1StrategyConfig {
   maxHoldDays: number;
@@ -10,6 +11,20 @@ export interface T1StrategyConfig {
   maxEntriesPerDay: number;
   positionSizePct: number;
   maxCandidates: number;
+  /**
+   * 入场总分下限（100 分制）。
+   * 只有在 applyFactorWeights 做了归一化之后这个绝对阈值才成立 —— 否则调低任一因子权重
+   * 都会连带抬高实际入场门槛，权重优化会同时改变「因子相对影响」与「入场松紧」两件事。
+   */
+  minEntryScore: number;
+  /**
+   * 是否按个股总分缩放仓位（positionRatioForScore：≥70 → 0.8 / ≥55 → 0.6 / …）。
+   *
+   * 这条链路过去是断的：`positionRatioForScore` / `strategyForScore` 只被测试引用，
+   * 实际下单一律用固定的 positionSizePct，所有入选股票仓位相同 —— 而 docs/logic.md §2.3
+   * 用一整张表描述了分档仓位。打开后评分才真正影响「买多少」，而不只是「买不买」。
+   */
+  scoreScaledSizing: boolean;
   lotSize: number;
   slippageRate: number;
   commissionRate: number;
@@ -25,6 +40,8 @@ export const DEFAULT_T1_STRATEGY: Readonly<T1StrategyConfig> = Object.freeze({
   maxEntriesPerDay: 2,
   positionSizePct: 10,
   maxCandidates: 5,
+  minEntryScore: 40,
+  scoreScaledSizing: true,
   lotSize: 100,
   slippageRate: 0.0005,
   commissionRate: 0.0003,
@@ -79,6 +96,7 @@ export function rankEntryCandidates(
   rows: RankingRow[],
   excludedCodes: ReadonlySet<string> = new Set(),
   limit = DEFAULT_T1_STRATEGY.maxCandidates,
+  minEntryScore = DEFAULT_T1_STRATEGY.minEntryScore,
 ): RankingRow[] {
   const eligible = rows.filter((row) => !excludedCodes.has(String(row.stock_code ?? '')));
   if (!eligible.length) return [];
@@ -87,7 +105,7 @@ export function rankEntryCandidates(
     stock_code: String(row.stock_code ?? ''),
     total_score: Number(row.total_score ?? 0),
   })))
-    .filter(pl.col('total_score').gtEq(40))
+    .filter(pl.col('total_score').gtEq(minEntryScore))
     .sort('total_score', true, true)
     .head(Math.max(0, Math.trunc(limit)))
     .toRecords() as unknown as RankingRow[];
@@ -97,16 +115,29 @@ export function commission(grossAmount: number, config: T1StrategyConfig = DEFAU
   return round(Math.max(config.minimumCommission, grossAmount * config.commissionRate), 2);
 }
 
+/**
+ * 计算建仓股数。
+ *
+ * `totalScore` 传入时（且 config.scoreScaledSizing 为真），单票额度会按
+ * positionRatioForScore 的分档系数缩放 —— 高分股票拿更大仓位，这是 docs/logic.md §2.3
+ * 描述、但过去从未真正生效的行为。不传则退回固定额度。
+ */
 export function calculateEntrySize(
   cash: number,
   referenceCapital: number,
   price: number,
   config: T1StrategyConfig = DEFAULT_T1_STRATEGY,
+  totalScore?: number,
 ): { shares: number; grossAmount: number; totalCost: number } | null {
   if (cash <= 0 || referenceCapital <= 0 || price <= 0) return null;
+  const scoreRatio = config.scoreScaledSizing && totalScore != null
+    ? positionRatioForScore(totalScore)
+    : 1;
+  if (scoreRatio <= 0) return null;
+  const sizePct = config.positionSizePct * scoreRatio;
   const allocation = Math.min(
-    cash * config.positionSizePct / 100,
-    referenceCapital * config.positionSizePct / 100,
+    cash * sizePct / 100,
+    referenceCapital * sizePct / 100,
   );
   let shares = Math.floor(allocation / price / config.lotSize) * config.lotSize;
   while (shares >= config.lotSize) {

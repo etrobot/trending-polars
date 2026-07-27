@@ -34,6 +34,8 @@ export interface SectorTrendRecord {
   plus_di: number | null;
   minus_di: number | null;
   downgraded: number;
+  /** 多周期交叉验证的改写方向：'up' 升级 / 'down' 降级 / null 未改写。 */
+  adjust_direction: string | null;
   original_state_id: number | null;
   original_state_name: string | null;
   strategy_action: string;

@@ -144,7 +144,7 @@ describe('node:sqlite data store', () => {
     expect(status.foreign_keys).toBe(true);
     expect(status.busy_timeout_ms).toBe(5000);
     expect(status.synchronous).toBe('normal');
-    expect(status.schema_version).toBe(19);
+    expect(status.schema_version).toBe(20);
     expect(status.tables).toEqual(expect.arrayContaining([
       'stock_info',
       'sector_info',

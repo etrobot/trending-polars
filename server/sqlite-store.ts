@@ -24,8 +24,15 @@ import type { SectorTrendLookup } from './backtest-engine.js';
 import {
   analyzeBlockTrend,
   classifyMarketState,
+  DEFAULT_SCORE_STOCK_CONFIG,
   distanceFromLowScore,
+  HIGHER_TIMEFRAME_WINDOW_BARS,
   klinesToBars,
+  type MarketStateThresholds,
+  MIN_HIGHER_TIMEFRAME_BARS,
+  RAW_SCORE_MAX,
+  SCORE_SCALE,
+  SECTOR_STATE_WINDOW_BARS,
   volatilityClassOf,
   volatilityTrendScore,
   type TrendAxis,
@@ -139,9 +146,9 @@ export class SqliteStore {
         INSERT INTO sector_trend_daily (
           date, sector_code, sector_name, state_id, state_name, trend,
           latest, ma5, ma20, near_high, volume_trend,
-          adx, plus_di, minus_di, downgraded, original_state_id, original_state_name,
+          adx, plus_di, minus_di, downgraded, adjust_direction, original_state_id, original_state_name,
           strategy_action, strategy_label, strategy_position, computed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(date, sector_code) DO UPDATE SET
           sector_name = excluded.sector_name,
           state_id = excluded.state_id,
@@ -156,6 +163,7 @@ export class SqliteStore {
           plus_di = excluded.plus_di,
           minus_di = excluded.minus_di,
           downgraded = excluded.downgraded,
+          adjust_direction = excluded.adjust_direction,
           original_state_id = excluded.original_state_id,
           original_state_name = excluded.original_state_name,
           strategy_action = excluded.strategy_action,
@@ -171,8 +179,9 @@ export class SqliteStore {
         this.upsertSectorInfo(sectorCode, sectorName, computedAt);
         const stateId = Math.min(8, Math.max(0, Math.trunc(numberValue(block.trend?.state_id, 5))));
         const stateName = STATE_NAMES[stateId] ?? textValue(block.trend?.state_name);
-        const trendExtra = block.trend as { downgraded?: boolean; adx?: number; plus_di?: number; minus_di?: number; original_state_id?: number; original_state_name?: string };
+        const trendExtra = block.trend as { downgraded?: boolean; adjust_direction?: 'up' | 'down'; adx?: number; plus_di?: number; minus_di?: number; original_state_id?: number; original_state_name?: string };
         const downgraded = trendExtra?.downgraded ? 1 : 0;
+        const adjustDirection = trendExtra?.adjust_direction ?? null;
         const originalStateId = finiteNumber(trendExtra?.original_state_id);
         const originalStateNameRaw = trendExtra?.original_state_name;
         const originalStateName = originalStateNameRaw == null || originalStateNameRaw === '' ? null : String(originalStateNameRaw);
@@ -192,6 +201,7 @@ export class SqliteStore {
           finiteNumber(trendExtra?.plus_di),
           finiteNumber(trendExtra?.minus_di),
           downgraded,
+          adjustDirection,
           originalStateId,
           originalStateName,
           textValue(block.strategy?.action),
@@ -435,6 +445,7 @@ export class SqliteStore {
       plus_di: finiteNumber(row.plus_di),
       minus_di: finiteNumber(row.minus_di),
       downgraded: numberValue(row.downgraded),
+      adjust_direction: row.adjust_direction == null ? null : textValue(row.adjust_direction),
       original_state_id: finiteNumber(row.original_state_id),
       original_state_name: finiteNumber(row.original_state_id) == null ? null : textValue(row.original_state_name),
       strategy_action: textValue(row.strategy_action),
@@ -450,7 +461,11 @@ export class SqliteStore {
    * 与首页 Live 路径一致，使用 analyzeBlockTrend 完成多周期交叉验证。
    * 返回 null 表示板块代码无效、数据不足或无法计算。
    */
-  computeSectorTrendFromBlockPrices(sectorCode: string, date: string): SectorTrendLookup | null {
+  computeSectorTrendFromBlockPrices(
+    sectorCode: string,
+    date: string,
+    thresholds: MarketStateThresholds = DEFAULT_SCORE_STOCK_CONFIG.marketState,
+  ): SectorTrendLookup | null {
     if (!/^\d{6}$/.test(sectorCode)) return null;
     const targetDate = compactDate(date);
     if (!targetDate) return null;
@@ -461,10 +476,16 @@ export class SqliteStore {
       .filter((kline) => compactDate(kline.date) <= targetDate);
     const monthlyKlines = this.getBlockPrices(sectorCode, 120, BLOCK_PERIOD_MONTHLY)
       .filter((kline) => compactDate(kline.date) <= targetDate);
-    const dailyBars = klinesToBars(dailyKlines);
-    const weeklyBars = weeklyKlines.length >= 14 ? klinesToBars(weeklyKlines) : undefined;
-    const monthlyBars = monthlyKlines.length >= 14 ? klinesToBars(monthlyKlines) : undefined;
-    const state = analyzeBlockTrend(dailyBars, weeklyBars, monthlyBars);
+    // 只保留最近 SECTOR_STATE_WINDOW_BARS 根：ADX 的 Wilder 平滑路径依赖，
+    // 必须与向量化回测 computeSectorStates 的窗口一致，否则同一日可能分出不同状态。
+    const dailyBars = klinesToBars(dailyKlines).slice(-SECTOR_STATE_WINDOW_BARS);
+    const weeklyBars = weeklyKlines.length >= MIN_HIGHER_TIMEFRAME_BARS
+      ? klinesToBars(weeklyKlines).slice(-HIGHER_TIMEFRAME_WINDOW_BARS)
+      : undefined;
+    const monthlyBars = monthlyKlines.length >= MIN_HIGHER_TIMEFRAME_BARS
+      ? klinesToBars(monthlyKlines).slice(-HIGHER_TIMEFRAME_WINDOW_BARS)
+      : undefined;
+    const state = analyzeBlockTrend(dailyBars, weeklyBars, monthlyBars, thresholds);
     const sectorName = this.database.prepare(
       'SELECT name FROM sector_info WHERE code = ?',
     ).get(sectorCode);
@@ -524,7 +545,12 @@ export class SqliteStore {
     const volumePriceScore = numberValue(row.volume_price_score ?? row.volume_score);
     const fromLow = distanceFromLowScore(numberValue(row.distance_from_low_pct));
     const positionScore = finiteNumber(row.position_score) ?? fromLow.score;
-    const totalScore = round(trendScore + volumePriceScore + positionScore + volatilityScore, 1);
+    // 维度 5 由打分引擎给出；旧快照没有这一列时取中性分，避免整批塌陷。
+    const relativeStrengthScore = finiteNumber(row.relative_strength_score)
+      ?? DEFAULT_SCORE_STOCK_CONFIG.relativeStrength.maxScore / 2;
+    // 与 scoreStock 同一口径：原始满分 RAW_SCORE_MAX，折算到 100 分制。
+    const rawScore = trendScore + volumePriceScore + positionScore + volatilityScore + relativeStrengthScore;
+    const totalScore = round(rawScore * SCORE_SCALE / RAW_SCORE_MAX, 1);
     return {
       ...row,
       total_score: totalScore,
@@ -533,6 +559,7 @@ export class SqliteStore {
       volatility_trend_score: volatilityScore,
       volatility_class: volatilityClass,
       volatility_label: ({ high: '高波动', medium: '中波动', low: '低波动' } as const)[volatilityClass],
+      relative_strength_score: relativeStrengthScore,
       limit_up_count_20d: exactLimitUpCount,
     };
   }
@@ -560,13 +587,14 @@ export class SqliteStore {
           momentum_score, volume_score, volume_price_score, position_score,
           volatility_trend_score, alignment, trend_strength, volume_label,
           volume_price_label, position_label, volatility_class, volatility_label,
+          relative_strength_score, relative_strength_label, relative_strength_pct,
           limit_up_count_20d, sector_trend_name, sector_trend_state_id,
           latest_price,
           latest_change_rate, sector_code, sector_name, continue_num,
           reason_type, sector_change, payload_json, updated_at
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
       `);
       const insertFactor = this.database.prepare(`
@@ -602,6 +630,9 @@ export class SqliteStore {
           textValue(row.position_label),
           textValue(row.volatility_class),
           textValue(row.volatility_label),
+          finiteNumber(row.relative_strength_score),
+          textValue(row.relative_strength_label),
+          finiteNumber(row.relative_strength_pct),
           finiteNumber(row.limit_up_count_20d),
           textValue(row.sector_trend_name),
           finiteNumber(row.sector_trend_state_id),
@@ -1293,6 +1324,7 @@ export class SqliteStore {
       signal_price: numberValue(row.signal_price),
       quantity: numberValue(row.quantity),
       ...(row.rank != null ? { rank: numberValue(row.rank) } : {}),
+      ...(row.signal_score != null ? { signal_score: numberValue(row.signal_score) } : {}),
       reason: textValue(row.reason),
       ...(row.execution_window != null ? { execution_window: textValue(row.execution_window) as 'open' | 'near_close' } : {}),
       status: textValue(row.status) as PaperStrategyInstruction['status'],
@@ -1310,9 +1342,9 @@ export class SqliteStore {
       const insert = this.database.prepare(`
         INSERT INTO paper_instruction (
           id, side, stock_code, signal_date, signal_price, quantity,
-          rank, reason, execution_window,
+          rank, signal_score, reason, execution_window,
           status, created_at, submitted_at, completed_at, broker_status, execution_price
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       for (const inst of instructions) {
         this.upsertStockInfo(inst.stock_code, inst.stock_name || inst.stock_code, inst.created_at);
@@ -1324,6 +1356,7 @@ export class SqliteStore {
           inst.signal_price,
           inst.quantity,
           inst.rank ?? null,
+          inst.signal_score ?? null,
           inst.reason ?? '',
           inst.execution_window ?? null,
           inst.status,

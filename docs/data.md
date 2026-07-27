@@ -193,7 +193,7 @@
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `factor_weights` | `FactorWeights` | 四维因子权重（`trendWeightPct` / `volumePriceWeightPct` / `distanceFromLowWeightPct` / `volatilityTrendWeightPct`） |
+| `factor_weights` | `FactorWeights` | 五维因子权重（`trendWeightPct` / `volumePriceWeightPct` / `distanceFromLowWeightPct` / `volatilityTrendWeightPct` / `relativeStrengthWeightPct`），范围 1–200，归一化后总分恒为 100 分制 |
 | `scoring_config` | `ScoreStockConfig` | 评分参数配置（距低点分档阈值、趋势参数、波动率矩阵） |
 | `applied_backtest_run_id` | string? | 来源回测 run_id，便于溯源 |
 | `updated_at` | string | 更新时间戳 |

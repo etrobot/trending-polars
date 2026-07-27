@@ -49,6 +49,18 @@ export interface BlockAnalysis {
     latest?: number;
     ma5?: number | null;
     ma20?: number | null;
+    adx?: number;
+    plus_di?: number;
+    minus_di?: number;
+    /** 多周期交叉验证把日线分类改写得更保守。 */
+    downgraded?: boolean;
+    /** 是否被多周期交叉验证改写过（升级或降级）。 */
+    adjusted?: boolean;
+    adjust_direction?: 'up' | 'down';
+    original_state_id?: number;
+    original_state_name?: string;
+    /** 周/月线是否参与判定；未参与时该状态仅由日线得出。 */
+    confirmations?: { weekly: boolean; monthly: boolean };
   };
   strategy: {
     action: StrategyAction;
@@ -96,6 +108,11 @@ export interface RankingRow {
   volatility_trend_score?: number;
   volatility_class?: 'high' | 'medium' | 'low' | string;
   volatility_label?: string;
+  /** 维度 5：相对强度得分（0-20）。 */
+  relative_strength_score?: number;
+  relative_strength_label?: string;
+  /** 个股 N 日收益 − 基准 N 日收益（百分点）；基准缺失时为 null。 */
+  relative_strength_pct?: number | null;
   limit_up_count_20d?: number;
   alignment: string;
   trend_strength?: number;
@@ -311,6 +328,8 @@ export interface PaperStrategyInstruction {
   signal_price: number;
   quantity: number;
   rank?: number;
+  /** 信号日总分（100 分制）；执行时按同一评分缩放仓位，避免计划与成交口径不一致。 */
+  signal_score?: number;
   reason: string;
   execution_window?: PlanExecutionWindow;
   status: StrategyInstructionStatus;

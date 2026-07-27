@@ -15,8 +15,16 @@
 | 配置域 | 字段 | 含义 |
 |--------|------|------|
 | `distanceFromLow` | `tiers[]`, `atLowScore`, `extendedScore` | 距 60 日低点评分的分档阈值和分值 |
-| `trend` | `bullishAlignment`, `trendBonusMultiplier`, `sectorUpBonus` | K 线趋势评分参数 |
+| `trend` | `bullishAlignment`, `trendBonusMultiplier`, `trendStrengthThreshold`, `sectorUpBonus` | K 线趋势评分参数 |
 | `volatilityTrend` | `limitUp.highMinLimitUps`, `matrix` | 波动率分类阈值和交叉评分矩阵 |
+| `relativeStrength` | `lookback`, `floorPct`, `capPct`, `maxScore` | 维度 5 相对强度的窗口与映射区间 |
+| `marketState` | `MarketStateThresholds` 全部字段 | 八态分类阈值（ADX 门槛、量比、筑底确认数…） |
+
+> `marketState` 挂在 `ScoreStockConfig` 上，是为了复用既有的「配置 → SQLite → 回测/实盘两条打分路径」的传递链路，
+> 而不是另造一套。此前 `MarketStateThresholds` 虽然定义了类型，却没有任何调用方能把它传进 `analyzeBlockTrend`，
+> `singlePeriodTrend` 里的 `15 / 0.003 / 3`、`classifyMarketState` 里的 `0.9` 也都是裸魔数 —— 现已全部收编。
+>
+> 该组阈值**未**纳入参数优化的搜索网格：再加 8 个维度会让网格爆炸，也会加剧正是 §3.5 想要对抗的过拟合。
 
 **默认配置**：`DEFAULT_SCORE_STOCK_CONFIG`，可在 `ScoreStockConfig` 基础上通过 `normalizeScoreStockConfig(overrides)` 覆盖，生成完整配置副本。
 
@@ -62,11 +70,25 @@ df_daily (K线)
 | 7 | 恐慌暴跌 | 下跌 | 0-1成 | empty |
 | 8 | 筑底成功 | 横盘 | 1成 | buy |
 
-**分类规则**（`classifyMarketState()`）：
-- 上升趋势（`bullish` 排列或 `trendStrength > 0.003`）：距高点 3% 内且量比≥0.9 → 主线主升；距高点 3% 内且缩量 → 高位滞涨；距高点≥5% → 首次回调
-- 下跌趋势（`bearish` 排列或 `trendStrength < -0.003`）：5日跌幅≥8% 或波动率≥4.5 → 恐慌暴跌；否则 → 阴跌不止
+**分类规则**（`classifyMarketState()`，阈值全部来自 `MarketStateThresholds`）：
+- 上升趋势：`bullish` 排列，或 `trendStrength > 0.003` **且** ADX 确认（`adx ≥ 20` 且 `+DI − -DI > 3`）
+  - 距高点 3% 内 → 量比 ≥ 0.9（`risingVolumeRatio`）为主线主升，否则高位滞涨
+  - 距高点 ≥ 5% → 首次回调
+  - 中间带 −5% ~ −3% → **同样做量能检验**（曾经无条件判主线主升，导致 −2% 缩量判卖出、−4% 缩量判七九成买入的悬崖）
+- 下跌趋势：`bearish` 排列，或 `trendStrength < -0.003` 且 ADX 确认反向。5 日跌幅≥8% 或波动率≥4.5 → 恐慌暴跌；否则 → 阴跌不止
 - 横盘：量比<0.8 → 缩量无序；否则 → 箱体震荡
-- **筑底成功**（state 8）：不上升也不下跌 + 5 日涨幅>0 且 ≤8% + 量比≥1.0 + 距高点 ≤-8% + 趋势强度>-0.005 → 视为底部反转（仓位建议 1 成，由 `assessMarketTiming()` 计为偏强）
+- **筑底成功**（state 8）：不上升 + 5 日涨幅 ∈ [2%, 8%] + 量比≥1.1 + 距高点 ≤-8% + 趋势强度>-0.005，**并且**通过底部反转确认
+
+> **ADX 预热保护**：`computeADX` 需要 `period × 2 = 28` 根 K 线才完成 Wilder 预热，未预热时返回 `warm: false`。
+> 此时 ADX **不构成否决条件**，趋势判定退回纯斜率 —— 否则样本刚够 20 根的板块会被系统性压成震荡市。
+
+> **底部反转确认**（`bottomingConfirmations`）：区分「筑底成功」与「下跌中继反抽」。
+> state 8 按设计就发生在均线仍空头排列的结构里，不能用 `!falling` 简单排除，真正的分水岭是方向是否已转折。
+> 四项证据分两类：
+> - 动量类：收盘站上 MA5、-DI 收敛（`direction > -10`）。**一根长阳就能同时点亮两项**（实测阴跌中插入 +8.5% 假反弹即可）。
+> - 结构类：MA5 掉头向上、低点抬高（最近 5 日最低 > 前 10 日最低）。需要连续多根 K 线配合，单根脉冲伪造不出来。
+>
+> 判定要求「总数 ≥ `bottomingMinConfirmations`（默认 2）**且** 结构类 ≥ 1」。
 
 > `state_id=8` 在表 `sector_trend_daily` 由 v18 起不再被 CHECK 约束拒绝；`server/sqlite/helpers.ts` 的 `STATE_NAMES` 与 `scoring-engine.ts` 的 `STATE_TABLE` 同步暴露该状态。
 
@@ -85,15 +107,37 @@ df_daily (K线)
   ├─ 月线粗判断: singlePeriodTrend() → up / down / range
   │
   └─ 交叉验证
-       ├─ 日线上升 + 周月均下跌 → 降级为「阴跌不止」（downgraded=true）
+       ├─ 日线上升 + 周月均下跌 → 降级为「阴跌不止」（adjust_direction='down'）
+       ├─ 日线 state 8 + 周月均下跌 → 抑制为「阴跌不止」（adjust_direction='down'）
+       ├─ 日线下跌 + 周月均上升 → 升级为「筑底成功」（adjust_direction='up'）
        └─ 其他情况 → 正常使用日线状态
 ```
 
-**输出字段**：`state_id`, `state_name`, `trend`, `position`, `signal`, `latest`, `ma5`, `ma20`, `near_high`, `volume_trend`, `downgraded?`
+**周/月线最小样本**：`MIN_HIGHER_TIMEFRAME_BARS = 28`（ADX 预热长度）。
+过去的门槛是 14 根 —— 而 14 根恰好让 `computeADX` 返回 0 从而永远判 `range`，15~27 根则输出未预热的噪音值，门槛形同虚设却又不可信。
+
+**窗口一致性**：日线取 `SECTOR_STATE_WINDOW_BARS = 120` 根、周月线取 `HIGHER_TIMEFRAME_WINDOW_BARS = 60` 根，
+**实盘与回测两条路径必须取同一值**。ADX 的 Wilder 平滑是路径依赖的（IIR）：同一根 K 线喂 60 根和喂 250 根历史会给出不同 ADX，
+可能跨过 `adxTrending` 门槛得到不同 `state_id`，回测结论就无法外推到实盘。
+
+**输出字段**：`state_id`, `state_name`, `trend`, `position`, `signal`, `latest`, `ma5`, `ma20`, `near_high`, `volume_trend`,
+`adx`, `plus_di`, `minus_di`, `adjusted?`, `adjust_direction?`, `downgraded?`, `original_state_id?`, `confirmations?`, `higher_timeframe?`
+
+> `downgraded` 只在**降级**时为 true；升级请读 `adjusted` + `adjust_direction`。
+> 旧实现两种情况都写 `downgraded=true`，审计时分不清方向。
+> `confirmations` 标明周/月线是否真的参与判定 —— 仅由日线得出的状态可信度较低。
 
 ### 1.4 板块策略矩阵 —— `server/scoring-engine.ts`
 
-**接口**：`blockStrategy(stateId, limitUpNum, maxContinue) → BlockStrategy`
+**接口**：`blockStrategy(stateId, limitUpNum, maxContinue, context?) → BlockStrategy`
+
+**热度判定**（`isHotBlock`）：连板高度 ≥ 2，且涨停家数 ≥ **随市场温度缩放**的门槛
+（全市场涨停总数 × 12%，钳制在 3~8 家）。冷市场（全市场 30 家）4 家即达标，热市场（120 家）需要 8 家。
+不传 `marketLimitUpTotal` 时退回固定阈值 5。旧实现用固定 5 家一刀切，冷热市场的同一个数字含义完全不同。
+
+**多周期正向共振**：`context.higherTimeframe` 显示周月线同时向上时，仓位在
+`0成 → 0-1成 → 1成 → 0-3成 → 3-5成 → 7-9成` 的梯子上**上调一档**。
+负向背离不在这里再减一档 —— 那已由 `analyzeBlockTrend` 改写 `state_id` 处理过，重复扣会把同一信号计两次。
 
 **策略规则**（状态 × 涨停热度）：
 
@@ -132,15 +176,23 @@ Phase 1: 数据准备
   ├─ prepareSeries() → 排序 + 日期索引
   └─ 可选：SectorContext（板块趋势上下文）
 
-Phase 2: 四维评分计算（scoreStock()）
+Phase 2: 五维评分计算（scoreStock()）
   ├─ K线趋势评分（40分）
   ├─ 价量配合评分（25分）
   ├─ 距60日低点评分（20分）
-  └─ 波动率-趋势适配评分（15分）
-  → 返回 RankingRow（含策略建议）
+  ├─ 波动率-趋势适配评分（15分）
+  └─ 相对强度评分（20分）
+  → 原始满分 120 → 折算到 100 分制 → 返回 RankingRow
 ```
 
 **核心引擎**：`scoreStock(series, date, sector?) → RankingRow | null`（`scoring-engine.ts`），同时被回测引擎和收盘决策使用。需要至少 20 根 K 线。
+
+**总分标度**：原始满分 `RAW_SCORE_MAX = 120`，对外统一折算到 `SCORE_SCALE = 100`。
+下游全是绝对阈值（入场线 40、策略分档 70/55/40/25/10），不折算的话加维度就会让这些阈值的含义整体漂移。
+
+> **口径一致性**：`scoreStock`（实盘）与 `computeBacktestScores`（向量化回测）是同一套评分的两份实现，
+> 历史上已经漂移过两次（向量化路径漏了 trendBonus 死区；实盘路径用个股 alignment 冒充板块趋势）。
+> `tests/scoring-parity.test.ts` 逐股逐日比对五个维度，任何一处只改单边就会红。
 
 ### 2.2 评分维度详解
 
@@ -161,24 +213,45 @@ Phase 2: 四维评分计算（scoreStock()）
 
 `volumePriceScore(bars, endIndex) → { score, label }`
 
-| 状态 | 分值 | 判断条件 |
-|------|------|---------|
-| 顶部放量 | 2 | 涨幅>5% + 量比>1.5 + 距60日高点<5% |
-| 高位滞涨 | 1 | 涨幅±1%内 + 量比>1.5 + 距高点<5% |
-| 放量下跌 | 2 | 量比>1.5 + 下跌 |
-| 启动放量 | 20 | 量比>1.5 + 涨幅>3% + 距60日低点>15% |
-| 低位启动 | 18 | 量比>1.5 + 涨幅0-3% + 距低点>15% |
-| 放量滞涨 | 10 | 量比>1.5 + 涨幅±1% |
-| 追高放量 | 12 | 量比>1.5 + 涨幅>5%（非顶部） |
-| 稳健放量 | 22 | 量比1.1-1.5 + 涨幅0-3% + 非顶部 |
-| 高位稳量 | 14 | 量比1.1-1.5 + 涨幅0-3% + 近高点 |
-| 温和放量 | 15 | 量比1.1-1.5 + 涨幅>3% |
-| 健康回调 | 8 | 量比1.1-1.5 + 下跌 |
-| 缩量上涨 | 12 | 量比<0.8 + 上涨 |
-| 缩量下跌 | 10 | 量比<0.8 + 下跌 |
-| 量价均衡 | 10 | 其他情况 |
+判定按 **位置三分 × 涨跌幅五分** 的互斥网格展开，两组区间都穷尽且不重叠：
+
+- 位置：`近高点`(距高点 > −5%) / `中位`(−15% ~ −5%) / `远离高点`(< −15%)
+- 涨跌幅：`decline`(< −1%) / `flat`(−1% ~ 1%) / `smallGain`(1% ~ 3%) / `mildGain`(3% ~ 5%) / `bigGain`(> 5%)
+
+| 量比 | 位置 | 涨跌幅 | 分值 | 标签 |
+|------|------|--------|------|------|
+| >1.5 | 近高点 | bigGain | 2 | 顶部放量 |
+| >1.5 | 近高点 | flat | 1 | 高位滞涨 |
+| >1.5 | 近高点 | decline | 2 | 放量下跌 |
+| >1.5 | 近高点 | 其他 | 8 | 高位放量 |
+| >1.5 | 远离高点 | mild/bigGain | 20 | 启动放量 |
+| >1.5 | 远离高点 | smallGain | 18 | 低位启动 |
+| >1.5 | 远离高点 | flat | 10 | 放量滞涨 |
+| >1.5 | 远离高点 | decline | 2 | 放量下跌 |
+| >1.5 | 中位 | bigGain | 12 | 追高放量 |
+| >1.5 | 中位 | mildGain | 16 | 中位放量 |
+| >1.5 | 中位 | smallGain | 15 | 中位放量 |
+| >1.5 | 中位 | flat | 10 | 放量滞涨 |
+| >1.5 | 中位 | decline | 2 | 放量下跌 |
+| 1.1–1.5 | 近高点 | smallGain | 14 | 高位稳量 |
+| 1.1–1.5 | 非近高点 | smallGain | 22 | 稳健放量 |
+| 1.1–1.5 | — | mild/bigGain | 15 | 温和放量 |
+| 1.1–1.5 | — | decline | 8 | 健康回调 |
+| 1.1–1.5 | — | flat | 10 | 量价均衡 |
+| <0.8 | — | 上涨 | 12 | 缩量上涨 |
+| <0.8 | — | decline | 10 | 缩量下跌 |
+| 其他 | — | — | 10 | 量价均衡 |
 
 **量比计算**：近5日均量 / 再前5日均量
+
+> 修复了两处结构缺陷：
+> 1. **中位分支空洞** —— `启动放量` 要求距高点 < −15%、`追高放量` 只认涨幅 > 5%，
+>    于是「放量 + 涨 4% + 距高点 −10%」谁都不命中，掉进兜底的「量价均衡」拿 10 分，标签和分值都是错的。现由 `中位放量` 承接。
+> 2. **0% 附近的 16 分悬崖** —— 旧的 `decline(<0)` 与 `stagnation([-1,1])` 区间重叠且 decline 排在前面，
+>    导致放量微跌 −0.5% 判「放量下跌」2 分、微涨 +0.5% 判「低位启动」18 分。现在滞涨区跨 0 对称，1 个百分点的日内噪音不再翻转结论。
+>
+> 边界仍是离散跳变（未做插值）：这套判定有实盘与向量化两份实现，
+> 插值会让两边的对齐难度翻倍，而 parity 分歧正是本模块历史上最主要的 bug 来源。
 
 #### 维度 3：距60日低点评分（20 分）
 
@@ -204,7 +277,40 @@ Phase 2: 四维评分计算（scoreStock()）
 |:---:|:---:|:---:|:---:|
 | **高** | 15 | 8 | 1 |
 | **中** | 12 | 6 | 3 |
-| **低** | 8 | 4 | 5 |
+| **低** | 8 | 5 | 4 |
+
+矩阵两个方向都单调，且两种单调性含义不同：
+
+- **行**（同一波动率比趋势）：`up > range > down`。旧的 low 行是 `8 / 4 / 5`，
+  「低波动 + 下跌」比「低波动 + 震荡」还高 1 分，是唯一一处行内倒挂。
+- **列**（同一趋势比波动率）：下跌市里 `low > medium > high`（低波动受损最小），
+  上涨/震荡市里 `high > medium > low`（高波动更有博弈价值）。这是刻意设计，不得"修正"。
+
+> 板块趋势轴同时驱动维度 1 的板块加分（±4）与本维度的列选择。
+> 拿不到板块状态时 `sector.trend` 必须为 `undefined`（板块加分为 0），
+> **不得**回退到个股自身的均线排列 —— 那等于把同一个信号计入 2~3 次，且与向量化回测路径不一致。
+> 本维度的 alignment 回退由 `scoreStock` 内部完成，两条路径口径相同。
+
+#### 维度 5：相对强度（20 分）
+
+`relativeStrengthScore(stockReturn, benchmarkReturn, config) → { score, label, excessPct }`
+
+超额收益 = 个股 `lookback`(默认 20) 日收益 − 基准（上证指数 `sh000001`）同期收益，
+线性映射到 0~20 分：`floorPct(-15)` 以下得 0，`capPct(+25)` 以上得满分。基准缺失时给中性分 10 并标注「基准缺失」。
+
+| 超额收益 | 标签 |
+|---------|------|
+| ≥ +15pct | 显著跑赢 |
+| ≥ +5pct | 跑赢大盘 |
+| > −5pct | 同步大盘 |
+| > −15pct | 跑输大盘 |
+| 其余 | 显著跑输 |
+
+补的是原本整套评分最大的缺口：README 的核心逻辑写着「指数定仓位」，
+但此前四个维度全是绝对口径（距 60 日高/低点、均线排列、量比），没有任何一项衡量个股相对大盘的强弱 ——
+牛市里所有股票的位置分一起上移、熊市一起下移，截面区分度被系统性压缩。
+
+本维度刻意做成**连续**映射而非分档，不引入新的阈值悬崖。
 
 ### 2.3 总分与策略判定
 
@@ -219,7 +325,18 @@ Phase 2: 四维评分计算（scoreStock()）
 | ≥ 10 | reduce | 观望减仓 | 0.05 |
 | < 10 | ignore | 坚决回避 | 0 |
 
-满分 100＝趋势40 + 价量25 + 距60日低点20 + 波动15。
+原始满分 120 ＝ 趋势40 + 价量25 + 距60日低点20 + 波动15 + 相对强度20，对外折算到 100 分制。
+
+**这张表现在真的生效了**：`calculateEntrySize` 会按 `positionRatioForScore(totalScore)` 缩放单票额度
+（`T1StrategyConfig.scoreScaledSizing`，默认开启），高分股票拿更大仓位。
+在此之前 `positionRatioForScore` / `strategyForScore` 只被测试引用，实盘与回测一律用固定的 `positionSizePct`，
+**所有入选股票仓位完全相同**，评分只决定「买不买」而不决定「买多少」—— 文档描述的行为从未运行过。
+
+模拟交易的指令会记录 `signal_score`，执行时用计划时的同一个总分重算仓位，避免计划量与成交量不一致。
+
+**排序并列**：四个离散维度让 `total_score` 的取值集合很小、并列极多。
+`compareByScore` 用连续量 `trend_strength` 作次键破平局，`stock_code` 只作最终兜底 ——
+旧实现直接用 `stock_code.localeCompare`，导致 top-N 选股系统性偏向代码小的股票（000xxx / 600xxx）。
 
 ---
 
@@ -273,7 +390,8 @@ Phase 2: 四维评分计算（scoreStock()）
 ```
 1. 板块趋势滚动计算（computeSectorStates）
    ├─ 遍历 HistoricalMarketData.blocks（板块指数日线）
-   └─ 对每个板块在每个回测日期调用 classifyMarketState() 获取当日状态
+   ├─ 对每个板块在每个回测日期调用 analyzeBlockTrend()（日线 + 周月交叉验证）
+   └─ 窗口长度取 SECTOR_STATE_WINDOW_BARS / HIGHER_TIMEFRAME_WINDOW_BARS，与实盘路径严格一致
    → 返回 Map<sector_code, Map<date, state_id>>
 
 2. 构建扁平化列数组
@@ -284,7 +402,7 @@ Phase 2: 四维评分计算（scoreStock()）
 3. 单次 Polars DataFrame 运算
    ├─ 滚动窗口：MA5/10/20/60、量比、60日高点、20日涨停计数
    ├─ 均线排列分类（bullish/bearish/tangled）
-   ├─ 四维评分：趋势(40) + 价量(25) + 位置(20) + 波动率(15)
+   ├─ 五维评分：趋势(40) + 价量(25) + 位置(20) + 波动率(15) + 相对强度(20) → 折算 100 分制
    └─ 策略分类（accumulate/trade/reduce/ignore）
 
 4. 按日期分组，排序编号
@@ -311,7 +429,9 @@ Phase 2: 四维评分计算（scoreStock()）
 | 佣金 | 3bps | 最低 5 元 |
 | 印花税 | 5bps | 仅卖出时收取 |
 
-**因子加权**（`FactorWeights`，`backtest-engine.ts`）：回测对每个评分项叠加线性权重，组合权重在 `applyFactorWeights()` 中按 `× 权重/100` 缩放后排总分，搜索空间可在 `POST /api/backtest/run` 通过 `trend_weight_pct / volume_price_weight_pct / distance_from_low_weight_pct / volatility_weight_pct`（范围 1–100）覆盖，默认均为 100%：
+**因子加权**（`FactorWeights`，`backtest-engine.ts`）：`applyFactorWeights()` 对五个维度施加线性权重。
+可在 `POST /api/backtest/run` 通过 `trend_weight_pct / volume_price_weight_pct / distance_from_low_weight_pct /
+volatility_weight_pct / relative_strength_weight_pct` 覆盖，**范围 1–200**（100 为中性），默认均为 100：
 
 | 权重字段 | 默认 | 作用维度 |
 |----------|------|----------|
@@ -319,6 +439,17 @@ Phase 2: 四维评分计算（scoreStock()）
 | `volumePriceWeightPct` | 100 | 维度 2：价量配合评分 |
 | `distanceFromLowWeightPct` | 100 | 维度 3：距 60 日低点评分 |
 | `volatilityTrendWeightPct` | 100 | 维度 4：波动率-趋势适配评分 |
+| `relativeStrengthWeightPct` | 100 | 维度 5：相对强度评分 |
+
+> **权重是归一化的**：加权和会除以「本组权重下的理论满分」再放大回 100 分制，
+> 所以调权重只改变维度的**相对**影响，不改变总分量纲。全 100 时结果与未加权的 `scoreStock` 完全一致。
+>
+> 这一点是必须的。下游全是绝对阈值（入场线 `minEntryScore=40`、策略分档 70/55/40/25/10）。
+> 旧写法直接乘 `pct/100` 且上限锁在 100 —— 权重只能往下调，总分就只会缩水：
+> 例如 `(trend 70, distance 70)` 把理论满分压到 82，40 分的入场线等效变成原口径的 **48.8 分**。
+> 于是参数优化器搜索权重时，同时改变了「因子相对权重」与「绝对入场松紧」两件事，
+> 两个效应完全纠缠，搜出来的"最优权重"很可能只是在调仓位数量，而不是在调因子。
+> 上限放宽到 200 后，权重可以「加强」而不只是「削弱」某个维度。
 
 **回测主循环**：
 
@@ -446,10 +577,18 @@ for each date in 交易日:
 
 ```
 2a 核心交易参数：6 持仓天数 × 5 止盈 × 5 止损 = 150 组
-2b 仓位 + 因子权重（在 2a 最优基础上）：
-   4 持仓个数 × 4 单票仓位 × 3 距低点权重 × 3 趋势权重 = 144 组
-合计 294 组回测 → 选 objective 最高
+2b 仓位（在 2a 最优基础上）：4 持仓个数 × 4 单票仓位 = 16 组
+2c 五个因子权重坐标下降：2 轮 × 5 维 × 3 取值 = 30 组
+合计约 196 组回测 → 选 objective 最高
 ```
+
+> **2c 的三处修正**：
+> 1. 旧版只搜 `trend` / `distanceFromLow` 两维，`volumePrice` / `volatility` / `relativeStrength` 恒为 100，从未被优化。
+> 2. `volatilityWeightPct` 即使传了也**被静默丢弃** —— 优化器用的字段名与 `quickSimulateBacktest` 读的
+>    `volatilityTrendWeightPct` 不匹配。现在两个名字都接受。
+> 3. 取值区间从 `[70, 100]`（只能往下调）改为以 100 为中心的 `70 / 100 / 130`。
+>
+> 全网格是 3⁵ = 243 组；坐标下降只要 30 组，覆盖的维度反而更多。
 
 若阶段 2 仍未超过阶段 0 的默认基线（默认 scoreStock + 默认策略参数跑出的 `baseline.validation`），将 `optimized/validation` 回退为默认，并在 `methodology` 中说明「未超越默认方案」。
 
@@ -485,6 +624,39 @@ POST /api/backtest/optimize?days=20&date=YYYYMMDD
 - 「开始参数优化」→ 调起异步任务，完成后弹出「参数优化结果」modal（含阶段 1 评分配置表 + 阶段 2 交易参数 + 验证 vs 基线对比 + 分档收益明细 + ★ 优选分档）
 - 「应用到回测设置」一键把推荐参数写回回测表单
 - 历史记录 modal：支持分页（`HISTORY_PAGE_SIZE = 15`）+ 勾选批量删除
+
+---
+
+## 3.5 因子有效性评估 —— `server/factor-ic.ts`
+
+> 与回测收益**正交**的证据链。参数优化在几十个交易日上找「收益最高的权重」极易过拟合 ——
+> 它优化的是这段样本的路径，而不是因子的预测能力。这里回答的是另一个问题：
+> **某个维度到底有没有预测未来收益？**
+
+**接口**：`computeFactorIC(history, days=60, forwardDays=5, scoringConfig?) → FactorICReport`
+
+**API**：`GET /api/backtest/factor-ic?days=60&forward_days=5`
+
+**输出指标**（逐维度 + 总分）：
+
+| 指标 | 含义 | 判读 |
+|------|------|------|
+| `meanIC` | 逐日截面 RankIC（因子值排名 vs 未来收益排名的 Spearman）的时序均值 | \|IC\| > 0.03 有效，> 0.05 强 |
+| `stdIC` | RankIC 的时序标准差 | — |
+| `icir` | `meanIC / stdIC`，稳定性 | IC 高但忽正忽负的因子不可用 |
+| `tStat` | `icir × sqrt(天数)` | \|t\| > 2 才算显著 |
+| `positiveRatio` | IC > 0 的交易日占比 | 接近 50% 说明是噪音 |
+| `quintileReturns[5]` | 按因子值五等分后各档的未来平均收益 | — |
+| `monotone` | 分层收益是否随因子值单调上升 | `false` 说明关系非线性或纯噪音 |
+
+**因子相关矩阵**：`correlations[]` 给出五个维度两两的截面 Spearman 相关（`total_score` 是线性组合，不参与）。
+相关性 > 0.7 提示两个维度在重复计入同一个信号 —— 例如板块趋势同时驱动维度 1 的板块加分与维度 4 的趋势轴选择。
+
+**口径说明**：未来收益取「信号日收盘 → `forwardDays` 个交易日后收盘」。
+回测实际是次日开盘成交，两者有 1 日错位；IC 衡量的是因子的**排序能力**而非可实现收益，收盘对收盘是标准做法。
+
+**建议用法**：调权重前先看 IC。一个 `meanIC ≈ 0`、`monotone=false` 的维度，
+无论参数优化把它的权重调到多少，都只是在拟合噪音。
 
 ---
 

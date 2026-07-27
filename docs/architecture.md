@@ -53,10 +53,10 @@
 | 启动引导 | `server/index-bootstrap.ts` | 上证指数历史补全、交易日历解析、`resolveLatestTradingDate()` |
 | 混合数据存储 | `server/data-store.ts` | SQLite 门面、旧 JSON 种子迁移、缓存/状态/回测归档/排行配置 |
 | SQLite 仓储 | `server/sqlite-store.ts` | `node:sqlite` 批量 upsert、结构化查询；PRAGMA 与状态查询 |
-| SQLite schema | `server/sqlite/schema.ts` | 建表、迁移 `migrateV15/migrateV16`，`SCHEMA_VERSION=18` |
+| SQLite schema | `server/sqlite/schema.ts` | 建表、迁移 `migrateV15/V16/V18/V19`，`SCHEMA_VERSION=20` |
 | SQLite 工具 | `server/sqlite/helpers.ts` | 类型定义、值转换（`LimitUpRecord`、`STATE_NAMES`、类型工具） |
 | 行情采集 | `server/historical-market.ts` | 多源 K 线、板块 K 线、涨停排行采集 |
-| 评分引擎 | `server/scoring-engine.ts` | 四维多因子评分 + 八态市场分类 + 板块趋势分析；导出可配置 `ScoreStockConfig` |
+| 评分引擎 | `server/scoring-engine.ts` | 五维多因子评分 + 八态市场分类 + 板块趋势分析；导出可配置 `ScoreStockConfig` |
 | 排行榜查询 | `server/polars-engine.ts` | 排行榜查询/排序/筛选、情绪聚合、重算 |
 | 排行配置 | `server/ranking-config.ts` | `RankingRuntimeConfig`（因子权重 + 评分配置 + 回测来源）；从回测结果提取配置、默认配置生成 |
 | 向量化回测评分 | `server/backtest-scoring.ts` | 单次 Polars 遍历计算全量股票×日期评分矩阵，替代逐日逐股 `scoreStock` 循环 |

@@ -838,6 +838,7 @@ export class PaperTradingService extends EventEmitter {
       context.rankings,
       excludedCodes,
       Math.max(this.strategy.maxCandidates, planCount),
+      this.strategy.minEntryScore,
     )
       .map((candidate, index) => ({
         ...candidate,
@@ -852,7 +853,8 @@ export class PaperTradingService extends EventEmitter {
     for (const candidate of candidates) {
       if (plannedCount >= planCount) break;
       const signalPrice = Number(candidate.latest_price ?? 0);
-      const sizing = calculateEntrySize(estimatedCash, referenceCapital, signalPrice, this.strategy);
+      const signalScore = Number(candidate.total_score ?? 0);
+      const sizing = calculateEntrySize(estimatedCash, referenceCapital, signalPrice, this.strategy, signalScore);
       const status = sizing ? 'pending' as const : 'skipped' as const;
       const reason = sizing
         ? withExecutionTiming(`信号日${signalDate} 排名#${candidate.rank}`, 'buy', executionWindow)
@@ -866,6 +868,7 @@ export class PaperTradingService extends EventEmitter {
         signal_price: signalPrice,
         quantity: sizing?.shares ?? 0,
         rank: candidate.rank,
+        signal_score: signalScore,
         reason,
         execution_window: executionWindow,
         status,
@@ -1003,7 +1006,8 @@ export class PaperTradingService extends EventEmitter {
         stage: `${executionWindow}:quote`,
         source: 'paper_trading',
       });
-      const sizing = calculateEntrySize(availableCash, referenceCapital, quote, this.strategy);
+      // 用计划时记录的总分重算仓位：不传的话执行量会比计划量大（缩放系数退回 1）。
+      const sizing = calculateEntrySize(availableCash, referenceCapital, quote, this.strategy, instruction.signal_score);
       if (!sizing) {
         instruction.status = 'skipped';
         instruction.completed_at = shanghaiClock(this.now()).timestamp;

@@ -31,6 +31,7 @@ export interface OptimizedStrategyParams {
   volumePriceWeightPct: number;
   distanceFromLowWeightPct: number;
   volatilityWeightPct: number;
+  relativeStrengthWeightPct: number;
 }
 
 export interface BacktestValidation {
@@ -101,6 +102,7 @@ function defaultStrategyParams(): OptimizedStrategyParams {
     volumePriceWeightPct: 100,
     distanceFromLowWeightPct: 100,
     volatilityWeightPct: 100,
+    relativeStrengthWeightPct: 100,
   };
 }
 
@@ -398,29 +400,48 @@ function gridSearchBacktestParams(
 
   const maxPositionsList = [3, 5, 7, 10];
   const positionSizeList = [10, 15, 20, 25];
-  const distanceWeightList = [70, 85, 100];
-  const trendWeightList = [70, 85, 100];
 
-  // 2b：在 2a 最优附近调仓位与因子权重
+  // 2b：在 2a 最优附近调仓位
   for (const maxPositions of maxPositionsList) {
     for (const positionSizePct of positionSizeList) {
-      for (const distanceFromLowWeightPct of distanceWeightList) {
-        for (const trendWeightPct of trendWeightList) {
-          const candidate: OptimizedStrategyParams = {
-            ...bestParams,
-            maxPositions,
-            positionSizePct,
-            distanceFromLowWeightPct,
-            trendWeightPct,
-          };
-          const validation = quickSimulateBacktest(context, candidate);
-          evaluated += 1;
-          const objective = backtestObjective(validation);
-          if (objective > bestObjective) {
-            bestObjective = objective;
-            bestParams = candidate;
-            bestValidation = validation;
-          }
+      const candidate: OptimizedStrategyParams = { ...bestParams, maxPositions, positionSizePct };
+      const validation = quickSimulateBacktest(context, candidate);
+      evaluated += 1;
+      const objective = backtestObjective(validation);
+      if (objective > bestObjective) {
+        bestObjective = objective;
+        bestParams = candidate;
+        bestValidation = validation;
+      }
+    }
+  }
+
+  // 2c：五个因子权重做坐标下降。
+  // 过去只搜 trend / distanceFromLow 两维（4×4×3×3=144 次），volumePrice / volatility /
+  // relativeStrength 恒为 100 从未被优化 —— 且 volatilityWeightPct 因为键名与
+  // quickSimulateBacktest 不匹配，即使传了也被静默丢弃。
+  // 区间也从 [70,100]（只能往下调）改为以 100 为中心的 70/100/130：归一化后权重可双向调整。
+  // 全网格是 3⁵=243 次，坐标下降两轮只要 2×5×3=30 次，覆盖的维度反而更多。
+  const weightList = [70, 100, 130];
+  const weightKeys = [
+    'trendWeightPct',
+    'volumePriceWeightPct',
+    'distanceFromLowWeightPct',
+    'volatilityWeightPct',
+    'relativeStrengthWeightPct',
+  ] as const;
+  for (let round = 0; round < 2; round += 1) {
+    for (const key of weightKeys) {
+      for (const weight of weightList) {
+        if (bestParams[key] === weight) continue;
+        const candidate: OptimizedStrategyParams = { ...bestParams, [key]: weight };
+        const validation = quickSimulateBacktest(context, candidate);
+        evaluated += 1;
+        const objective = backtestObjective(validation);
+        if (objective > bestObjective) {
+          bestObjective = objective;
+          bestParams = candidate;
+          bestValidation = validation;
         }
       }
     }

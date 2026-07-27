@@ -4,6 +4,7 @@ import {
   analyzeBlockTrend,
   blockStrategy,
   classifyMarketState,
+  isHotBlock,
   computeADX,
   distanceFromLowScore,
   limitUpCount,
@@ -13,9 +14,12 @@ import {
   suggestedPositionPct,
   volatilityClassOf,
   volatilityTrendScore,
+  RAW_SCORE_MAX,
+  SCORE_SCALE,
   type Bar,
   type PreparedSeries,
 } from '../server/scoring-engine.js';
+import { calculateEntrySize, DEFAULT_T1_STRATEGY } from '../server/trading-strategy.js';
 
 /** 由每日涨跌幅（百分比）构造 Bar 序列；涨停事实另由 block_top 日期集合传入。 */
 function barsFromReturns(startPrice: number, returns: number[], volumes?: number[]): Bar[] {
@@ -56,8 +60,22 @@ describe('dimension 4 — 波动率-趋势适配矩阵', () => {
     expect(volatilityTrendScore('medium', 'range')).toBe(6);
     expect(volatilityTrendScore('medium', 'down')).toBe(3);
     expect(volatilityTrendScore('low', 'up')).toBe(8);
-    expect(volatilityTrendScore('low', 'range')).toBe(4);
-    expect(volatilityTrendScore('low', 'down')).toBe(5);
+    expect(volatilityTrendScore('low', 'range')).toBe(5);
+    expect(volatilityTrendScore('low', 'down')).toBe(4);
+  });
+
+  it('is monotone along both axes', () => {
+    // 行：同一波动率下 up > range > down。旧的 low 行是 8/4/5，
+    // 「低波动 + 下跌」比「低波动 + 震荡」还高 1 分，是唯一一处倒挂。
+    for (const volatility of ['high', 'medium', 'low'] as const) {
+      expect(volatilityTrendScore(volatility, 'up')).toBeGreaterThan(volatilityTrendScore(volatility, 'range'));
+      expect(volatilityTrendScore(volatility, 'range')).toBeGreaterThan(volatilityTrendScore(volatility, 'down'));
+    }
+    // 列：下跌市里低波动受损最小，上涨/震荡市里高波动更有价值 —— 这是刻意的设计，不得改动。
+    expect(volatilityTrendScore('low', 'down')).toBeGreaterThan(volatilityTrendScore('medium', 'down'));
+    expect(volatilityTrendScore('medium', 'down')).toBeGreaterThan(volatilityTrendScore('high', 'down'));
+    expect(volatilityTrendScore('high', 'up')).toBeGreaterThan(volatilityTrendScore('medium', 'up'));
+    expect(volatilityTrendScore('medium', 'up')).toBeGreaterThan(volatilityTrendScore('low', 'up'));
   });
 
   it('classifies volatility from 20-day limit-up count', () => {
@@ -102,11 +120,16 @@ describe('scoreStock — 四维评分与标签', () => {
     expect(row.volatility_label).toBe('低波动');
     expect(typeof row.distance_from_low_pct).toBe('number');
     expect(Number(row.position_score)).toBeGreaterThan(0);
+    // 无指数数据 → 维度 5 取中性分（maxScore/2）。
+    expect(row.relative_strength_label).toBe('基准缺失');
+    expect(row.relative_strength_score).toBe(10);
+    // 五维原始满分 120，对外折算到 100 分制。
     expect(row.total_score).toBeCloseTo(
-      Number(row.trend_score)
+      (Number(row.trend_score)
         + Number(row.volume_price_score)
         + Number(row.position_score)
-        + Number(row.volatility_trend_score),
+        + Number(row.volatility_trend_score)
+        + Number(row.relative_strength_score)) * SCORE_SCALE / RAW_SCORE_MAX,
       1,
     );
   });
@@ -174,7 +197,7 @@ describe('classifyMarketState — 八种市场状态', () => {
     const state = classifyMarketState(barsFromReturns(20, [...decline, ...recovery], volumes));
     expect(state.state_id).toBe(8);
     expect(state.state_name).toBe('筑底成功');
-    expect(state.position).toBe('1');
+    expect(state.position).toBe('1成');
     expect(state.signal).toBe('buy');
   });
 
@@ -190,21 +213,24 @@ describe('classifyMarketState — 八种市场状态', () => {
 describe('analyzeBlockTrend — 周月线交叉验证', () => {
   it('downgrades a rising daily trend to 阴跌不止 when weekly and monthly both fall', () => {
     const daily = steadyUp();
-    const weeklyDown = barsFromReturns(30, Array.from({ length: 20 }, () => -1.5));
-    const monthlyDown = barsFromReturns(40, Array.from({ length: 20 }, () => -2.5));
+    const weeklyDown = barsFromReturns(30, Array.from({ length: 30 }, () => -1.5));
+    const monthlyDown = barsFromReturns(40, Array.from({ length: 30 }, () => -2.5));
     expect(singlePeriodTrend(weeklyDown)).toBe('down');
     const result = analyzeBlockTrend(daily, weeklyDown, monthlyDown);
     expect(result.state_id).toBe(6);
+    expect(result.adjusted).toBe(true);
+    expect(result.adjust_direction).toBe('down');
     expect(result.downgraded).toBe(true);
   });
 
   it('keeps the daily state when higher timeframes are not both down', () => {
     const daily = steadyUp();
-    const weeklyUp = barsFromReturns(30, Array.from({ length: 12 }, () => 1.5));
-    const monthlyUp = barsFromReturns(40, Array.from({ length: 12 }, () => 2.0));
+    const weeklyUp = barsFromReturns(30, Array.from({ length: 30 }, () => 1.5));
+    const monthlyUp = barsFromReturns(40, Array.from({ length: 30 }, () => 2.0));
     const result = analyzeBlockTrend(daily, weeklyUp, monthlyUp);
     expect(result.state_id).toBe(1);
-    expect(result.downgraded).toBeUndefined();
+    expect(result.adjusted).toBeUndefined();
+    expect(result.confirmations).toEqual({ weekly: true, monthly: true });
   });
 });
 
@@ -232,7 +258,7 @@ describe('blockStrategy — 状态 × 涨停热度矩阵', () => {
     expect(blockStrategy(5, 9, 5)).toEqual({ action: 'ignore', label: '休息', position: '0成' });
     expect(blockStrategy(7, 6, 2)).toEqual({ action: 'trade', label: '超跌反弹', position: '0-1成' });
     expect(blockStrategy(7, 1, 1)).toEqual({ action: 'ignore', label: '回避', position: '0成' });
-    expect(blockStrategy(8, 2, 1)).toEqual({ action: 'accumulate', label: '筑底成功', position: '1' });
+    expect(blockStrategy(8, 2, 1)).toEqual({ action: 'accumulate', label: '筑底成功', position: '1成' });
   });
 });
 
@@ -331,13 +357,16 @@ describe('analyzeBlockTrend — 多周期升级/降级', () => {
   it('upgrades a falling daily trend to 筑底成功 when weekly and monthly both rise', () => {
     // 日线下跌但周月线均上升：底部共振信号
     const dailyDown = barsFromReturns(100, Array.from({ length: 60 }, () => -0.3));
-    const weeklyUp = barsFromReturns(50, Array.from({ length: 20 }, () => 1.5));
-    const monthlyUp = barsFromReturns(60, Array.from({ length: 20 }, () => 2.5));
+    const weeklyUp = barsFromReturns(50, Array.from({ length: 30 }, () => 1.5));
+    const monthlyUp = barsFromReturns(60, Array.from({ length: 30 }, () => 2.5));
     expect(singlePeriodTrend(weeklyUp)).toBe('up');
     expect(singlePeriodTrend(monthlyUp)).toBe('up');
     const result = analyzeBlockTrend(dailyDown, weeklyUp, monthlyUp);
     expect(result.state_id).toBe(8);
-    expect(result.downgraded).toBe(true);
+    expect(result.adjusted).toBe(true);
+    // 升级是变乐观，不该置位 downgraded —— 这正是旧实现分不清的地方。
+    expect(result.adjust_direction).toBe('up');
+    expect(result.downgraded).toBe(false);
     expect(result.original_state_id).toBe(6); // 日线原始为阴跌不止
   });
 
@@ -350,11 +379,73 @@ describe('analyzeBlockTrend — 多周期升级/降级', () => {
       ...Array.from({ length: 5 }, () => 1_800_000),
     ];
     const dailyBars = barsFromReturns(20, [...decline, ...recovery], volumes);
-    const weeklyDown = barsFromReturns(50, Array.from({ length: 20 }, () => -1.5));
-    const monthlyDown = barsFromReturns(60, Array.from({ length: 20 }, () => -2.5));
+    const weeklyDown = barsFromReturns(50, Array.from({ length: 30 }, () => -1.5));
+    const monthlyDown = barsFromReturns(60, Array.from({ length: 30 }, () => -2.5));
     const result = analyzeBlockTrend(dailyBars, weeklyDown, monthlyDown);
     expect(result.state_id).toBe(6);
-    expect(result.downgraded).toBe(true);
+    expect(result.adjusted).toBe(true);
+    expect(result.adjust_direction).toBe('down');
     expect(result.original_state_id).toBe(8);
+  });
+});
+
+describe('blockStrategy — 热度相对化与多周期共振', () => {
+  it('scales the hot threshold with overall market temperature', () => {
+    // 冷市场（全市场 30 家涨停）：4 家即达标（30 × 12% ≈ 4）。
+    expect(isHotBlock(4, 2, 30)).toBe(true);
+    // 热市场（全市场 120 家）：同样 4 家远不够，需要 8 家（钳制上限）。
+    expect(isHotBlock(4, 2, 120)).toBe(false);
+    expect(isHotBlock(8, 2, 120)).toBe(true);
+    // 极冷市场也不会把门槛压到 1~2 家（下限 3）。
+    expect(isHotBlock(2, 2, 8)).toBe(false);
+    expect(isHotBlock(3, 2, 8)).toBe(true);
+    // 连板高度仍是硬条件。
+    expect(isHotBlock(20, 1, 30)).toBe(false);
+    // 不传全市场总数时退回旧的固定阈值 5。
+    expect(isHotBlock(4, 2)).toBe(false);
+    expect(isHotBlock(5, 2)).toBe(true);
+  });
+
+  it('lifts the position one notch on weekly+monthly resonance', () => {
+    const base = blockStrategy(1, 2, 1);
+    const resonant = blockStrategy(1, 2, 1, { higherTimeframe: { weekly: 'up', monthly: 'up' } });
+    expect(base.position).toBe('3-5成');
+    expect(resonant.position).toBe('7-9成');
+    expect(resonant.label).toBe(base.label);
+  });
+
+  it('does not lift a 回避 state, and does not double-penalise divergence', () => {
+    // 负向背离已经由 analyzeBlockTrend 改写 state_id 处理过，这里不得再减一档。
+    const avoid = blockStrategy(6, 2, 1, { higherTimeframe: { weekly: 'down', monthly: 'down' } });
+    expect(avoid).toEqual({ action: 'ignore', label: '回避', position: '0成' });
+    const mixed = blockStrategy(1, 2, 1, { higherTimeframe: { weekly: 'up', monthly: 'range' } });
+    expect(mixed.position).toBe('3-5成');
+  });
+});
+
+describe('calculateEntrySize — 按评分缩放仓位', () => {
+  it('allocates more to a higher-scoring candidate', () => {
+    const high = calculateEntrySize(1_000_000, 1_000_000, 10, DEFAULT_T1_STRATEGY, 80);
+    const mid = calculateEntrySize(1_000_000, 1_000_000, 10, DEFAULT_T1_STRATEGY, 45);
+    // 10% 单票上限 × 0.8 / 0.4 分档系数。
+    expect(high?.shares).toBe(8000);
+    expect(mid?.shares).toBe(4000);
+  });
+
+  it('refuses to size a candidate below the lowest tier', () => {
+    expect(calculateEntrySize(1_000_000, 1_000_000, 10, DEFAULT_T1_STRATEGY, 5)).toBeNull();
+  });
+
+  it('falls back to the flat size when scaling is off or no score is given', () => {
+    const flat = calculateEntrySize(1_000_000, 1_000_000, 10, DEFAULT_T1_STRATEGY);
+    expect(flat?.shares).toBe(10_000);
+    const disabled = calculateEntrySize(
+      1_000_000,
+      1_000_000,
+      10,
+      { ...DEFAULT_T1_STRATEGY, scoreScaledSizing: false },
+      80,
+    );
+    expect(disabled?.shares).toBe(10_000);
   });
 });

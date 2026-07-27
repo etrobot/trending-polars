@@ -3,8 +3,9 @@ import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import type { AnalysisData } from '../../src/types.js';
 import { guardDetachedPromise, type AuditLevel, type AuditLoggerLike } from '../audit-log.js';
-import { runPolarsBacktest, runRandomizedBacktest } from '../backtest-engine.js';
+import { MAX_FACTOR_WEIGHT_PCT, runPolarsBacktest, runRandomizedBacktest } from '../backtest-engine.js';
 import { optimizeStrategyParams } from '../backtest-param-optimizer.js';
+import { computeFactorIC } from '../factor-ic.js';
 import { fetchSohuIndexKlines, buildBenchmarkCurve } from '../benchmark.js';
 import { compactDate, formatDateTime, round } from '../format.js';
 import { fetchAdjustedKlines, fetchBlockKlines, MAX_BACKTEST_DAYS, MIN_BACKTEST_DAYS, type BlockKlinePeriod } from '../historical-market.js';
@@ -353,7 +354,8 @@ export function registerRoutes(
     const trendWeightPct = numberParam(request.query.trend_weight_pct, 100, 1, 100);
     const volumePriceWeightPct = numberParam(request.query.volume_price_weight_pct, 100, 1, 100);
     const distanceFromLowWeightPct = numberParam(request.query.distance_from_low_weight_pct, 100, 1, 100);
-    const volatilityWeightPct = numberParam(request.query.volatility_weight_pct, 100, 1, 100);
+    const volatilityWeightPct = numberParam(request.query.volatility_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
+    const relativeStrengthWeightPct = numberParam(request.query.relative_strength_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
     const requestedDate = marketDateParam(request.query.date);
     const taskLabel = mode === 'current'
       ? `运行 ${days} 日当前方案回测`
@@ -384,6 +386,7 @@ export function registerRoutes(
         volume_price_weight_pct: volumePriceWeightPct,
         distance_from_low_weight_pct: distanceFromLowWeightPct,
         volatility_weight_pct: volatilityWeightPct,
+        relative_strength_weight_pct: relativeStrengthWeightPct,
         history_as_of_date: history.as_of_date,
         stocks: history.stocks.length,
       });
@@ -402,6 +405,7 @@ export function registerRoutes(
           volume_price_weight_pct: volumePriceWeightPct,
           distance_from_low_weight_pct: distanceFromLowWeightPct,
           volatility_weight_pct: volatilityWeightPct,
+          relative_strength_weight_pct: relativeStrengthWeightPct,
           history_as_of_date: history.as_of_date,
           stocks: history.stocks.length,
         },
@@ -425,6 +429,7 @@ export function registerRoutes(
           volumePriceWeightPct,
           distanceFromLowWeightPct,
           volatilityTrendWeightPct: volatilityWeightPct,
+          relativeStrengthWeightPct: relativeStrengthWeightPct,
           scoringConfig,
         })]
         : runRandomizedBacktest(history, {
@@ -439,6 +444,7 @@ export function registerRoutes(
           volumePriceWeightPctUpper: volumePriceWeightPct,
           distanceFromLowWeightPctUpper: distanceFromLowWeightPct,
           volatilityTrendWeightPctUpper: volatilityWeightPct,
+          relativeStrengthWeightPctUpper: relativeStrengthWeightPct,
           scoringConfig,
         });
       progress(88, mode === 'current' ? '汇总含交易成本的收益、胜率与回撤' : `汇总 ${results.length} 组回测结果`);
@@ -530,6 +536,20 @@ export function registerRoutes(
       return;
     }
     response.json(result);
+  }));
+
+  app.get('/api/backtest/factor-ic', asyncHandler(async (request, response) => {
+    // 因子有效性面板：与回测收益正交的证据，用来判断某个维度是否真的预测未来收益，
+    // 而不是让参数优化器在几十个交易日上拟合出一组「看起来最赚钱」的权重。
+    const history = await store.getHistoricalMarket();
+    if (!history?.stocks?.length) {
+      response.status(404).json({ error: 'no historical market data; run 行情采集 first' });
+      return;
+    }
+    const days = numberParam(request.query.days, 60, 10, 500);
+    const forwardDays = numberParam(request.query.forward_days, 5, 1, 20);
+    const rankingConfig = await store.getRankingConfig();
+    response.json(computeFactorIC(history, days, forwardDays, rankingConfig?.scoring_config));
   }));
 
   app.get('/api/backtest/:runId', asyncHandler(async (request, response) => {

@@ -1,6 +1,38 @@
 import { DatabaseSync } from 'node:sqlite';
 
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
+
+/**
+ * v19→20：
+ *
+ * - `stock_ranking` 新增维度 5「相对强度」的三列。评分从四维扩到五维（原始满分 120，
+ *   对外折算到 100 分制），旧行没有这一列，读取时按中性分处理。
+ * - `sector_trend_daily` 新增 `adjust_direction`：过去多周期交叉验证无论升级还是降级
+ *   都写 `downgraded=1`，审计时分不清方向。现在 `downgraded` 只表示降级，
+ *   `adjust_direction` 记录 'up' / 'down'。
+ * - `paper_instruction` 新增 `signal_score`：仓位改为按评分分档缩放后，执行时必须
+ *   拿到与计划时同一个总分，否则计划量与成交量会不一致。
+ */
+export function migrateV19(database: DatabaseSync): void {
+  const rankingCols = database.prepare(`PRAGMA table_info(stock_ranking)`).all() as Array<{ name: string }>;
+  const rankingNames = new Set(rankingCols.map((column) => column.name));
+  if (rankingCols.length && !rankingNames.has('relative_strength_score')) {
+    database.exec(`
+      ALTER TABLE stock_ranking ADD COLUMN relative_strength_score REAL;
+      ALTER TABLE stock_ranking ADD COLUMN relative_strength_label TEXT NOT NULL DEFAULT '';
+      ALTER TABLE stock_ranking ADD COLUMN relative_strength_pct REAL;
+    `);
+  }
+  const trendCols = database.prepare(`PRAGMA table_info(sector_trend_daily)`).all() as Array<{ name: string }>;
+  const trendNames = new Set(trendCols.map((column) => column.name));
+  if (trendCols.length && !trendNames.has('adjust_direction')) {
+    database.exec(`ALTER TABLE sector_trend_daily ADD COLUMN adjust_direction TEXT`);
+  }
+  const instructionCols = database.prepare(`PRAGMA table_info(paper_instruction)`).all() as Array<{ name: string }>;
+  if (instructionCols.length && !instructionCols.some((column) => column.name === 'signal_score')) {
+    database.exec(`ALTER TABLE paper_instruction ADD COLUMN signal_score REAL`);
+  }
+}
 
 /** v16→17: 允许 state_id 为 0（数据不足），配合 CHECK 约束从 BETWEEN 1 AND 7 改为 0 AND 7。 */
 export function migrateV16(database: DatabaseSync): void {
@@ -254,6 +286,7 @@ export function initializeSchema(database: DatabaseSync): void {
       plus_di REAL,
       minus_di REAL,
       downgraded INTEGER NOT NULL DEFAULT 0,
+      adjust_direction TEXT,
       original_state_id INTEGER,
       original_state_name TEXT,
       strategy_action TEXT NOT NULL DEFAULT '',
@@ -291,6 +324,9 @@ export function initializeSchema(database: DatabaseSync): void {
       position_label TEXT NOT NULL DEFAULT '',
       volatility_class TEXT NOT NULL DEFAULT '',
       volatility_label TEXT NOT NULL DEFAULT '',
+      relative_strength_score REAL,
+      relative_strength_label TEXT NOT NULL DEFAULT '',
+      relative_strength_pct REAL,
       limit_up_count_20d INTEGER,
       sector_trend_name TEXT NOT NULL DEFAULT '',
       sector_trend_state_id INTEGER,
@@ -337,6 +373,7 @@ export function initializeSchema(database: DatabaseSync): void {
       signal_price REAL NOT NULL,
       quantity INTEGER NOT NULL,
       rank INTEGER,
+      signal_score REAL,
       reason TEXT NOT NULL DEFAULT '',
       execution_window TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
@@ -369,5 +406,6 @@ export function initializeSchema(database: DatabaseSync): void {
   migrateV15(database);
   migrateV16(database);
   migrateV18(database);
+  migrateV19(database);
   database.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
 }

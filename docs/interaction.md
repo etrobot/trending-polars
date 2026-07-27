@@ -199,7 +199,7 @@ paperSockets: 连接时发送 { type: "status", connected: true }，后续事件
                    │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐               │
                    │  │ scoring-    │  │ polars-      │  │ backtest-    │               │
                    │  │ engine.ts   │  │ engine.ts    │  │ engine.ts   │               │
-                   │  │ 四维评分     │  │ 排行榜查询   │  │ 回测引擎     │               │
+                   │  │ 五维评分     │  │ 排行榜查询   │  │ 回测引擎     │               │
                    │  │ 七态分类     │  │ 排序/筛选    │  │ 历史评分     │               │
                    │  │ 板块趋势分析 │  │ 情绪聚合     │  │ (调scoring)  │               │
                    │  └──────────────┘  └──────────────┘  └──────────────┘               │
@@ -311,14 +311,18 @@ POST /api/backtest/optimize?days=20  # 两阶段参数优化（scoreStock + 回�
                                       # 完成后从 /api/tasks/:taskId.result 读取 OptimizedParams / validation
 GET /api/backtest/list               # 回测列表
 GET /api/backtest/optimize-result    # 最近一次参数优化结果
+GET /api/backtest/factor-ic?days=60&forward_days=5
+                                      # 因子有效性面板：逐维度 RankIC / ICIR / t 值 /
+                                      # 分层收益 / 因子间相关矩阵（与回测收益正交的证据）
 GET /api/backtest/:runId             # 回测详情
 DELETE /api/backtest/:runId          # 删除回测（支持前端勾选批量并发 DELETE）
 # 应用参数：前端使用任务 result.optimized，结果本身可由优化详情 modal 直接回填
 # /api/backtest/run 通用参数（mode 默认 random）：
 #   max_hold_days / max_positions / position_size_pct /
 #   take_profit_pct / stop_loss_pct /
-#   trend_weight_pct / volume_price_weight_pct /
-#   distance_from_low_weight_pct / volatility_weight_pct （1–100）
+#   trend_weight_pct / volume_price_weight_pct / distance_from_low_weight_pct /
+#   volatility_weight_pct / relative_strength_weight_pct （1–200，100 为中性）
+#   权重归一化：只改变维度的相对影响，总分量纲恒为 100 分制
 
 
 # ==== 基准指数对照 ====
