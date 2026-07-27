@@ -13,7 +13,8 @@ import { Modal } from '../components/Modal';
 import { PageHeaderActions } from '../components/HeaderActions';
 import { Button, EmptyState, LoadingPanel, Pagination, SectionHeading } from '../components/Ui';
 import { api, formatMoney, pctColor } from '../lib/api';
-import type { AutomationState, BacktestListItem, PaperOverview, PaperPlanHistoryItem, TradingWindow } from '../types';
+import { clientImmediateAutoRejection } from '../lib/trading-session';
+import type { AutomationState, BacktestListItem, PaperOverview, PaperPlanHistoryItem, TradingSession, TradingWindow } from '../types';
 
 const HISTORY_PAGE_SIZE = 15;
 const BACKTEST_HISTORY_PAGE_SIZE = 15;
@@ -78,6 +79,7 @@ function PlanHistoryTable({
 export function SimulatedTradingPage() {
   const [overview, setOverview] = useState<PaperOverview | null>(null);
   const [automation, setAutomation] = useState<AutomationState | null>(null);
+  const [tradingSession, setTradingSession] = useState<TradingSession | null>(null);
   const [connecting, setConnecting] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -98,9 +100,10 @@ export function SimulatedTradingPage() {
 
   const loadBootstrap = useCallback(async () => {
     try {
-      const result = await api<{ overview: PaperOverview; automation: AutomationState }>('/api/simulated-trading/bootstrap');
+      const result = await api<{ overview: PaperOverview; automation: AutomationState; trading_session: TradingSession }>('/api/simulated-trading/bootstrap');
       setOverview(result.overview);
       setAutomation(result.automation);
+      setTradingSession(result.trading_session);
       setError('');
     } catch (bootstrapError) {
       setError(bootstrapError instanceof Error ? bootstrapError.message : String(bootstrapError));
@@ -253,7 +256,11 @@ export function SimulatedTradingPage() {
     socket.onopen = () => setConnected(true);
     socket.onmessage = (event) => {
       try {
-        const message = JSON.parse(String(event.data)) as { type?: string };
+        const message = JSON.parse(String(event.data)) as { type?: string; payload?: TradingSession };
+        if (message.type === 'trading_session' && message.payload) {
+          setTradingSession(message.payload);
+          return;
+        }
         if (message.type !== 'status') void loadBootstrap();
       } catch {
         void loadBootstrap();
@@ -302,6 +309,23 @@ export function SimulatedTradingPage() {
   };
 
   const confirmWindow = (window: TradingWindow | 'auto') => {
+    if (window === 'auto') {
+      const clientRejection = clientImmediateAutoRejection();
+      if (clientRejection) {
+        console.log('[simulated-trading] immediate execute rejected (client)', clientRejection);
+        setNotice('');
+        setError(clientRejection);
+        return;
+      }
+      if (tradingSession && !tradingSession.immediate_execute_allowed) {
+        const reason = tradingSession.immediate_execute_reason ?? '当前不在交易时段，无法立即执行';
+        console.log('[simulated-trading] immediate execute rejected (server session)', reason);
+        setNotice('');
+        setError(reason);
+        return;
+      }
+    }
+    setError('');
     setSelectedWindow(window);
     setExecuteOpen(true);
   };

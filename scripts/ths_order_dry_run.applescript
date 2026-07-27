@@ -483,25 +483,7 @@ on refreshSimulationConnection(simulationWindow)
                 set btnX to item 1 of btnPos
                 set btnY to item 2 of btnPos
                 -- 无名按钮、同行、在"模拟"右侧且不超过"股票"位置
-                if n is "" and btnY = tabY and btnX > tabX and btnX < tabX + 200 then
-                    my pressControl(b)
-                    delay 1.5
-                    return
-                end if
-            end try
-        end repeat
-        -- 部分按钮的 name 可能无值（missing value），尝试用另一方式匹配
-        repeat with b in buttons of simulationWindow
-            try
-                set n to name of b as text
-            on error
-                set n to ""
-            end try
-            try
-                set btnPos to position of b
-                set btnX to item 1 of btnPos
-                set btnY to item 2 of btnPos
-                if n is "" and btnY = tabY and btnX > tabX and btnX < tabX + 200 then
+                if n is "" and btnY is tabY and btnX > tabX and btnX < tabX + 200 then
                     my pressControl(b)
                     delay 1.5
                     return
@@ -514,8 +496,9 @@ end refreshSimulationConnection
 on ensureWindowAvailable(appProcess)
     -- count of windows 在页面切换/窗口刚出现/辅助功能树尚未就绪时可能瞬时返回 0，
     -- 这里加长重试并预热辅助功能树，避免明明窗口已打开却误报"未找到同花顺窗口"。
+    -- Swift（AppKit）进程在非前台 Space 时 AX 树也可能延迟 1–2s 才出现。
     tell application "System Events"
-        repeat 12 times
+        repeat 8 times
             try
                 if (count of windows of appProcess) > 0 then return
             end try
@@ -523,34 +506,34 @@ on ensureWindowAvailable(appProcess)
             try
                 get name of appProcess
             end try
-            delay 0.4
-        end repeat
-        -- 窗口不可见时，尝试将进程临时激活（处理分屏/其它 Space 的情况）
-        my bringProcessToFront(appProcess)
-        repeat 8 times
-            try
-                if (count of windows of appProcess) > 0 then return
-            end try
-            delay 0.4
+            delay 0.3
         end repeat
     end tell
+    -- 这里不再主动切到前台；兜底激活统一交给 findSimulationWindow，避免重复抢焦点。
     -- 连续读不到窗口：抛出可区分根因的诊断，而不是笼统的"未找到窗口"
     error (my windowUnavailableReason(appProcess))
 end ensureWindowAvailable
 
 on bringProcessToFront(appProcess)
-    -- 临时激活进程，使辅助功能树完整暴露（Swift 应用在非前台 Space 时 AX 树可能为空）。
-    -- 仅在同花顺不是前台应用时才激活；已是前台时激活无意义且会导致分屏跳动。
+    -- 兜底激活：仅当同花顺确实不在前台时再设 frontmost，且永远不抢没有窗口的进程。
+    -- Swift App 在多个桌面/Space 时 AX 树可能在非前台瞬间为空，抬升后再读一次。
     tell application "System Events"
         try
-            if frontmost of appProcess is true then return
+            -- 仅在已有窗口且尚未前台时激活；避免掩盖"窗口被最小化"等真实失败。
+            if (count of windows of appProcess) is 0 then return
+        end try
+        try
+            if frontmost of appProcess is true then
+                delay 0.2
+                return
+            end if
         end try
         set my stoleFocus to true
         try
             set frontmost of appProcess to true
         end try
     end tell
-    delay 0.6
+    delay 0.5
 end bringProcessToFront
 
 on saveForegroundApp()
@@ -588,36 +571,21 @@ end windowUnavailableReason
 
 on findSimulationWindow(appProcess)
     tell application "System Events"
-        -- 第一轮：后台静默扫描（同分屏时不需要 activate 即可成功）
+        -- 第一轮：最多 8 次静默扫描，让 Swift 应用的 AX 树有时间填充。命中即返回。
+        repeat 8 times
+            repeat with candidateWindow in windows of appProcess
+                tell candidateWindow
+                    if (exists button "模拟股票") or (exists static text "模拟练习") or (exists static text "模拟股票") then return candidateWindow
+                end tell
+            end repeat
+            delay 0.3
+        end repeat
+        -- 静默扫描失败才走兜底激活；保证 Swift 应用即便未在最前也能完成读取，但仅此一次。
+        my bringProcessToFront(appProcess)
         repeat 4 times
             repeat with candidateWindow in windows of appProcess
                 tell candidateWindow
-                    if (exists button "模拟股票") or (exists static text "模拟练习") or (exists static text "模拟股票") then return contents of candidateWindow
-                end tell
-            end repeat
-            delay 0.35
-        end repeat
-        -- 第二轮：AXRaise + 预热辅助功能树后再扫描（仍不 activate）
-        repeat with candidateWindow in windows of appProcess
-            try
-                perform action "AXRaise" of candidateWindow
-            end try
-            try
-                get {title, position, size} of candidateWindow
-            end try
-        end repeat
-        delay 0.4
-        repeat with candidateWindow in windows of appProcess
-            tell candidateWindow
-                if (exists button "模拟股票") or (exists static text "模拟练习") or (exists static text "模拟股票") then return contents of candidateWindow
-            end tell
-        end repeat
-        -- 第三轮：静默扫描失败，尝试激活进程（若已是前台则自动跳过，不会抢焦点）
-        my bringProcessToFront(appProcess)
-        repeat 3 times
-            repeat with candidateWindow in windows of appProcess
-                tell candidateWindow
-                    if (exists button "模拟股票") or (exists static text "模拟练习") or (exists static text "模拟股票") then return contents of candidateWindow
+                    if (exists button "模拟股票") or (exists static text "模拟练习") or (exists static text "模拟股票") then return candidateWindow
                 end tell
             end repeat
             delay 0.4
@@ -756,10 +724,22 @@ on collectSnapshotTableRows(simulationWindow, snapshotKind, hintCodes)
     set my snapshotFundRowsFound to false
     set my snapshotFoundCodes to {}
     set primaryHandled to false
+    set maxRowsToScan to 500
     tell application "System Events"
         tell simulationWindow
             repeat with scrollItem in scroll areas
                 repeat with tableItem in tables of scrollItem
+                    set rowCount to 0
+                    try
+                        set rowCount to count of rows of tableItem
+                    end try
+                    set colCount to 0
+                    try
+                        set colCount to count of columns of tableItem
+                    end try
+                    if rowCount is 0 or rowCount > maxRowsToScan or colCount > 20 then
+                        cycle
+                    end if
                     if (count of rows of tableItem) <= 100 and (count of columns of tableItem) <= 20 then
                         set scanAllRows to false
                         if not primaryHandled then
@@ -773,7 +753,9 @@ on collectSnapshotTableRows(simulationWindow, snapshotKind, hintCodes)
                                 set primaryHandled to true
                             end if
                         end if
-                        my appendTableSnapshotRows(tableItem, hintCodes, capturedRows, scanAllRows)
+                        if scanAllRows or (count of hintCodes) > 0 then
+                            my appendTableSnapshotRows(tableItem, hintCodes, capturedRows, scanAllRows)
+                        end if
                         if (count of hintCodes) > 0 and my snapshotScanComplete(hintCodes, capturedRows) then
                             set plainRows to {}
                             repeat with i from 1 to count of capturedRows

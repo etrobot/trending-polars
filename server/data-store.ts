@@ -13,12 +13,14 @@ import type {
 import type { HistoricalMarketData, KLineData } from './historical-market.js';
 import type { ParamOptimizeResult } from './backtest-param-optimizer.js';
 import type { RankingRuntimeConfig } from './ranking-config.js';
+import { normalizeRankingRuntimeConfig } from './ranking-config.js';
 import { formatDateTime } from './format.js';
 import {
   SqliteStore,
   type DailyPriceCoverage,
   type LimitUpRecord,
   type RankingFactorRecord,
+  type SectorStockRecord,
   type SectorTrendRecord,
   type StoredDailyPrice,
 } from './sqlite-store.js';
@@ -253,6 +255,10 @@ export class DataStore {
     return this.sqlite.getLimitUpByDate(date);
   }
 
+  async getSectorStocks(sectorCode: string): Promise<SectorStockRecord[]> {
+    return this.sqlite.getSectorStocks(sectorCode);
+  }
+
   async getLatestAnalysisDate(): Promise<string | null> {
     return this.sqlite.getLatestAnalysisDate();
   }
@@ -333,6 +339,10 @@ export class DataStore {
     return this.sqlite.getIndexTradingDays(symbol);
   }
 
+  async patchHistoricalSnapshotCalendar(calendar: readonly string[]): Promise<boolean> {
+    return this.sqlite.patchHistoricalSnapshotCalendar(calendar);
+  }
+
   async getAllStockPriceCoverage(dateFrom: string, dateTo: string): Promise<DailyPriceCoverage[]> {
     return this.sqlite.getAllStockPriceCoverage(dateFrom, dateTo);
   }
@@ -387,7 +397,12 @@ export class DataStore {
 
   async getRankingConfig(): Promise<RankingRuntimeConfig | null> {
     try {
-      return await readJson<RankingRuntimeConfig>(path.join(this.runtime, 'ranking-config.json'));
+      const raw = await readJson<Partial<RankingRuntimeConfig> | null>(
+        path.join(this.runtime, 'ranking-config.json'),
+      );
+      // 与默认值对齐，补齐历史版本缺失的字段（relativeStrength / marketState / relativeStrengthWeightPct）。
+      // 早期写入的配置缺少这些字段，直接使用会在打分时抛 "Cannot read properties of undefined"。
+      return raw ? normalizeRankingRuntimeConfig(raw) : null;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
       throw error;

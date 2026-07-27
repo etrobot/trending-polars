@@ -15,9 +15,9 @@ import { rankingConfigFromBacktest } from '../ranking-config.js';
 import type { TaskRegistry } from '../tasks.js';
 import { ThsSimulatedBrokerError } from '../ths-simulated-broker.js';
 import { MarketService, analysisWithStats, priceRows, averageRankingChange } from './market-service.js';
-import { resolveLatestTradingDate } from '../index-bootstrap.js';
+import { resolveLatestTradingDate, loadTradingCalendar } from '../index-bootstrap.js';
 import { PAPER_ENGINE_VERSION, type PaperTradingService } from '../paper-trading.js';
-import { shanghaiClock } from '../paper-trading/helpers.js';
+import { buildTradingSession, immediateAutoWindowRejection, resolveAutoTradingWindow, shanghaiClock } from '../paper-trading/helpers.js';
 
 // ---------------------------------------------------------------------------
 // Helper types and functions
@@ -155,6 +155,54 @@ export function registerRoutes(
       request.query.date || await store.getLatestAnalysisDate() || compactDate().slice(0, 8),
     );
     response.json(await store.getLimitUpByDate(date));
+  }));
+
+  // 板块个股：列出数据库内该板块累积去重的全部个股
+  app.get('/api/sector-stocks', asyncHandler(async (request, response) => {
+    const sectorCode = String(request.query.sector_code ?? '').trim();
+    if (!sectorCode) {
+      response.status(400).json({ error: 'sector_code 不能为空' });
+      return;
+    }
+    const stocks = await store.getSectorStocks(sectorCode);
+    response.json({
+      sector_code: sectorCode,
+      sector_name: stocks[0]?.sector_name ?? '',
+      stock_count: stocks.length,
+      latest_analysis_date: stocks[0]?.latest_analysis_date ?? '',
+      fresh_count: stocks.filter((stock) => stock.price_fresh).length,
+      stocks: stocks.map((stock) => ({
+        code: stock.stock_code,
+        name: stock.stock_name,
+        latest_date: stock.date,
+        continue_num: stock.continue_num,
+        reason_type: stock.reason_type,
+        // 涨停当时的价格（仍可作为「当时连板价」参考列）
+        latest: stock.latest,
+        change_rate: stock.change_rate,
+        // 当前 K 线最新数据（仅当 price_fresh 时反映当下行情）
+        kline_date: stock.kline_date,
+        kline_latest: stock.kline_latest,
+        kline_change_rate: stock.kline_change_rate,
+        price_fresh: stock.price_fresh,
+      })),
+    });
+  }));
+
+  // 异步刷新该板块全部个股的 K 线
+  app.post('/api/sector-stocks/refresh-kline', asyncHandler(async (request, response) => {
+    const sectorCode = String(request.query.sector_code ?? '').trim();
+    if (!sectorCode) {
+      response.status(400).json({ error: 'sector_code 不能为空' });
+      return;
+    }
+    const task = tasks.start('sector_kline_refresh', `板块个股K线刷新 ${sectorCode}`, async ({ progress, cancelled }) => (
+      marketService.refreshSectorStockKlines(sectorCode, {
+        progress: (completed, total, message) => progress(Math.round((completed / total) * 100), message),
+        cancelled,
+      })
+    ));
+    response.status(202).json({ task_id: task.id, status: 'started', message: '板块个股K线刷新任务已启动' });
   }));
 
   // Klines
@@ -592,17 +640,23 @@ export function registerRoutes(
     const marketAverageChange = averageRankingChange(ranking.rankings);
     const limitUpRecords = (await store.getLimitUpByDate(ranking.date))
       .map((record) => ({ date: record.date, stock_code: record.stock_code }));
+    const history = await store.getHistoricalMarket();
+    const calendar = await loadTradingCalendar(store);
+    const clock = shanghaiClock(new Date());
     const [overview, automation] = await Promise.all([
-      paper.cachedOverview(analysisWithStats(analysis), ranking.date, ranking.rankings, [], traceId, marketAverageChange, limitUpRecords),
+      paper.cachedOverview(analysisWithStats(analysis), ranking.date, ranking.rankings, calendar, traceId, marketAverageChange, limitUpRecords),
       paper.getAutomation(),
     ]);
-    response.json({ overview, automation: automation.automation });
+    response.json({
+      overview,
+      automation: automation.automation,
+      trading_session: buildTradingSession(clock, calendar),
+    });
   }));
 
   app.get('/api/simulated-trading/overview', asyncHandler(async (_request, response) => {
     const traceId = String(response.locals.traceId);
-    const history = await store.getHistoricalMarket();
-    const calendar = history?.calendar ?? [];
+    const calendar = await loadTradingCalendar(store);
     const context = paper.isAccountSyncOnlyNow(calendar)
       ? await marketService.loadPaperContextFromStore(traceId)
       : await marketService.loadPaperContext(false, traceId);
@@ -640,22 +694,15 @@ export function registerRoutes(
   app.post('/api/simulated-trading/automation/run-window', asyncHandler(async (request, response) => {
     let requestedWindow = String(request.body?.window ?? 'auto');
     if (requestedWindow === 'auto') {
+      const calendar = await loadTradingCalendar(store);
       const clock = shanghaiClock(new Date());
-      const m = clock.minute;
-      if (m < 9 * 60 + 25) {
-        response.status(400).json({ ok: false, error: '当前不在交易时段（09:25 后方可执行）' });
+      const rejection = immediateAutoWindowRejection(clock, calendar);
+      if (rejection) {
+        console.log('[paper] immediate auto window rejected', { clock: clock.timestamp, reason: rejection });
+        response.status(400).json({ ok: false, error: rejection });
         return;
-      } else if (m < 10 * 60) {
-        requestedWindow = 'open';
-      } else if (m < 14 * 60 + 50) {
-        requestedWindow = 'open';
-      } else if (m < 15 * 60) {
-        requestedWindow = 'near_close';
-      } else if (m < 15 * 60 + 5) {
-        requestedWindow = 'close';
-      } else {
-        requestedWindow = 'post_close';
       }
+      requestedWindow = resolveAutoTradingWindow(clock);
     }
     if (!['open', 'near_close', 'close', 'post_close'].includes(requestedWindow)) {
       response.status(400).json({ ok: false, error: '交易窗口必须是 open、near_close、close 或 post_close' });

@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { AuditDetails, AuditLevel, AuditLoggerLike } from '../server/audit-log.js';
+import type { AuditDetails, AuditLevel, AuditLogFile, AuditLoggerLike, AuditQuery, AuditRecord } from '../server/audit-log.js';
 import {
   PaperTradingService,
   type PaperMarketContext,
   type PaperTradingStateStore,
 } from '../server/paper-trading.js';
-import { isAccountSyncOnlyPeriod, shanghaiClock } from '../server/paper-trading/helpers.js';
+import { immediateAutoWindowRejection, isAccountSyncOnlyPeriod, isTradingDay, resolveAutoTradingWindow, shanghaiClock } from '../server/paper-trading/helpers.js';
 import type { SimulatedAccountSnapshot, SimulatedBroker } from '../server/ths-simulated-broker.js';
 import type { AnalysisData, PaperOrder, PaperTradingRuntimeState, RankingRow } from '../src/types.js';
 
@@ -28,6 +28,9 @@ class RecordingAudit implements AuditLoggerLike {
   info(component: string, event: string, details?: AuditDetails) { return this.add('info', component, event, details); }
   warn(component: string, event: string, details?: AuditDetails) { return this.add('warn', component, event, details); }
   error(component: string, event: string, details?: AuditDetails) { return this.add('error', component, event, details); }
+
+  async query(_query?: AuditQuery): Promise<AuditRecord[]> { return []; }
+  async files(): Promise<AuditLogFile[]> { return []; }
 
   private async add(level: AuditLevel, component: string, event: string, details?: AuditDetails) {
     this.records.push({ level, component, event, details });
@@ -378,7 +381,7 @@ describe('Node T+1 paper-trading core', () => {
       expect.objectContaining({ side: 'buy', stock_code: '000001', execution_window: 'open' }),
     ]);
 
-    now = new Date('2026-07-27T14:55:00+08:00');
+    now = new Date('2026-07-27T14:57:00+08:00');
     await service.runWindow('near_close', context('20260724', [], calendar));
     expect(broker.placed[1]).toMatchObject({ side: 'sell', stock_code: '600100', execution_window: 'near_close' });
     expect(broker.account.positions.some((position) => position.stock_code === '600100')).toBe(false);
@@ -428,7 +431,7 @@ describe('Node T+1 paper-trading core', () => {
       expect.objectContaining({ side: 'sell', stock_code: '600100', execution_window: 'open' }),
     ]);
 
-    now = new Date('2026-07-23T14:55:00+08:00');
+    now = new Date('2026-07-23T14:57:00+08:00');
     await service.runWindow('near_close', market);
     expect(broker.placed[1]).toMatchObject({ side: 'buy', stock_code: '000001', execution_window: 'near_close' });
   });
@@ -649,7 +652,7 @@ describe('Node T+1 paper-trading core', () => {
   it('applies backtest strategy parameters and persists them in runtime state', async () => {
     const stateStore = new TestStateStore();
     const audit = new RecordingAudit();
-    const service = new PaperTradingService(new FlowBroker(), {
+    const service = new PaperTradingService(new FlowBroker({ availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] }), {
       stateStore,
       audit,
       now: () => new Date('2026-07-24T10:00:00+08:00'),
@@ -694,5 +697,37 @@ describe('Node T+1 paper-trading core', () => {
       maxEntriesPerDay: 2,
     });
     expect(audit.records.some((record) => record.event === 'strategy_applied_from_backtest')).toBe(true);
+  });
+
+  it('rejects immediate auto window outside trading session or on non-trading days', () => {
+    const calendar = ['20260722', '20260723', '20260724'];
+    expect(immediateAutoWindowRejection(shanghaiClock(new Date('2026-07-25T10:00:00+08:00')), calendar))
+      .toBe('当前不是交易日（周末），无法立即执行');
+    expect(immediateAutoWindowRejection(shanghaiClock(new Date('2026-07-21T10:00:00+08:00')), calendar))
+      .toBe('当前不是交易日（节假日），无法立即执行');
+    expect(immediateAutoWindowRejection(shanghaiClock(new Date('2026-07-24T08:00:00+08:00')), calendar))
+      .toBe('当前不在交易时段（09:25 后方可执行）');
+    expect(immediateAutoWindowRejection(shanghaiClock(new Date('2026-07-24T20:00:00+08:00')), calendar)).toBeNull();
+    expect(immediateAutoWindowRejection(shanghaiClock(new Date('2026-07-24T10:00:00+08:00')), calendar)).toBeNull();
+  });
+
+  it('resolves auto trading window from shanghai clock', () => {
+    expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T09:30:00+08:00')))).toBe('open');
+    expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T11:00:00+08:00')))).toBe('open');
+    expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T14:55:00+08:00')))).toBe('open');
+    expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T14:57:00+08:00')))).toBe('near_close');
+    expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T15:02:00+08:00')))).toBe('close');
+    expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T15:10:00+08:00')))).toBe('post_close');
+  });
+
+  it('detects trading day from shanghai index calendar', () => {
+    const calendar = ['20260722', '20260723', '20260724'];
+    expect(isTradingDay(shanghaiClock(new Date('2026-07-25T10:00:00+08:00')), calendar)).toBe(false);
+    expect(isTradingDay(shanghaiClock(new Date('2026-07-24T10:00:00+08:00')), calendar)).toBe(true);
+    expect(isTradingDay(
+      shanghaiClock(new Date('2026-07-27T10:00:00+08:00')),
+      calendar,
+      { calendarRefreshed: true },
+    )).toBe(false);
   });
 });

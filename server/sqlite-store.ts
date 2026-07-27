@@ -52,6 +52,7 @@ import {
   numberValue,
   parseJsonArray,
   parseJsonObject,
+  type SectorStockRecord,
   type SectorTrendRecord,
   rowToKline,
   type StoredDailyPrice,
@@ -64,7 +65,7 @@ import {
 import { initializeSchema, SCHEMA_VERSION } from './sqlite/schema.js';
 
 // Re-export types for backward compatibility (consumed by data-store.ts)
-export type { DailyPriceCoverage, LimitUpRecord, RankingFactorRecord, SectorTrendRecord, StoredDailyPrice };
+export type { DailyPriceCoverage, LimitUpRecord, RankingFactorRecord, SectorStockRecord, SectorTrendRecord, StoredDailyPrice };
 
 export class SqliteStore {
   readonly databasePath: string;
@@ -362,6 +363,68 @@ export class SqliteStore {
       latest: finiteNumber(row.latest),
       change_rate: finiteNumber(row.change_rate),
     }));
+  }
+
+  /**
+   * 查询某板块关联的全部个股：在 limit_up_record 中按 sector_code 过滤、
+   * 按 stock_code 去重保留最新 date 一条（每日采集累积出板块成员清单）。
+   *
+   * 同步 LEFT JOIN 该个股在 stock_daily_price 中的最新一行（close / change_rate / date），
+   * 并用 limit_up_record 的全局最新日期作基准，标注 price_fresh：
+   *   true  → K 线最新日 ≥ 最新行情日 → 价格字段反映「当下」
+   *   false → K 线缺失或落后 → 价格仍可能来自历史涨停时，需异步刷新 K 线后才显示真实当下价
+   */
+  getSectorStocks(sectorCode: string): SectorStockRecord[] {
+    const code = sectorCode.trim();
+    if (!code) return [];
+    const latestAnalysisDate = this.getLatestAnalysisDate() ?? '';
+    return this.database.prepare(`
+      SELECT r.date, r.stock_code, si.name AS stock_name,
+             r.sector_code, sci.name AS sector_name,
+             r.continue_num, r.reason_type, r.sector_change, r.latest, r.change_rate,
+             p.date AS kline_date, p.close AS kline_close, p.change_rate AS kline_change_rate
+      FROM limit_up_record r
+      JOIN stock_info si ON si.code = r.stock_code
+      JOIN sector_info sci ON sci.code = r.sector_code
+      LEFT JOIN (
+        SELECT p1.stock_code, p1.date, p1.close, p1.change_rate
+        FROM stock_daily_price p1
+        INNER JOIN (
+          SELECT stock_code, MAX(REPLACE(date, '-', '')) AS max_compact
+          FROM stock_daily_price GROUP BY stock_code
+        ) p2 ON p2.stock_code = p1.stock_code
+             AND REPLACE(p1.date, '-', '') = p2.max_compact
+      ) p ON p.stock_code = r.stock_code
+      WHERE r.sector_code = ?
+        AND r.date = (
+          SELECT MAX(r2.date) FROM limit_up_record r2
+          WHERE r2.stock_code = r.stock_code AND r2.sector_code = r.sector_code
+        )
+      ORDER BY r.continue_num DESC, r.stock_code ASC
+    `).all(code).map((row) => {
+      const klineDate = textValue(row.kline_date) || null;
+      const klineLatest = finiteNumber(row.kline_close);
+      const klineChangeRate = finiteNumber(row.kline_change_rate);
+      const klineCompact = klineDate ? klineDate.replace(/-/g, '') : '';
+      const priceFresh = Boolean(klineCompact) && Boolean(latestAnalysisDate) && klineCompact >= latestAnalysisDate;
+      return {
+        date: textValue(row.date),
+        stock_code: textValue(row.stock_code),
+        stock_name: textValue(row.stock_name),
+        sector_code: textValue(row.sector_code),
+        sector_name: textValue(row.sector_name),
+        continue_num: numberValue(row.continue_num),
+        reason_type: textValue(row.reason_type),
+        sector_change: numberValue(row.sector_change),
+        latest: finiteNumber(row.latest),
+        change_rate: finiteNumber(row.change_rate),
+        kline_date: klineDate,
+        kline_latest: klineLatest,
+        kline_change_rate: klineChangeRate,
+        latest_analysis_date: latestAnalysisDate,
+        price_fresh: priceFresh,
+      };
+    });
   }
 
   getSectorStats(value: string): Array<{ sector_code: string; sector_name: string; limit_up_count: number; max_continue: number }> {
@@ -930,6 +993,25 @@ export class SqliteStore {
       WHERE symbol = ?
       ORDER BY date ASC
     `).all(symbol).map((row) => compactDate(row.date)).filter(Boolean);
+  }
+
+  /** 将上证交易日历增量合并进 historical_snapshot，避免仅 index 表更新而快照滞后。 */
+  patchHistoricalSnapshotCalendar(calendar: readonly string[]): boolean {
+    const snapshot = this.database.prepare(`
+      SELECT as_of_date, calendar_json FROM historical_snapshot WHERE singleton = 1
+    `).get() as { as_of_date?: string; calendar_json?: string } | undefined;
+    if (!snapshot) return false;
+    const existing = parseJsonArray<string>(snapshot.calendar_json).map(compactDate).filter(Boolean);
+    const merged = [...new Set([...existing, ...calendar.map(compactDate).filter(Boolean)])].sort();
+    const previousLatest = existing.at(-1) ?? compactDate(snapshot.as_of_date);
+    const nextLatest = merged.at(-1) ?? previousLatest;
+    if (merged.length === existing.length && nextLatest === previousLatest) return false;
+    this.database.prepare(`
+      UPDATE historical_snapshot
+      SET calendar_json = ?, as_of_date = ?, updated_at = ?
+      WHERE singleton = 1
+    `).run(JSON.stringify(merged), isoDate(nextLatest), formatDateTime());
+    return true;
   }
 
   private upsertBlockPricesWithinTransaction(blockCode: string, blockName: string, klines: KLineData[], timestamp: string, period: BlockPeriod = BLOCK_PERIOD_DAILY): number {

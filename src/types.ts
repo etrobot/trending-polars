@@ -34,6 +34,37 @@ export interface LimitUpStock {
   [key: string]: unknown;
 }
 
+/** 板块个股：板块关联的全部去重个股（来自 limit_up_record 累积）。 */
+export interface SectorStock {
+  code: string;
+  name: string;
+  latest_date: string;
+  continue_num?: number;
+  reason_type?: string | null;
+  /** 涨停当时记录的收盘价（与「当下」价格不同）。 */
+  latest?: number | null;
+  change_rate?: number | null;
+  /** stock_daily_price 中该个股的最新日期 (YYYY-MM-DD)。 */
+  kline_date?: string | null;
+  /** stock_daily_price 中该个股的最新收盘价（仅当 price_fresh 时反映当下）。 */
+  kline_latest?: number | null;
+  /** stock_daily_price 中该个股的最新涨跌幅%。 */
+  kline_change_rate?: number | null;
+  /** K 线最新日 ≥ 最新行情日 → 当前价/涨幅可显示；否则视为尚未刷新到当下。 */
+  price_fresh: boolean;
+}
+
+export interface SectorStocksResponse {
+  sector_code: string;
+  sector_name: string;
+  stock_count: number;
+  /** limit_up_record 的全局最新日期（最新行情日基准）。 */
+  latest_analysis_date: string;
+  /** 已就绪（price_fresh=true）的个股数。 */
+  fresh_count: number;
+  stocks: SectorStock[];
+}
+
 export interface BlockAnalysis {
   name: string;
   code: string;
@@ -313,6 +344,15 @@ export interface AutomationState {
   last_run?: string;
   last_window?: TradingWindow;
   last_error?: string;
+}
+
+export interface TradingSession {
+  shanghai_time: string;
+  trading_date: string;
+  is_trading_day: boolean;
+  calendar_latest?: string;
+  immediate_execute_allowed: boolean;
+  immediate_execute_reason?: string;
 }
 
 export type PlanExecutionWindow = 'open' | 'near_close';

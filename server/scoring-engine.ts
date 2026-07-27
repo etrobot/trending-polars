@@ -474,18 +474,26 @@ export const DEFAULT_SCORE_STOCK_CONFIG: Readonly<ScoreStockConfig> = Object.fre
   marketState: DEFAULT_MARKET_STATE_THRESHOLDS,
 });
 
-export function normalizeScoreStockConfig(overrides?: Partial<ScoreStockConfig>): ScoreStockConfig {
+export type DeepPartial<T> = T extends object
+  ? { [P in keyof T]?: DeepPartial<T[P]> }
+  : T;
+
+export function normalizeScoreStockConfig(overrides?: DeepPartial<ScoreStockConfig>): ScoreStockConfig {
   const base = DEFAULT_SCORE_STOCK_CONFIG;
+  // tiers 与 matrix 是「整体替换」语义（spread 不会逐元素合并），所以这里把它们当作
+  // 必须整体提供的完整值对待 —— 调用方若提供了部分数组/对象，应自行先与默认值合并。
+  const tiersOverride = overrides?.distanceFromLow?.tiers as DistanceFromLowTier[] | undefined;
+  const matrixOverride = overrides?.volatilityTrend?.matrix as Record<VolatilityClass, Record<TrendAxis, number>> | undefined;
   return {
     distanceFromLow: {
       ...base.distanceFromLow,
       ...overrides?.distanceFromLow,
-      tiers: overrides?.distanceFromLow?.tiers ?? [...base.distanceFromLow.tiers],
+      tiers: tiersOverride ?? [...base.distanceFromLow.tiers],
     },
     trend: { ...base.trend, ...overrides?.trend },
     volatilityTrend: {
       limitUp: { ...base.volatilityTrend.limitUp, ...overrides?.volatilityTrend?.limitUp },
-      matrix: overrides?.volatilityTrend?.matrix ?? {
+      matrix: matrixOverride ?? {
         high: { ...base.volatilityTrend.matrix.high },
         medium: { ...base.volatilityTrend.matrix.medium },
         low: { ...base.volatilityTrend.matrix.low },

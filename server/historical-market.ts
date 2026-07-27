@@ -99,7 +99,7 @@ interface CollectionOptions {
   existingBlockSeries?: HistoricalBlockSeries[];
 }
 
-export const HISTORICAL_WARMUP_DAYS = 70;
+export const HISTORICAL_WARMUP_DAYS = 155;
 /** 回测窗口下限（交易日）。与 MA60 等评分指标无关，预热由 HISTORICAL_WARMUP_DAYS 保证。 */
 export const MIN_BACKTEST_DAYS = 5;
 /** 回测窗口上限（交易日）。750 ≈ 3 年，MA60 等指标在任意窗口长度下均可逐日计算。 */
@@ -299,10 +299,14 @@ export async function fetchTencentKlines(symbol: string, limit = 120): Promise<K
 }
 
 async function fetchFromTencent(symbol: { code: string; market: 'SH' | 'SZ'; full: string }, limit: number): Promise<KLineData[]> {
-  const url = `https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?_var=kline_dayqfq&param=${symbol.full},day,,,${limit},qfq&r=${Math.random().toString().slice(2, 18)}`;
+  const url = `https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get?_var=kline_dayqfq&param=${symbol.full},day,,,${limit},qfq&r=${Math.random().toString().slice(2, 18)}`;
   try {
     const response = await fetch(url, {
-      headers: { Referer: 'https://gu.qq.com/', 'User-Agent': 'Mozilla/5.0 Chrome/124.0.0.0 Safari/537.36' },
+      headers: {
+        Referer: 'https://gu.qq.com/',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+        accept: '*/*',
+      },
       signal: AbortSignal.timeout(5_000),
     });
     if (!response.ok) return [];

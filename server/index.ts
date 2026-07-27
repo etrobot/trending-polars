@@ -1,7 +1,7 @@
 import { createServer } from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 import { createApp } from './app.js';
-import { ensureShanghaiIndexHistory } from './index-bootstrap.js';
+import { loadTradingCalendar } from './index-bootstrap.js';
 
 const port = Number(process.env.PORT ?? 8787);
 const host = process.env.HOST ?? '127.0.0.1';
@@ -40,9 +40,10 @@ async function main() {
     socket.on('close', () => services.paper.off('update', onUpdate));
   });
 
-  await ensureShanghaiIndexHistory(services.store).catch((error) => {
-    console.error('[bootstrap] 上证指数行情补全失败:', error);
-  });
+  const initialCalendar = await loadTradingCalendar().catch(() => [] as string[]);
+  if (initialCalendar.length) {
+    services.paper.setTradingCalendar(initialCalendar);
+  }
 
   services.paper.startScheduler();
   server.on('close', () => {

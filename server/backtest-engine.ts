@@ -14,6 +14,7 @@ import {
   type SectorContext,
   type ScoreStockConfig,
   DEFAULT_SCORE_STOCK_CONFIG,
+  normalizeScoreStockConfig,
 } from './scoring-engine.js';
 import { benchmarkReturns } from './backtest-scoring.js';
 import {
@@ -287,7 +288,11 @@ export function historicalCrossSectionRankings(
   sectorTrendsByCode: Map<string, SectorTrendLookup> = new Map(),
   options: CrossSectionRankingOptions = {},
 ): RankingRow[] {
-  const scoringConfig = options.scoringConfig ?? DEFAULT_SCORE_STOCK_CONFIG;
+  // 实盘截面计算的配置可能来自旧的 ranking-config.json（缺 relativeStrength/marketState），
+  // 用 normalize 与默认值对齐，避免 relativeStrength.lookback 读取到 undefined 而崩溃。
+  const scoringConfig = options.scoringConfig
+    ? normalizeScoreStockConfig(options.scoringConfig)
+    : DEFAULT_SCORE_STOCK_CONFIG;
   const factorWeights = options.factorWeights ?? DEFAULT_FACTOR_WEIGHTS;
   const targetDate = date.replaceAll('-', '').slice(0, 8);
   const previousByCode = new Map(previousRows.map((row) => [row.stock_code, row]));

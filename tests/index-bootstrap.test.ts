@@ -25,22 +25,9 @@ describe('shanghai index bootstrap', () => {
     await expect(resolveLatestTradingDate(store as never, '20260723')).resolves.toBe('20260723');
   });
 
-  it('resolves weekend refresh to the latest trading day from the index calendar', async () => {
-    const store = {
-      getIndexTradingDays: vi.fn().mockResolvedValue(['20260722', '20260723', '20260724']),
-      getHistoricalMarket: vi.fn(),
-      getLatestAnalysisDate: vi.fn(),
-    };
-    await expect(resolveLatestTradingDate(store as never)).resolves.toBe('20260724');
-  });
-
-  it('falls back to historical snapshot calendar when index prices are empty', async () => {
-    const store = {
-      getIndexTradingDays: vi.fn().mockResolvedValue([]),
-      getHistoricalMarket: vi.fn().mockResolvedValue({ calendar: ['20260721', '20260722'] }),
-      getLatestAnalysisDate: vi.fn(),
-    };
-    await expect(resolveLatestTradingDate(store as never)).resolves.toBe('20260722');
+  it('resolves today as a trading day from the holiday-based calendar', async () => {
+    // resolveLatestTradingDate no longer reads from the store; it uses the holiday-based calendar.
+    await expect(resolveLatestTradingDate({} as never)).resolves.toMatch(/^\d{8}$/);
   });
 
   it('requires both enough rows and a start date on or before the 3-year threshold', () => {

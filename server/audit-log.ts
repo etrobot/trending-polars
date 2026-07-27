@@ -54,6 +54,8 @@ export interface AuditLoggerLike {
   info(component: string, event: string, details?: AuditDetails): Promise<void>;
   warn(component: string, event: string, details?: AuditDetails): Promise<void>;
   error(component: string, event: string, details?: AuditDetails): Promise<void>;
+  query(query?: AuditQuery): Promise<AuditRecord[]>;
+  files(): Promise<AuditLogFile[]>;
 }
 
 function errorDetails(error: unknown): AuditError | undefined {
@@ -91,6 +93,8 @@ export const NOOP_AUDIT_LOGGER: AuditLoggerLike = {
   info: async () => undefined,
   warn: async () => undefined,
   error: async () => undefined,
+  query: async () => [],
+  files: async () => [],
 };
 
 export function guardDetachedPromise(

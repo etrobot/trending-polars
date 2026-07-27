@@ -18,6 +18,38 @@ export interface LimitUpRecord {
   change_rate: number | null;
 }
 
+/**
+ * 某板块关联的全部个股（由 limit_up_record 多日累积、按 stock_code 去重保留最新 date 一条）。
+ * 价格字段 (latest/change_rate) 仅在 K 线最新日 ≥ 板块最新行情日 时才有效：
+ * 历史涨停的个股需要等异步 K 线刷新覆盖到最新交易日，才能如实显示当下涨跌幅。
+ *  - kline_date: 该个股在 stock_daily_price 中的最新日期（YYYY-MM-DD，可能为 null 表示无 K 线）
+ *  - latest_analysis_date: 当前 limit_up_record 的最大日期（用于判断最新行情是否已就绪）
+ *  - price_fresh: 当 kline_date 非 null 且 ≥ latest_analysis_date 时为 true
+ */
+export interface SectorStockRecord {
+  date: string;
+  stock_code: string;
+  stock_name: string;
+  sector_code: string;
+  sector_name: string;
+  continue_num: number;
+  reason_type: string;
+  sector_change: number;
+  /** 涨停当时的收盘价（仅日期层面参照，与「当下最新价」不同）。 */
+  latest: number | null;
+  change_rate: number | null;
+  /** 当前 K 线最新日期 (YYYY-MM-DD)，null 表示尚无 K 线记录。 */
+  kline_date: string | null;
+  /** 当前 K 线最新收盘价（仅在 price_fresh 时才反映「当下」价格）。 */
+  kline_latest: number | null;
+  /** 当前 K 线最新涨跌幅%。 */
+  kline_change_rate: number | null;
+  /** 当前 limit_up_record 的最大日期，作为「最新行情日」基准。 */
+  latest_analysis_date: string;
+  /** 价格字段是否反映最新行情（K 线最新日 ≥ 最新行情日）。 */
+  price_fresh: boolean;
+}
+
 export interface SectorTrendRecord {
   date: string;
   sector_code: string;

@@ -350,7 +350,7 @@ Phase 2: 五维评分计算（scoreStock()）
 
 ```
 1. 并发采集历史日线（Semaphore 12 → 24）
-   ├─ 获取交易日历（sh000001 日线作为基准）
+   ├─ 获取交易日历（基于节假日数据反推，holiday-calendar.ts）
    └─ 并发拉取每只股票「回测天数 + 70」天真实日线（多源降级链路）
    → 单事务持久化到 stock_daily_price / index_daily_price / historical_snapshot
 

@@ -41,10 +41,13 @@ export interface PaperTradingStateStore {
 export interface PaperTradingServiceOptions {
   stateStore?: PaperTradingStateStore;
   marketDataProvider?: (window: TradingWindow, traceId: string) => Promise<PaperMarketContext>;
+  /** 自动化开启时定期调用，刷新并返回最新交易日历（上证 sh000001）。 */
+  calendarRefresher?: () => Promise<string[]>;
   strategy?: Partial<T1StrategyConfig>;
   now?: () => Date;
   schedulerIntervalMs?: number;
   accountMonitorIntervalMs?: number;
+  calendarRefreshIntervalMs?: number;
   enforceTradingWindows?: boolean;
   audit?: AuditLoggerLike;
 }
@@ -71,13 +74,6 @@ export interface MarketTimingAssessment {
   bullishIndices: number;
   broadRiskIndices: number;
   reason: string;
-}
-
-export interface AuditLoggerLike {
-  debug(component: string, event: string, meta?: Record<string, unknown>): void | Promise<void>;
-  info(component: string, event: string, meta?: Record<string, unknown>): void | Promise<void>;
-  warn(component: string, event: string, meta?: Record<string, unknown>): void | Promise<void>;
-  error(component: string, event: string, meta?: Record<string, unknown>): void | Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -116,25 +112,88 @@ export function displayDate(value: string): string {
   return `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`;
 }
 
-/** 与调度器持仓监控窗口一致：9:25–15:20 视为交易时段。 */
+/** 与调度器持仓监控窗口一致：9:25–15:20 视为账户监控时段。 */
 export const ACCOUNT_SYNC_SESSION_START_MINUTE = 9 * 60 + 25;
 export const ACCOUNT_SYNC_SESSION_END_MINUTE = 15 * 60 + 20;
+/** 立即执行（auto）最早可触发时间。 */
+export const IMMEDIATE_AUTO_SESSION_START_MINUTE = 9 * 60 + 25;
+/** 临收盘委托窗口：14:57 起至 15:00 收盘。 */
+export const NEAR_CLOSE_WINDOW_START_MINUTE = 14 * 60 + 57;
+export const MARKET_CLOSE_MINUTE = 15 * 60;
+export const TRADING_CALENDAR_REFRESH_INTERVAL_MS = 5 * 60_000;
+export const TRADING_CALENDAR_STALE_REFRESH_INTERVAL_MS = 60_000;
 
 /**
  * 非交易日期/时段只需同步账户与持仓，跳过策略补算、行情补采和同花顺委托查询。
  */
+export function isTradingDay(
+  clock: ReturnType<typeof shanghaiClock>,
+  calendar: readonly string[] = [],
+  options?: { calendarRefreshed?: boolean },
+): boolean {
+  if (clock.weekday === 0 || clock.weekday === 6) return false;
+  const tradingDays = calendar.map(compactDate).filter(Boolean).sort();
+  if (tradingDays.length === 0) return true;
+  const latestCalendarDay = tradingDays.at(-1) ?? '';
+  const daySet = new Set(tradingDays);
+  if (daySet.has(clock.date)) return true;
+  if (clock.date < latestCalendarDay) return false;
+  if (clock.date > latestCalendarDay) {
+    // 日历已刷新且已过开盘，今日仍无 K 线则视为非交易日（节假日）。
+    if (options?.calendarRefreshed && clock.minute >= 9 * 60 + 30) return false;
+    return true;
+  }
+  return false;
+}
+
 export function isAccountSyncOnlyPeriod(
   clock: ReturnType<typeof shanghaiClock>,
   calendar: readonly string[] = [],
 ): boolean {
-  if (clock.weekday === 0 || clock.weekday === 6) return true;
-  if (calendar.length > 0) {
-    const tradingDays = calendar.map(compactDate).filter(Boolean).sort();
-    const latestCalendarDay = tradingDays.at(-1) ?? '';
-    // 日历尚未覆盖到当前日期时，不能据此判定为节假日。
-    if (clock.date <= latestCalendarDay && !new Set(tradingDays).has(clock.date)) return true;
-  }
+  if (!isTradingDay(clock, calendar)) return true;
   return clock.minute < ACCOUNT_SYNC_SESSION_START_MINUTE || clock.minute > ACCOUNT_SYNC_SESSION_END_MINUTE;
+}
+
+export function buildTradingSession(
+  clock: ReturnType<typeof shanghaiClock>,
+  calendar: readonly string[] = [],
+) {
+  const rejection = immediateAutoWindowRejection(clock, calendar);
+  return {
+    shanghai_time: clock.timestamp,
+    trading_date: clock.date,
+    is_trading_day: isTradingDay(clock, calendar),
+    calendar_latest: calendar.map(compactDate).filter(Boolean).sort().at(-1),
+    immediate_execute_allowed: !rejection,
+    immediate_execute_reason: rejection ?? undefined,
+  };
+}
+
+/** 立即执行（auto）在非交易日期/时段的拒绝原因；可执行时返回 null。 */
+export function immediateAutoWindowRejection(
+  clock: ReturnType<typeof shanghaiClock>,
+  calendar: readonly string[] = [],
+): string | null {
+  if (!isTradingDay(clock, calendar)) {
+    if (clock.weekday === 0 || clock.weekday === 6) {
+      return '当前不是交易日（周末），无法立即执行';
+    }
+    return '当前不是交易日（节假日），无法立即执行';
+  }
+  if (clock.minute < IMMEDIATE_AUTO_SESSION_START_MINUTE) {
+    return '当前不在交易时段（09:25 后方可执行）';
+  }
+  return null;
+}
+
+/** 根据当前上海时间解析 auto 窗口。调用方需先通过 immediateAutoWindowRejection。 */
+export function resolveAutoTradingWindow(clock: ReturnType<typeof shanghaiClock>): TradingWindow {
+  const minute = clock.minute;
+  if (minute < 10 * 60) return 'open';
+  if (minute < NEAR_CLOSE_WINDOW_START_MINUTE) return 'open';
+  if (minute < MARKET_CLOSE_MINUTE) return 'near_close';
+  if (minute < 15 * 60 + 5) return 'close';
+  return 'post_close';
 }
 
 export function shanghaiClock(date: Date): { date: string; minute: number; weekday: number; timestamp: string } {

@@ -49,8 +49,9 @@ trending-polars/
 │   ├── app/             # 应用拆分后的子模块
 │   │   ├── market-service.ts   # 市场采集 / 行情覆盖 / PaperTrading 上下文 / 排行计算
 │   │   └── routes.ts           # 所有 /api/* 路由注册
-│   ├── index.ts         # HTTP + WebSocket 启动入口；启动时补全上证指数历史
-│   ├── index-bootstrap.ts      # 上证指数历史补全 / 交易日历解析 / resolveLatestTradingDate
+│   ├── index.ts         # HTTP + WebSocket 启动入口；加载交易日历
+│   ├── holiday-calendar.ts     # 节假日数据（2023–2026），反推构造交易日序列
+│   ├── index-bootstrap.ts      # 交易日历解析 / resolveLatestTradingDate / 上证指数历史补全
 │   ├── scoring-engine.ts        # 五维评分 + 0/1–8 状态分类 + 板块策略矩阵
 │   ├── polars-engine.ts         # 排行榜查询 / 排序 / 情绪聚合
 │   ├── ranking-config.ts        # RankingRuntimeConfig：因子权重 + 评分配置 + 回测来源

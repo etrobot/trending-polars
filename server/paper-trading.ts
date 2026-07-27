@@ -36,6 +36,7 @@ import {
 } from './ths-simulated-broker.js';
 import {
   assessMarketTiming,
+  buildTradingSession,
   compactDate,
   defaultAutomation,
   defaultState,
@@ -46,14 +47,19 @@ import {
   isActiveInstruction,
   instructionStatusLabel,
   isAccountSyncOnlyPeriod,
+  isTradingDay,
   isWeakMarket,
+  MARKET_CLOSE_MINUTE,
   type MarketTimingAssessment,
   MemoryPaperTradingStateStore,
+  NEAR_CLOSE_WINDOW_START_MINUTE,
   type PaperMarketContext,
   type PaperTradingServiceOptions,
   type PaperTradingStateStore,
   PAPER_ENGINE_VERSION,
   type RunWindowOptions,
+  TRADING_CALENDAR_REFRESH_INTERVAL_MS,
+  TRADING_CALENDAR_STALE_REFRESH_INTERVAL_MS,
   type WindowRunResult,
   shanghaiClock,
   withExecutionTiming,
@@ -72,6 +78,10 @@ export class PaperTradingService extends EventEmitter {
   private schedulerRetryAfter = 0;
   private monitorRetryAfter = 0;
   private lastMonitorAt = 0;
+  private cachedTradingCalendar: string[] = [];
+  private lastCalendarRefreshAt = 0;
+  private calendarRefreshInFlight: Promise<string[]> | null = null;
+  private calendarRefreshedThisTick = false;
   private readonly stateStore: PaperTradingStateStore;
   private strategy: T1StrategyConfig;
   private strategyHydratedFromState = false;
@@ -80,6 +90,8 @@ export class PaperTradingService extends EventEmitter {
   private readonly accountMonitorIntervalMs: number;
   private readonly enforceTradingWindows: boolean;
   private readonly audit: AuditLoggerLike;
+  private readonly calendarRefresher?: () => Promise<string[]>;
+  private readonly calendarRefreshIntervalMs: number;
   private readonly marketDataProvider?: (window: TradingWindow, traceId: string) => Promise<PaperMarketContext>;
 
   constructor(
@@ -108,6 +120,8 @@ export class PaperTradingService extends EventEmitter {
     this.accountMonitorIntervalMs = Math.max(30_000, options.accountMonitorIntervalMs ?? 60_000);
     this.enforceTradingWindows = options.enforceTradingWindows ?? true;
     this.audit = options.audit ?? NOOP_AUDIT_LOGGER;
+    this.calendarRefresher = options.calendarRefresher;
+    this.calendarRefreshIntervalMs = Math.max(60_000, options.calendarRefreshIntervalMs ?? TRADING_CALENDAR_REFRESH_INTERVAL_MS);
     this.marketDataProvider = options.marketDataProvider;
   }
 
@@ -119,7 +133,7 @@ export class PaperTradingService extends EventEmitter {
       automation: { ...state.automation, next_window: this.nextWindowLabel(state, clock) },
       schedule: [
         { window: 'open', label: '开盘执行', time: '09:31', status: this.windowStatus(state, clock.date, 'open') },
-        { window: 'near_close', label: '临收盘执行', time: '14:55', status: this.windowStatus(state, clock.date, 'near_close') },
+        { window: 'near_close', label: '临收盘执行', time: '14:57', status: this.windowStatus(state, clock.date, 'near_close') },
         { window: 'close', label: '收盘决策', time: '15:05', status: this.windowStatus(state, clock.date, 'close') },
         { window: 'post_close', label: '盘后核对', time: '15:10', status: this.windowStatus(state, clock.date, 'post_close') },
       ],
@@ -195,6 +209,9 @@ export class PaperTradingService extends EventEmitter {
       });
       const payload = await this.getAutomation();
       this.broadcast('automation', payload);
+      if (enabled) {
+        guardDetachedPromise(this.refreshTradingCalendar(true), 'paper_trading', 'calendar_refresh_on_enable');
+      }
       return payload;
     });
   }
@@ -451,6 +468,11 @@ export class PaperTradingService extends EventEmitter {
     if (!this.scheduler) return;
     clearInterval(this.scheduler);
     this.scheduler = null;
+  }
+
+  setTradingCalendar(calendar: readonly string[]) {
+    this.cachedTradingCalendar = [...calendar];
+    this.lastCalendarRefreshAt = this.now().getTime();
   }
 
   private async buildOverview(context: PaperMarketContext, traceId: string): Promise<PaperOverview> {
@@ -1316,13 +1338,21 @@ export class PaperTradingService extends EventEmitter {
     this.schedulerTickInFlight = (async () => {
       const state = await this.getState();
       const clock = shanghaiClock(this.now());
-      if (!state.automation.enabled || state.automation.paused_today || clock.weekday === 0 || clock.weekday === 6) return;
+      if (!state.automation.enabled || state.automation.paused_today) return;
+
+      this.calendarRefreshedThisTick = false;
+      if (this.calendarRefresher) {
+        await this.refreshTradingCalendar(false);
+      }
+      const calendar = this.cachedTradingCalendar;
+      if (!isTradingDay(clock, calendar, { calendarRefreshed: this.calendarRefreshedThisTick })) return;
+
       const nowMs = this.now().getTime();
 
       let due: TradingWindow | null = null;
       if (clock.minute >= 9 * 60 + 31 && clock.minute < 10 * 60 && !this.isWindowCompleted(state, clock.date, 'open')) {
         due = 'open';
-      } else if (clock.minute >= 14 * 60 + 55 && clock.minute < 15 * 60 && !this.isWindowCompleted(state, clock.date, 'near_close')) {
+      } else if (clock.minute >= NEAR_CLOSE_WINDOW_START_MINUTE && clock.minute < MARKET_CLOSE_MINUTE && !this.isWindowCompleted(state, clock.date, 'near_close')) {
         due = 'near_close';
       } else if (clock.minute >= 15 * 60 + 5 && !this.isWindowCompleted(state, clock.date, 'close')) {
         due = 'close';
@@ -1378,27 +1408,27 @@ export class PaperTradingService extends EventEmitter {
   }
 
   private getState(): Promise<PaperTradingRuntimeState> {
-    if (!this.statePromise) {
-      this.statePromise = this.stateStore.load().then((stored) => {
-        const timestamp = shanghaiClock(this.now()).timestamp;
-        if (!stored || stored.schema_version !== 1) return defaultState(timestamp);
-        const state = {
-          ...defaultState(timestamp),
-          ...stored,
-          engine_version: PAPER_ENGINE_VERSION,
-          automation: { ...defaultAutomation(), ...stored.automation },
-          completed_windows: stored.completed_windows ?? {},
-          instructions: (stored.instructions ?? []).map((instruction) => instruction.status === 'submitting'
-            ? { ...instruction, status: 'uncertain', broker_status: '服务重启时委托仍处于提交中，请根据同花顺委托和持仓人工核对' }
-            : instruction),
-          tracked_positions: stored.tracked_positions ?? [],
-          events: stored.events ?? [],
-        };
-        this.hydrateStrategyFromState(state);
-        return state;
-      });
-    }
-    return this.statePromise;
+    if (this.statePromise) return this.statePromise;
+    const promise = this.stateStore.load().then((stored) => {
+      const timestamp = shanghaiClock(this.now()).timestamp;
+      if (!stored || stored.schema_version !== 1) return defaultState(timestamp);
+      const state = {
+        ...defaultState(timestamp),
+        ...stored,
+        engine_version: PAPER_ENGINE_VERSION,
+        automation: { ...defaultAutomation(), ...stored.automation },
+        completed_windows: stored.completed_windows ?? {},
+        instructions: (stored.instructions ?? []).map((instruction) => instruction.status === 'submitting'
+          ? { ...instruction, status: 'uncertain' as const, broker_status: '服务重启时委托仍处于提交中，请根据同花顺委托和持仓人工核对' }
+          : instruction),
+        tracked_positions: stored.tracked_positions ?? [],
+        events: stored.events ?? [],
+      };
+      this.hydrateStrategyFromState(state);
+      return state;
+    });
+    this.statePromise = promise;
+    return promise;
   }
 
   private async persist(state: PaperTradingRuntimeState) {
@@ -1455,7 +1485,7 @@ export class PaperTradingService extends EventEmitter {
     if (!state.automation.enabled) return '自动化已关闭';
     if (state.automation.paused_today) return '今日已暂停';
     if (clock.minute < 9 * 60 + 31 && !this.isWindowCompleted(state, clock.date, 'open')) return '下一窗口：09:31 开盘执行';
-    if (clock.minute < 14 * 60 + 55 && !this.isWindowCompleted(state, clock.date, 'near_close')) return '下一窗口：14:55 临收盘执行';
+    if (clock.minute < NEAR_CLOSE_WINDOW_START_MINUTE && !this.isWindowCompleted(state, clock.date, 'near_close')) return '下一窗口：14:57 临收盘执行';
     if (clock.minute < 15 * 60 + 5 && !this.isWindowCompleted(state, clock.date, 'close')) return '下一窗口：15:05 收盘决策';
     if (clock.minute < 15 * 60 + 10 && !this.isWindowCompleted(state, clock.date, 'post_close')) return '下一窗口：15:10 盘后核对';
     return '下一窗口：下一交易日 09:31 开盘执行';
@@ -1474,10 +1504,10 @@ export class PaperTradingService extends EventEmitter {
     if (window === 'open' && (trigger === 'scheduled' || trigger === 'manual') && (clock.minute < 9 * 60 + 25 || clock.minute >= 10 * 60)) {
       throw new Error('开盘执行窗口仅允许在交易日 09:25-10:00 运行');
     }
-    if (window === 'near_close' && (clock.minute < 14 * 60 + 50 || clock.minute >= 15 * 60)) {
-      throw new Error('临收盘执行窗口仅允许在交易日 14:50-15:00 运行');
+    if (window === 'near_close' && (clock.minute < NEAR_CLOSE_WINDOW_START_MINUTE || clock.minute >= MARKET_CLOSE_MINUTE)) {
+      throw new Error('临收盘执行窗口仅允许在交易日 14:57-15:00 运行');
     }
-    if (window === 'close' && clock.minute < 15 * 60) {
+    if (window === 'close' && clock.minute < MARKET_CLOSE_MINUTE) {
       throw new Error('收盘决策窗口仅允许在交易日 15:00 后运行');
     }
     if (window === 'post_close' && clock.minute < 15 * 60 + 5) {
@@ -1493,5 +1523,60 @@ export class PaperTradingService extends EventEmitter {
 
   private broadcast(type: string, payload: unknown) {
     this.emit('update', { type, payload, timestamp: shanghaiClock(this.now()).timestamp });
+  }
+
+  private broadcastTradingSession(calendar: readonly string[] = this.cachedTradingCalendar) {
+    const clock = shanghaiClock(this.now());
+    this.broadcast('trading_session', buildTradingSession(clock, calendar));
+  }
+
+  private shouldRefreshTradingCalendar(clock: ReturnType<typeof shanghaiClock>): boolean {
+    const nowMs = this.now().getTime();
+    const latestDay = this.cachedTradingCalendar.at(-1) ?? '';
+    const calendarStale = clock.weekday >= 1 && clock.weekday <= 5
+      && clock.date > latestDay
+      && clock.minute >= 8 * 60;
+    const intervalMs = calendarStale
+      ? TRADING_CALENDAR_STALE_REFRESH_INTERVAL_MS
+      : this.calendarRefreshIntervalMs;
+    return nowMs - this.lastCalendarRefreshAt >= intervalMs;
+  }
+
+  private refreshTradingCalendar(force = false): Promise<string[]> {
+    if (!this.calendarRefresher) return Promise.resolve(this.cachedTradingCalendar);
+    if (this.calendarRefreshInFlight) return this.calendarRefreshInFlight;
+    const clock = shanghaiClock(this.now());
+    if (!force && !this.shouldRefreshTradingCalendar(clock)) {
+      return Promise.resolve(this.cachedTradingCalendar);
+    }
+    this.calendarRefreshInFlight = (async () => {
+      try {
+        const previousLatest = this.cachedTradingCalendar.at(-1) ?? '';
+        const previousLength = this.cachedTradingCalendar.length;
+        const calendar = await this.calendarRefresher!();
+        this.cachedTradingCalendar = [...calendar];
+        this.lastCalendarRefreshAt = this.now().getTime();
+        this.calendarRefreshedThisTick = true;
+        const nextLatest = calendar.at(-1) ?? '';
+        if (force || nextLatest !== previousLatest || calendar.length !== previousLength) {
+          this.broadcastTradingSession(calendar);
+        }
+        await this.audit.info('paper_trading', 'trading_calendar_refreshed', {
+          data: {
+            latest_day: nextLatest,
+            calendar_days: calendar.length,
+            today_included: calendar.includes(clock.date),
+            forced: force,
+          },
+        });
+        return calendar;
+      } catch (error) {
+        await this.audit.error('paper_trading', 'trading_calendar_refresh_failed', { error });
+        throw error;
+      } finally {
+        this.calendarRefreshInFlight = null;
+      }
+    })();
+    return this.calendarRefreshInFlight;
   }
 }

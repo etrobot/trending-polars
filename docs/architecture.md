@@ -49,8 +49,9 @@
 | 服务装配 | `server/app.ts` | 装载 `Store/Audit/Tasks/Paper/MarketService`、注册路由、错误处理 |
 | 市场服务 | `server/app/market-service.ts` | 指数/板块/涨停采集、行情覆盖验证、PaperTrading 上下文、排行计算（含 RankingRuntimeConfig） |
 | API 路由 | `server/app/routes.ts` | 所有 `/api/*` 路由注册；任务、回测、模拟交易、审计 |
-| 服务入口 | `server/index.ts` | HTTP + WebSocket 服务器启动；启动时补全上证指数历史 |
-| 启动引导 | `server/index-bootstrap.ts` | 上证指数历史补全、交易日历解析、`resolveLatestTradingDate()` |
+| 服务入口 | `server/index.ts` | HTTP + WebSocket 服务器启动；加载交易日历 |
+| 节假日日历 | `server/holiday-calendar.ts` | 2023–2026 年 A 股节假日数据，`buildTradingCalendar()` 反推生成交易日序列 |
+| 启动引导 | `server/index-bootstrap.ts` | 交易日历解析、`resolveLatestTradingDate()`、上证指数历史补全 |
 | 混合数据存储 | `server/data-store.ts` | SQLite 门面、旧 JSON 种子迁移、缓存/状态/回测归档/排行配置 |
 | SQLite 仓储 | `server/sqlite-store.ts` | `node:sqlite` 批量 upsert、结构化查询；PRAGMA 与状态查询 |
 | SQLite schema | `server/sqlite/schema.ts` | 建表、迁移 `migrateV15/V16/V18/V19`，`SCHEMA_VERSION=20` |

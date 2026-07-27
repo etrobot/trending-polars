@@ -337,6 +337,32 @@ export class MarketService {
     };
   }
 
+  /**
+   * 异步刷新某板块关联全部个股的 K 线：个股清单取自 store.getSectorStocks
+   * （limit_up_record 累积去重），逐一并发抓取并落库 stock_daily_price。
+   */
+  async refreshSectorStockKlines(
+    sectorCode: string,
+    options: { progress?: (completed: number, total: number, message: string) => void; cancelled?: () => boolean } = {},
+  ): Promise<{ requested: number; loaded: number; rows: number }> {
+    const records = await this.store.getSectorStocks(sectorCode);
+    const stocks = records.map((record) => ({ code: record.stock_code, name: record.stock_name }));
+    let loaded = 0;
+    let rows = 0;
+    let completed = 0;
+    await runConcurrent(stocks, 12, async (stock) => {
+      if (options.cancelled?.()) return;
+      const marketData = await fetchAdjustedKlines(stockSymbol(stock.code), 120);
+      if (marketData.klines.length) {
+        rows += await this.store.upsertStockPrices(stock.code, stock.name, marketData.klines);
+        loaded += 1;
+      }
+      completed += 1;
+      options.progress?.(completed, stocks.length, `采集板块个股行情 ${completed}/${stocks.length}`);
+    });
+    return { requested: stocks.length, loaded, rows };
+  }
+
   async refreshIndexAnalysis(
     date: string,
     options: { progress?: (completed: number, total: number, message: string) => void; cancelled?: () => boolean } = {},

@@ -6,6 +6,7 @@ import { AuditLogger } from './audit-log.js';
 import { DataStore } from './data-store.js';
 import { ThsSimulatedBroker, ThsSimulatedBrokerError } from './ths-simulated-broker.js';
 import { PaperTradingService } from './paper-trading.js';
+import { refreshTradingCalendar } from './index-bootstrap.js';
 import { TaskRegistry } from './tasks.js';
 import { MarketService } from './app/market-service.js';
 import { registerRoutes } from './app/routes.js';
@@ -29,6 +30,10 @@ export function createApp(services: Partial<AppServices> = {}) {
       save: (state) => store.savePaperTradingState(state),
     },
     marketDataProvider: (window, traceId) => marketService.loadPaperContext(window === 'close', traceId),
+    calendarRefresher: async () => {
+      const refreshed = await refreshTradingCalendar(store);
+      return refreshed.calendar;
+    },
     audit,
   });
 
