@@ -3,7 +3,11 @@ import {
   defaultRankingRuntimeConfig,
   normalizeRankingRuntimeConfig,
 } from '../server/ranking-config.js';
-import { DEFAULT_FACTOR_WEIGHTS } from '../server/backtest-engine.js';
+import {
+  DEFAULT_FACTOR_WEIGHTS,
+  MAX_FACTOR_WEIGHT_PCT,
+  MIN_FACTOR_WEIGHT_PCT,
+} from '../server/backtest-engine.js';
 import { DEFAULT_SCORE_STOCK_CONFIG } from '../server/scoring-engine.js';
 
 describe('normalizeRankingRuntimeConfig', () => {
@@ -65,5 +69,25 @@ describe('normalizeRankingRuntimeConfig', () => {
     expect(normalized.scoring_config.relativeStrength.maxScore).toBe(15);
     // 未覆盖的整段字段回退到默认值（marketState 未提供）。
     expect(normalized.scoring_config.marketState).toEqual(DEFAULT_SCORE_STOCK_CONFIG.marketState);
+  });
+
+  it('accepts factor boosts above 100% and clamps only at the shared limits', () => {
+    const normalized = normalizeRankingRuntimeConfig({
+      factor_weights: {
+        trendWeightPct: 250,
+        volumePriceWeightPct: 150,
+        distanceFromLowWeightPct: 0,
+        volatilityTrendWeightPct: 175,
+        relativeStrengthWeightPct: -20,
+      },
+    });
+
+    expect(normalized.factor_weights).toEqual({
+      trendWeightPct: MAX_FACTOR_WEIGHT_PCT,
+      volumePriceWeightPct: 150,
+      distanceFromLowWeightPct: MIN_FACTOR_WEIGHT_PCT,
+      volatilityTrendWeightPct: 175,
+      relativeStrengthWeightPct: MIN_FACTOR_WEIGHT_PCT,
+    });
   });
 });

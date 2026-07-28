@@ -399,9 +399,9 @@ export function registerRoutes(
     const positionSizePct = numberParam(request.query.position_size_pct, 10, 1, 100);
     const takeProfitPct = numberParam(request.query.take_profit_pct, 15, 1, 60);
     const stopLossPct = numberParam(request.query.stop_loss_pct, 5, 1, 30);
-    const trendWeightPct = numberParam(request.query.trend_weight_pct, 100, 1, 100);
-    const volumePriceWeightPct = numberParam(request.query.volume_price_weight_pct, 100, 1, 100);
-    const distanceFromLowWeightPct = numberParam(request.query.distance_from_low_weight_pct, 100, 1, 100);
+    const trendWeightPct = numberParam(request.query.trend_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
+    const volumePriceWeightPct = numberParam(request.query.volume_price_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
+    const distanceFromLowWeightPct = numberParam(request.query.distance_from_low_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
     const volatilityWeightPct = numberParam(request.query.volatility_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
     const relativeStrengthWeightPct = numberParam(request.query.relative_strength_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
     const requestedDate = marketDateParam(request.query.date);
@@ -532,7 +532,7 @@ export function registerRoutes(
   app.post('/api/backtest/optimize', asyncHandler(async (request, response) => {
     const days = numberParam(request.query.days, 20, MIN_BACKTEST_DAYS, MAX_BACKTEST_DAYS);
     const requestedDate = marketDateParam(request.query.date);
-    const taskLabel = `参数优化（近 ${days} 日距60日低点表现）`;
+    const taskLabel = `参数优化（近 ${days} 日远期收益验证）`;
     const task = tasks.start('backtest_optimize', taskLabel, async ({ progress, cancelled, traceId }) => {
       const source = await store.getRankingUniverse();
       if (!source.rankings.length) throw new Error('当前股票池为空，无法运行参数优化');
@@ -708,10 +708,32 @@ export function registerRoutes(
       response.status(400).json({ ok: false, error: '交易窗口必须是 open、near_close、close 或 post_close' });
       return;
     }
+    if (requestedWindow === 'close') {
+      const task = tasks.start('paper_close_decision', '收盘决策：刷新行情并生成交易计划', async ({ progress, cancelled, traceId }) => {
+        try {
+          progress(5, '准备收盘行情与策略上下文');
+          const context = await marketService.loadPaperContext(true, traceId);
+          if (cancelled()) return null;
+          progress(82, '行情与排行已准备，正在生成下一交易日计划');
+          const result = await paper.runWindowConfirmed('close', context, traceId);
+          progress(98, result.message);
+          return result;
+        } catch (error) {
+          await audit.error('paper_trading', 'manual_window_failed', {
+            traceId,
+            data: { window: 'close' },
+            error,
+          });
+          throw error;
+        }
+      });
+      response.status(202).json({ task_id: task.id, status: 'started', message: '收盘决策任务已启动' });
+      return;
+    }
     try {
       response.json(await paper.runWindowConfirmed(
-        requestedWindow as 'open' | 'near_close' | 'close' | 'post_close',
-        await marketService.loadPaperContext(requestedWindow === 'close', String(response.locals.traceId)),
+        requestedWindow as 'open' | 'near_close' | 'post_close',
+        await marketService.loadPaperContext(false, String(response.locals.traceId)),
         String(response.locals.traceId),
       ));
     } catch (error) {

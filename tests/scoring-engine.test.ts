@@ -8,6 +8,7 @@ import {
   computeADX,
   distanceFromLowScore,
   limitUpCount,
+  relativeStrengthScore,
   scoreStock,
   singlePeriodTrend,
   strategyForScore,
@@ -107,8 +108,17 @@ describe('distanceFromLowScore — 距60日低点分档', () => {
   });
 });
 
-describe('scoreStock — 四维评分与标签', () => {
-  it('replaces the flat 8 with a real volatility-trend score and emits labels', () => {
+describe('dimension 5 — 相对强度', () => {
+  it('uses a neutral fallback and maps excess return continuously', () => {
+    expect(relativeStrengthScore(10, null)).toEqual({ score: 10, label: '基准缺失', excessPct: null });
+    expect(relativeStrengthScore(5, 0)).toEqual({ score: 10, label: '跑赢大盘', excessPct: 5 });
+    expect(relativeStrengthScore(20, 0)).toEqual({ score: 17.5, label: '显著跑赢', excessPct: 20 });
+    expect(relativeStrengthScore(-20, 0)).toEqual({ score: 0, label: '显著跑输', excessPct: -20 });
+  });
+});
+
+describe('scoreStock — 五维评分与标签', () => {
+  it('emits all five dimensions and a normalized total score', () => {
     const row = scoreStock(prepared(steadyUp()), String(100059))!;
     expect(row).not.toBeNull();
     expect(row.alignment).toBe('bullish');

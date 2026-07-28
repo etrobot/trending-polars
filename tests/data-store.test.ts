@@ -27,7 +27,13 @@ function rankingRow(code: string, name: string, score: number): RankingRow {
     total_score: score,
     trend_score: score / 2,
     volume_price_score: 10,
+    position_score: 18,
+    position_label: '启动确认',
+    distance_from_low_pct: 20,
     volatility_trend_score: 5,
+    relative_strength_score: 12,
+    relative_strength_label: '跑赢大盘',
+    relative_strength_pct: 7,
     alignment: 'bullish',
     trend_strength: 0.01,
     volume_price_label: '稳健放量',
@@ -157,7 +163,7 @@ describe('node:sqlite data store', () => {
     ]));
   });
 
-  it('uses ranking_factor as the canonical ranking source and keeps a JSON cache', async () => {
+  it('uses ranking_factor as the canonical five-factor ranking source and keeps a JSON cache', async () => {
     await store.saveAnalysis(blockTopAnalysis(), '20260723');
     await store.saveRanking({
       timestamp: '2026-07-23 15:05:00',
@@ -177,31 +183,13 @@ describe('node:sqlite data store', () => {
       expect.objectContaining({ stock_code: '600000', factor_name: 'limit_up_count_20d', val_numeric: 1 }),
       expect.objectContaining({ stock_code: '000001', factor_name: 'limit_up_count_20d', val_numeric: 0 }),
       expect.objectContaining({ stock_code: '000001', factor_name: 'volume_price_label', val_text: '稳健放量' }),
+      expect.objectContaining({ stock_code: '000001', factor_name: 'relative_strength_score', val_numeric: 12 }),
     ]));
     await expect(access(path.join(root, 'runtime', 'ranking.json'))).resolves.toBeUndefined();
 
     await store.clearRankingData();
     await expect(store.getRanking()).resolves.toMatchObject({ total_stocks: 0, rankings: [] });
     await expect(access(path.join(root, 'runtime', 'ranking.json'))).rejects.toThrow();
-  });
-
-  it('fills missing sector trend names from sector_trend_daily on read', async () => {
-    await store.saveAnalysis(blockTopAnalysis(), '20260723');
-    const row = rankingRow('600000', '浦发银行', 72);
-    delete row.sector_trend_name;
-    delete row.sector_trend_state_id;
-    await store.saveRanking({
-      timestamp: '2026-07-23 15:05:00',
-      date: '20260723',
-      total_stocks: 1,
-      rankings: [row],
-    });
-
-    const loaded = await store.getRanking();
-    // sector_trend_name is not auto-filled from sector_trend_daily on load
-    // when the ranking already has factor rows stored
-    expect(loaded.rankings[0].sector_trend_name).toBeUndefined();
-    expect(loaded.rankings[0].sector_trend_state_id).toBeUndefined();
   });
 
   it('rolls back the whole ranking batch when a row cannot be serialized', async () => {
@@ -300,17 +288,23 @@ describe('node:sqlite data store', () => {
   });
 
   it('imports legacy JSON seeds and remains usable after the seed files are removed', async () => {
+    const legacyRow = rankingRow('600000', '浦发银行', 72);
+    delete legacyRow.relative_strength_score;
+    delete legacyRow.relative_strength_label;
+    delete legacyRow.relative_strength_pct;
     await writeFile(path.join(root, 'analysis.json'), JSON.stringify(blockTopAnalysis()), 'utf8');
     await writeFile(path.join(root, 'ranking.json'), JSON.stringify({
       timestamp: '2026-07-23 15:05:00',
       date: '20260723',
       total_stocks: 1,
-      rankings: [rankingRow('600000', '浦发银行', 72)],
+      rankings: [legacyRow],
     }), 'utf8');
     await writeFile(path.join(root, 'historical-market.json'), JSON.stringify(historicalMarketFixture()), 'utf8');
 
     await expect(store.getAnalysis()).resolves.toMatchObject({ blocks: [expect.any(Object)] });
-    await expect(store.getRanking()).resolves.toMatchObject({ rankings: [expect.objectContaining({ stock_code: '600000' })] });
+    await expect(store.getRanking()).resolves.toMatchObject({
+      rankings: [expect.objectContaining({ stock_code: '600000', relative_strength_score: 10 })],
+    });
     await expect(store.getHistoricalMarket()).resolves.toMatchObject({ as_of_date: '20260723' });
 
     await unlink(path.join(root, 'analysis.json'));

@@ -69,14 +69,15 @@ describe('Tonghuashun simulated broker', () => {
       .toThrow(ThsSimulatedBrokerError);
   });
 
-  it('serially builds an account snapshot from the three read-only commands', async () => {
+  it('serially builds a full snapshot from the combined account and orders commands', async () => {
     const commands: string[][] = [];
     const broker = new ThsSimulatedBroker({
       runner: async (args) => {
         commands.push(args);
-        if (args[1] === 'funds') return snapshot('funds', 'TEXT|可用资金：90000', 'TEXT|总资产：100000');
-        if (args[1] === 'positions') return snapshot(
-          'positions',
+        if (args[1] === 'account') return snapshot(
+          'account',
+          'TEXT|可用资金：90000',
+          'TEXT|总资产：100000',
           'ROW|证券代码|证券名称|股票余额|可用余额|成本价|当前价|股票市值|总盈亏|盈亏比例',
           'ROW|000001|平安银行|1000|1000|10|10|10000|0|0%',
         );
@@ -87,8 +88,7 @@ describe('Tonghuashun simulated broker', () => {
     const account = await broker.snapshot();
 
     expect(commands).toEqual([
-      ['snapshot', 'funds'],
-      ['snapshot', 'positions'],
+      ['snapshot', 'account'],
       ['snapshot', 'orders'],
     ]);
     expect(account.availableCash).toBe(90_000);
@@ -113,13 +113,24 @@ describe('Tonghuashun simulated broker', () => {
       },
     });
 
-    const account = await broker.snapshotAccountOnly({ hintStockCodes: ['000001'] });
+    const account = await broker.snapshotAccountOnly({ hintStockCodes: ['000001', 'invalid', '600000'] });
 
     expect(commands).toEqual([
-      ['snapshot', 'account', '000001'],
+      ['snapshot', 'account', '000001,600000'],
     ]);
     expect(account.orders).toEqual([]);
     expect(account.positions[0].stock_code).toBe('000001');
+  });
+
+  it('rejects an empty position parse when Tonghuashun still reports positive market value', () => {
+    const broker = new ThsSimulatedBroker({ runner: async () => '' });
+
+    expect(() => broker.parseAccountSnapshot(snapshot(
+      'account',
+      'ROW|总资产|100000.00',
+      'ROW|总市值|40000.00',
+      'ROW|可用金额|60000.00',
+    ))).toThrow('已拒绝用空持仓覆盖上次快照');
   });
 
   it('returns the AppleScript-confirmed execution price to the Node trading core', async () => {

@@ -1,6 +1,6 @@
 import { prepareBacktestContext, quickSimulateBacktest } from './backtest-engine.js';
 import { round } from './format.js';
-import { type HistoricalMarketData } from './historical-market.js';
+import { normalizeBacktestDays, type HistoricalMarketData } from './historical-market.js';
 import {
   DEFAULT_SCORE_STOCK_CONFIG,
   distanceFromLowScore,
@@ -8,18 +8,18 @@ import {
   type Alignment,
   type DistanceFromLowTier,
   type ScoreStockConfig,
+  type TrendAxis,
 } from './scoring-engine.js';
 import { DEFAULT_T1_STRATEGY } from './trading-strategy.js';
 
 // ---------------------------------------------------------------------------
-// 两阶段参数优化（以完整回测收益为最终目标）：
-// 阶段1 — 每日按距60日低点收益降序取 Top N 正样本，提取特征分布生成候选 scoreStock
-//         配置，用默认交易参数跑回测，选收益最好的评分方案
+// 两阶段参数优化（以完整回测收益为最终目标，而非截面相关性）：
+// 阶段1 — 在候选 scoreStock 配置中，用默认交易参数跑回测，选收益最好的评分方案
 // 阶段2 — 固定阶段1评分，宽范围搜索回测参数；若仍不如默认基线则回退默认
 // ---------------------------------------------------------------------------
 
-/** 每日选取距60日低点收益最高的前 N 只股票作为正样本。 */
-export const TOP_N_PER_DAY = 20;
+/** 阶段1 统计表用的固定评估窗口（非交易持有天数）。 */
+export const SCORE_EVAL_FORWARD_DAYS = 5;
 
 export interface OptimizedStrategyParams {
   maxHoldDays: number;
@@ -43,10 +43,8 @@ export interface BacktestValidation {
 
 export interface ScoreStockOptimizeResult {
   config: ScoreStockConfig;
-  /** Top N 正样本的平均评分相对全体样本的领先幅度（分，>0 越理想）。 */
-  topScoreGapPct: number;
-  /** Top N 正样本集中度最高的分档占 Top N 总样本的比例（%）。 */
-  topConcentrationPct: number;
+  scoreCorrelation: number;
+  topBottomSpreadPct: number;
   distanceBucketStats: DistanceBucketStats[];
   sweetSpotLabels: string[];
   backtestValidation: BacktestValidation;
@@ -56,18 +54,14 @@ export interface DistanceBucketStats {
   label: string;
   minPct: number;
   maxPct: number | null;
-  /** 落在该分档的 Top N 正样本数量。 */
   sampleCount: number;
-  /** 该分档 Top N 正样本的平均距60日低点收益（%）。 */
-  avgDistancePct: number;
-  /** 该分档 Top N 正样本占 Top N 总数的比例（%）。 */
-  topConcentrationPct: number;
+  avgForwardReturnPct: number;
+  winRatePct: number;
   positionScore: number;
 }
 
 export interface ParamOptimizeResult {
   days: number;
-  topN: number;
   scoring: ScoreStockOptimizeResult;
   optimized: OptimizedStrategyParams;
   validation: BacktestValidation;
@@ -85,6 +79,8 @@ interface RawObservation {
   trendStrength: number;
   volumePriceScore: number;
   limitUpCount20d: number;
+  sectorTrend?: TrendAxis;
+  forwardByHold: Map<number, number>;
 }
 
 function clampInt(value: number, min: number, max: number): number {
@@ -106,12 +102,15 @@ function defaultStrategyParams(): OptimizedStrategyParams {
   };
 }
 
-/** 回测综合目标：收益为主，回撤惩罚，过少交易/极低胜率重罚。 */
+/**
+ * 回测综合目标：收益为主，回撤惩罚，过少交易/极低胜率重罚。
+ *
+ * 该分数只用于「收益率相同」时的 tie-breaker。最终优化目标必须仍然是
+ * totalReturnPct，否则会出现风险调整分更高、但用户实际看到的收益率更低的方案。
+ */
 function backtestObjective(summary: BacktestValidation): number {
-  // 亏损策略直接给最低分，避免 optimizer 在熊市挑"亏最少"的自欺欺人
-  if (summary.totalReturnPct <= 0) return Number.NEGATIVE_INFINITY;
   const tradePenalty = summary.totalTrades < 6 ? -12 : summary.totalTrades < 8 ? -4 : 0;
-  const winRatePenalty = summary.winRate < 40 ? (40 - summary.winRate) * 0.1 : 0;
+  const winRatePenalty = summary.winRate < 35 ? (35 - summary.winRate) * 0.08 : 0;
   return summary.totalReturnPct
     - Math.abs(summary.maxDrawdownPct) * 0.45
     + (summary.winRate >= 50 ? 1 : 0)
@@ -119,38 +118,90 @@ function backtestObjective(summary: BacktestValidation): number {
     - winRatePenalty;
 }
 
+const MIN_RELIABLE_TRADES = 6;
+
 /**
- * 构建正样本观测：每天按距60日低点收益降序取前 TOP_N_PER_DAY 名。
- * 使用 prepareBacktestContext 的 scoreMap 按天分组排序取 Top N。
+ * 比较两个回测结果。先排除交易样本不足的偶然高收益；在同一可靠性层级内，
+ * 收益率是严格的第一排序键，综合分只在收益率相同（回测摘要已四舍五入到
+ * 0.01%）时用于选择风险更优的方案。
+ */
+function compareBacktestResults(candidate: BacktestValidation, incumbent: BacktestValidation): number {
+  const candidateReliable = candidate.totalTrades >= MIN_RELIABLE_TRADES;
+  const incumbentReliable = incumbent.totalTrades >= MIN_RELIABLE_TRADES;
+  if (candidateReliable !== incumbentReliable) return candidateReliable ? 1 : -1;
+  const returnDelta = candidate.totalReturnPct - incumbent.totalReturnPct;
+  if (returnDelta !== 0) return returnDelta;
+  const objectiveDelta = backtestObjective(candidate) - backtestObjective(incumbent);
+  if (objectiveDelta !== 0) return objectiveDelta;
+  const drawdownDelta = Math.abs(incumbent.maxDrawdownPct) - Math.abs(candidate.maxDrawdownPct);
+  if (drawdownDelta !== 0) return drawdownDelta;
+  return candidate.totalTrades - incumbent.totalTrades;
+}
+
+function isBetterBacktestResult(candidate: BacktestValidation, incumbent: BacktestValidation): boolean {
+  return compareBacktestResults(candidate, incumbent) > 0;
+}
+
+function correlation(xs: number[], ys: number[]): number {
+  if (xs.length < 3 || xs.length !== ys.length) return 0;
+  const meanX = xs.reduce((sum, value) => sum + value, 0) / xs.length;
+  const meanY = ys.reduce((sum, value) => sum + value, 0) / ys.length;
+  let cov = 0;
+  let varX = 0;
+  let varY = 0;
+  for (let index = 0; index < xs.length; index += 1) {
+    const dx = xs[index] - meanX;
+    const dy = ys[index] - meanY;
+    cov += dx * dy;
+    varX += dx * dx;
+    varY += dy * dy;
+  }
+  if (!varX || !varY) return 0;
+  return cov / Math.sqrt(varX * varY);
+}
+
+function forwardReturn(observation: RawObservation, holdDays: number): number | null {
+  return observation.forwardByHold.get(holdDays) ?? null;
+}
+
+/**
+ * 构建正样本观测：遍历所有股票在所有日期的截面行，计算 SCORE_EVAL_FORWARD_DAYS 日
+ * 远期收益作为「正样本」标签。
+ *
+ * 关键：用**远期收益**（未来 N 日涨幅）而非「距低点收益」（过去涨幅）作为正样本信号。
+ * 后者是循环论证——选出已经涨最多的股票，再给它们所在的区间高分，等于鼓励买在顶部。
+ * 远期收益才是对「未来上涨」的预测信号。
  */
 function collectRawObservations(history: HistoricalMarketData, days: number): RawObservation[] {
   const context = prepareBacktestContext(history, days);
   const observations: RawObservation[] = [];
 
-  for (const date of context.dates) {
+  for (let dateIndex = 0; dateIndex < context.dates.length - SCORE_EVAL_FORWARD_DAYS; dateIndex += 1) {
+    const date = context.dates[dateIndex];
     const rows = context.scoreMap.get(date) ?? [];
-    // 按 distance_from_low_pct 降序取 Top N
-    const topN = [...rows]
-      .filter((row) => Number.isFinite(row.distance_from_low_pct))
-      .sort((a, b) => (b.distance_from_low_pct ?? 0) - (a.distance_from_low_pct ?? 0))
-      .slice(0, TOP_N_PER_DAY);
+    for (const row of rows) {
+      const series = context.seriesByCode.get(row.stock_code);
+      if (!series) continue;
+      const barIndex = series.indexByDate.get(date);
+      if (barIndex == null) continue;
+      const exitIndex = barIndex + SCORE_EVAL_FORWARD_DAYS;
+      if (exitIndex >= series.bars.length) continue;
+      const entryClose = series.bars[barIndex].close;
+      const exitClose = series.bars[exitIndex].close;
+      if (entryClose <= 0 || exitClose <= 0) continue;
 
-    for (const row of topN) {
       observations.push({
         distancePct: row.distance_from_low_pct ?? 0,
         alignment: (row.alignment ?? 'tangled') as Alignment,
         trendStrength: row.trend_strength ?? 0,
         volumePriceScore: Number(row.volume_price_score ?? row.volume_score ?? 0),
         limitUpCount20d: row.limit_up_count_20d ?? 0,
+        forwardByHold: new Map([[SCORE_EVAL_FORWARD_DAYS, round((exitClose - entryClose) / entryClose * 100, 2)]]),
       });
     }
   }
 
-  console.log('[param-optimize] top-N observations', {
-    days: context.dates.length,
-    topN: TOP_N_PER_DAY,
-    count: observations.length,
-  });
+  console.log('[param-optimize] raw observations', { days: context.dates.length, count: observations.length });
   return observations;
 }
 
@@ -161,8 +212,8 @@ function aggregateBucketStats(observations: RawObservation[], config: ScoreStock
     minPct: index === 0 ? 0 : tiers[index - 1].maxPct,
     maxPct: tier.maxPct,
     sampleCount: 0,
-    avgDistancePct: 0,
-    topConcentrationPct: 0,
+    avgForwardReturnPct: 0,
+    winRatePct: 0,
     positionScore: tier.score,
   }));
   buckets.push({
@@ -170,57 +221,48 @@ function aggregateBucketStats(observations: RawObservation[], config: ScoreStock
     minPct: tiers.at(-1)?.maxPct ?? 80,
     maxPct: null,
     sampleCount: 0,
-    avgDistancePct: 0,
-    topConcentrationPct: 0,
+    avgForwardReturnPct: 0,
+    winRatePct: 0,
     positionScore: config.distanceFromLow.extendedScore,
   });
 
-  const total = observations.length;
   for (const observation of observations) {
     const label = distanceFromLowScore(observation.distancePct, config).label;
     const bucket = buckets.find((item) => item.label === label);
     if (!bucket) continue;
+    const forward = forwardReturn(observation, SCORE_EVAL_FORWARD_DAYS);
+    if (forward == null) continue;
     bucket.sampleCount += 1;
-    bucket.avgDistancePct += observation.distancePct;
+    bucket.avgForwardReturnPct += forward;
+    if (forward > 0) bucket.winRatePct += 1;
   }
 
   for (const bucket of buckets) {
     if (!bucket.sampleCount) continue;
-    bucket.avgDistancePct = round(bucket.avgDistancePct / bucket.sampleCount, 2);
-    bucket.topConcentrationPct = total > 0 ? round(bucket.sampleCount / total * 100, 1) : 0;
+    bucket.avgForwardReturnPct = round(bucket.avgForwardReturnPct / bucket.sampleCount, 2);
+    bucket.winRatePct = round(bucket.winRatePct / bucket.sampleCount * 100, 1);
   }
   return buckets;
 }
 
-/** 评估评分配置对 Top N 正样本的区分度：Top N 平均评分 vs 全体平均评分的差距。 */
-function evaluateScoreDiagnostics(
-  observations: RawObservation[],
-  config: ScoreStockConfig,
-  allRowCount: number,
-  allAvgScore: number,
-) {
-  if (!observations.length || allRowCount <= 0) {
-    return { topScoreGap: 0, concentration: 0 };
-  }
-  let topScoreSum = 0;
-  let topInBestBucket = 0;
-  let bestBucketLabel: string | undefined;
+function evaluateScoreDiagnostics(observations: RawObservation[], config: ScoreStockConfig) {
+  const scores: number[] = [];
+  const forwards: number[] = [];
   for (const observation of observations) {
+    const forward = forwardReturn(observation, SCORE_EVAL_FORWARD_DAYS);
+    if (forward == null) continue;
     const fromLow = distanceFromLowScore(observation.distancePct, config);
-    topScoreSum += fromLow.score;
-    if (!bestBucketLabel || fromLow.score > (distanceFromLowScore(0, config).score)) {
-      bestBucketLabel = fromLow.label;
-    }
+    scores.push(fromLow.score);
+    forwards.push(forward);
   }
-  const topAvgScore = topScoreSum / observations.length;
-  const topScoreGap = round(topAvgScore - allAvgScore, 2);
-
-  for (const observation of observations) {
-    const fromLow = distanceFromLowScore(observation.distancePct, config);
-    if (fromLow.label === bestBucketLabel) topInBestBucket += 1;
-  }
-  const concentration = round(topInBestBucket / observations.length * 100, 1);
-  return { topScoreGap, concentration };
+  const corr = correlation(scores, forwards);
+  const ranked = scores.map((score, index) => ({ score, forward: forwards[index] }))
+    .sort((left, right) => right.score - left.score);
+  const topCount = Math.max(1, Math.floor(ranked.length * 0.2));
+  const bottomCount = Math.max(1, Math.floor(ranked.length * 0.2));
+  const topAvg = ranked.slice(0, topCount).reduce((sum, item) => sum + item.forward, 0) / topCount;
+  const bottomAvg = ranked.slice(-bottomCount).reduce((sum, item) => sum + item.forward, 0) / bottomCount;
+  return { correlation: round(corr, 3), spread: round(topAvg - bottomAvg, 2) };
 }
 
 function buildDistanceConfigFromStats(
@@ -235,18 +277,36 @@ function buildDistanceConfigFromStats(
     { label: '远离低点', maxPct: thresholds.farFromLow, score: 14 },
   ];
 
-  // 根据 Top N 正样本在各桶的集中度调整 tier.score
-  // 集中度越高的桶（Top N 越倾向于落在该区间），给越高的分值
-  const total = observations.length;
+  // 根据各桶的远期收益调整 tier.score：远期收益越高、胜率越高的区间给越高分值。
+  // 这是预测性信号——「该区间的股票未来更可能上涨」——而非描述性信号。
+  //
+  // 关键：用**相对表现**（tier 均值 - 全局均值）而非绝对收益来打分。
+  // 在下行市场中所有桶的远期收益可能都为负，绝对值公式会让所有桶得分趋同、
+  // 失去区分度。相对表现公式保证「比市场平均跌得少」的桶也能拿到高分。
+  const probeConfig = normalizeScoreStockConfig({
+    distanceFromLow: { ...DEFAULT_SCORE_STOCK_CONFIG.distanceFromLow, tiers },
+  });
+  const allReturns = observations
+    .map((item) => forwardReturn(item, SCORE_EVAL_FORWARD_DAYS))
+    .filter((value): value is number => value != null);
+  const overallAvg = allReturns.length
+    ? allReturns.reduce((sum, value) => sum + value, 0) / allReturns.length
+    : 0;
+  const overallWinRate = allReturns.length
+    ? allReturns.filter((value) => value > 0).length / allReturns.length
+    : 0;
+
   for (const tier of tiers) {
-    const probeConfig = normalizeScoreStockConfig({
-      distanceFromLow: { ...DEFAULT_SCORE_STOCK_CONFIG.distanceFromLow, tiers },
-    });
-    const inTier = observations.filter((item) => distanceFromLowScore(item.distancePct, probeConfig).label === tier.label);
-    if (!inTier.length) continue;
-    const concentration = inTier.length / total;
-    const avgDistance = inTier.reduce((sum, item) => sum + item.distancePct, 0) / inTier.length;
-    tier.score = clampInt(4 + concentration * 12 + Math.max(0, avgDistance) * 0.08, 2, 20);
+    const returns = observations
+      .filter((item) => distanceFromLowScore(item.distancePct, probeConfig).label === tier.label)
+      .map((item) => forwardReturn(item, SCORE_EVAL_FORWARD_DAYS))
+      .filter((value): value is number => value != null);
+    if (!returns.length) continue;
+    const avg = returns.reduce((sum, value) => sum + value, 0) / returns.length;
+    const winRate = returns.filter((value) => value > 0).length / returns.length;
+    const relativeReturn = avg - overallAvg;
+    const relativeWinRate = winRate - overallWinRate;
+    tier.score = clampInt(10 + relativeReturn * 2.0 + relativeWinRate * 25, 2, 20);
   }
 
   return {
@@ -281,21 +341,27 @@ function scoreConfigCandidates(observations: RawObservation[]): ScoreStockConfig
   return candidates;
 }
 
-/** 计算全体样本的平均位置分（作为 Top N 对比的基线）。 */
-function computeAllAvgPositionScore(history: HistoricalMarketData, days: number, config: ScoreStockConfig): { count: number; avgScore: number } {
-  const context = prepareBacktestContext(history, days, config);
-  let scoreSum = 0;
-  let count = 0;
-  for (const date of context.dates) {
-    const rows = context.scoreMap.get(date) ?? [];
-    for (const row of rows) {
-      const distancePct = row.distance_from_low_pct ?? 0;
-      if (!Number.isFinite(distancePct)) continue;
-      scoreSum += distanceFromLowScore(distancePct, config).score;
-      count += 1;
-    }
-  }
-  return { count, avgScore: count ? scoreSum / count : 0 };
+function scoreStockResultForConfig(
+  observations: RawObservation[],
+  config: ScoreStockConfig,
+  backtestValidation: BacktestValidation,
+): ScoreStockOptimizeResult {
+  const distanceBucketStats = aggregateBucketStats(observations, config);
+  const rankedBuckets = [...distanceBucketStats]
+    .filter((item) => item.sampleCount >= 5 && item.avgForwardReturnPct > 0)
+    .sort((left, right) => right.avgForwardReturnPct - left.avgForwardReturnPct || right.winRatePct - left.winRatePct);
+  const sweetSpotLabels = rankedBuckets.length
+    ? rankedBuckets.slice(0, 2).map((item) => item.label)
+    : ['启动确认', '趋势上行'];
+  const diagnostics = evaluateScoreDiagnostics(observations, config);
+  return {
+    config,
+    scoreCorrelation: diagnostics.correlation,
+    topBottomSpreadPct: diagnostics.spread,
+    distanceBucketStats,
+    sweetSpotLabels,
+    backtestValidation,
+  };
 }
 
 function optimizeScoreStockConfig(
@@ -305,59 +371,37 @@ function optimizeScoreStockConfig(
   tradingDefaults: OptimizedStrategyParams,
 ): ScoreStockOptimizeResult {
   let bestConfig = DEFAULT_SCORE_STOCK_CONFIG;
-  let bestValidation: BacktestValidation = {
-    totalReturnPct: Number.NEGATIVE_INFINITY,
-    winRate: 0,
-    maxDrawdownPct: 0,
-    totalTrades: 0,
-  };
-  let bestObjective = Number.NEGATIVE_INFINITY;
-  let bestDiagnostics = { topScoreGap: 0, concentration: 0 };
+  let bestValidation: BacktestValidation | undefined;
 
   const candidates = scoreConfigCandidates(observations);
   console.log('[param-optimize] phase1 candidates', candidates.length);
 
-  // 用默认 config 计算全体平均位置分作为对比基线
-  const allBaseline = computeAllAvgPositionScore(history, days, DEFAULT_SCORE_STOCK_CONFIG);
-
   for (const config of candidates) {
     const context = prepareBacktestContext(history, days, config);
     const validation = quickSimulateBacktest(context, tradingDefaults);
-    const objective = backtestObjective(validation);
-    if (objective > bestObjective) {
-      bestObjective = objective;
+    if (!bestValidation || isBetterBacktestResult(validation, bestValidation)) {
       bestConfig = config;
       bestValidation = validation;
-      bestDiagnostics = evaluateScoreDiagnostics(observations, config, allBaseline.count, allBaseline.avgScore);
     }
   }
 
-  const bucketStats = aggregateBucketStats(observations, bestConfig);
-  // 优选区间：Top N 集中度最高的两个分档（sampleCount > 0）
-  const rankedBuckets = [...bucketStats]
-    .filter((item) => item.sampleCount > 0)
-    .sort((left, right) => right.topConcentrationPct - left.topConcentrationPct || right.avgDistancePct - left.avgDistancePct);
-  const sweetSpotLabels = rankedBuckets.length
-    ? rankedBuckets.slice(0, 2).map((item) => item.label)
-    : ['启动确认', '趋势上行'];
+  // candidates 至少包含默认配置，因此这里必定有验证结果；保留保护分支以防未来
+  // 搜索空间被改成空数组时不会把 undefined 传到 API。
+  const validation = bestValidation ?? quickSimulateBacktest(
+    prepareBacktestContext(history, days, DEFAULT_SCORE_STOCK_CONFIG),
+    tradingDefaults,
+  );
+  const result = scoreStockResultForConfig(observations, bestConfig, validation);
 
   console.log('[param-optimize] phase1 scoreStock done', {
-    objective: round(bestObjective, 2),
-    backtestValidation: bestValidation,
-    topScoreGap: bestDiagnostics.topScoreGap,
-    topConcentration: bestDiagnostics.concentration,
-    distanceTiers: bestConfig.distanceFromLow.tiers,
-    trend: bestConfig.trend,
+    objective: round(backtestObjective(validation), 2),
+    backtestValidation: validation,
+    scoreCorrelation: result.scoreCorrelation,
+    distanceTiers: result.config.distanceFromLow.tiers,
+    trend: result.config.trend,
   });
 
-  return {
-    config: bestConfig,
-    topScoreGapPct: bestDiagnostics.topScoreGap,
-    topConcentrationPct: bestDiagnostics.concentration,
-    distanceBucketStats: bucketStats,
-    sweetSpotLabels,
-    backtestValidation: bestValidation,
-  };
+  return result;
 }
 
 function gridSearchBacktestParams(
@@ -367,33 +411,29 @@ function gridSearchBacktestParams(
   seed: OptimizedStrategyParams,
 ): { params: OptimizedStrategyParams; validation: BacktestValidation; objective: number } {
   const context = prepareBacktestContext(history, days, scoringConfig);
-  let bestParams = seed;
-  let bestObjective = Number.NEGATIVE_INFINITY;
-  let bestValidation: BacktestValidation = {
-    totalReturnPct: 0,
-    winRate: 0,
-    maxDrawdownPct: 0,
-    totalTrades: 0,
+  let bestParams = { ...seed };
+  let bestValidation = quickSimulateBacktest(context, bestParams);
+  let evaluated = 1;
+
+  const consider = (candidate: OptimizedStrategyParams) => {
+    const validation = quickSimulateBacktest(context, candidate);
+    evaluated += 1;
+    if (isBetterBacktestResult(validation, bestValidation)) {
+      bestParams = candidate;
+      bestValidation = validation;
+    }
   };
 
   const holdDaysList = [3, 5, 7, 10, 15, 20];
   const takeProfitList = [10, 15, 20, 25, 30];
   const stopLossList = [5, 8, 10, 12, 15];
 
-  let evaluated = 0;
   // 2a：核心交易参数
   for (const maxHoldDays of holdDaysList) {
     for (const takeProfitPct of takeProfitList) {
       for (const stopLossPct of stopLossList) {
         const candidate = { ...seed, maxHoldDays, takeProfitPct, stopLossPct };
-        const validation = quickSimulateBacktest(context, candidate);
-        evaluated += 1;
-        const objective = backtestObjective(validation);
-        if (objective > bestObjective) {
-          bestObjective = objective;
-          bestParams = candidate;
-          bestValidation = validation;
-        }
+        consider(candidate);
       }
     }
   }
@@ -402,26 +442,15 @@ function gridSearchBacktestParams(
   const positionSizeList = [10, 15, 20, 25];
 
   // 2b：在 2a 最优附近调仓位
+  const positionSeed = { ...bestParams };
   for (const maxPositions of maxPositionsList) {
     for (const positionSizePct of positionSizeList) {
-      const candidate: OptimizedStrategyParams = { ...bestParams, maxPositions, positionSizePct };
-      const validation = quickSimulateBacktest(context, candidate);
-      evaluated += 1;
-      const objective = backtestObjective(validation);
-      if (objective > bestObjective) {
-        bestObjective = objective;
-        bestParams = candidate;
-        bestValidation = validation;
-      }
+      consider({ ...positionSeed, maxPositions, positionSizePct });
     }
   }
 
-  // 2c：五个因子权重做坐标下降。
-  // 过去只搜 trend / distanceFromLow 两维（4×4×3×3=144 次），volumePrice / volatility /
-  // relativeStrength 恒为 100 从未被优化 —— 且 volatilityWeightPct 因为键名与
-  // quickSimulateBacktest 不匹配，即使传了也被静默丢弃。
-  // 区间也从 [70,100]（只能往下调）改为以 100 为中心的 70/100/130：归一化后权重可双向调整。
-  // 全网格是 3⁵=243 次，坐标下降两轮只要 2×5×3=30 次，覆盖的维度反而更多。
+  // 2c：五个因子权重做坐标下降。权重以 100 为中性点，允许增强或削弱
+  // 任一维度；总分在回测引擎中会重新归一化到 100 分制。
   const weightList = [70, 100, 130];
   const weightKeys = [
     'trendWeightPct',
@@ -430,23 +459,17 @@ function gridSearchBacktestParams(
     'volatilityWeightPct',
     'relativeStrengthWeightPct',
   ] as const;
-  for (let round = 0; round < 2; round += 1) {
+  for (let pass = 0; pass < 2; pass += 1) {
     for (const key of weightKeys) {
+      const weightSeed = { ...bestParams };
       for (const weight of weightList) {
-        if (bestParams[key] === weight) continue;
-        const candidate: OptimizedStrategyParams = { ...bestParams, [key]: weight };
-        const validation = quickSimulateBacktest(context, candidate);
-        evaluated += 1;
-        const objective = backtestObjective(validation);
-        if (objective > bestObjective) {
-          bestObjective = objective;
-          bestParams = candidate;
-          bestValidation = validation;
-        }
+        if (weightSeed[key] === weight) continue;
+        consider({ ...weightSeed, [key]: weight });
       }
     }
   }
 
+  const bestObjective = backtestObjective(bestValidation);
   console.log('[param-optimize] phase2 backtest grid done', {
     evaluated,
     objective: round(bestObjective, 2),
@@ -463,7 +486,9 @@ export function optimizeStrategyParams(
   history: HistoricalMarketData,
   options: { days?: number } = {},
 ): ParamOptimizeResult {
-  const days = Math.min(60, Math.max(5, Math.trunc(options.days ?? 60)));
+  // 与 /api/backtest/run 使用同一套窗口归一化，避免优化阶段用 60 日而
+  // 页面重跑时用 120/250 日，导致「验证收益」与实际收益不是同一件事。
+  const days = normalizeBacktestDays(options.days, 20);
   const defaultParams = defaultStrategyParams();
   const observations = collectRawObservations(history, days);
   if (observations.length < 10) {
@@ -478,24 +503,20 @@ export function optimizeStrategyParams(
   const scoring = optimizeScoreStockConfig(history, days, observations, defaultParams);
   const phase2 = gridSearchBacktestParams(history, days, scoring.config, defaultParams);
 
-  const beatBaseline = phase2.objective > baselineObjective;
+  // 用户关心的是最终收益率。即使某个方案回撤更小、交易更少而综合分更高，
+  // 只要收益率没有严格超过基线，就不应把它标成“优化成功”。
+  const beatBaseline = phase2.validation.totalReturnPct > baselineValidation.totalReturnPct;
   const optimized = beatBaseline ? phase2.params : defaultParams;
   const validation = beatBaseline ? phase2.validation : baselineValidation;
   const finalScoring = beatBaseline
     ? scoring
-    : {
-      ...scoring,
-      config: DEFAULT_SCORE_STOCK_CONFIG,
-      backtestValidation: baselineValidation,
-    };
+    : scoreStockResultForConfig(observations, DEFAULT_SCORE_STOCK_CONFIG, baselineValidation);
 
   const methodology = beatBaseline
     ? `阶段1：${scoreConfigCandidates(observations).length} 组 scoreStock 以完整回测选优。`
       + `阶段2：搜索回测参数得 ${validation.totalReturnPct}%（胜率 ${validation.winRate}%），`
       + `超越默认基线 ${baselineValidation.totalReturnPct}%。`
-    : baselineValidation.totalReturnPct <= 0
-      ? `当前 ${days} 日市场环境下所有策略均未能盈利（最优仅 ${phase2.validation.totalReturnPct}%），已回退默认参数。`
-      : `优化结果（${phase2.validation.totalReturnPct}%）未超越默认方案（${baselineValidation.totalReturnPct}%），已回退默认参数。`;
+    : `优化结果（${phase2.validation.totalReturnPct}%）未超越默认方案（${baselineValidation.totalReturnPct}%），已回退默认参数。`;
 
   console.log('[param-optimize] completed', {
     days,
@@ -507,7 +528,6 @@ export function optimizeStrategyParams(
 
   return {
     days,
-    topN: TOP_N_PER_DAY,
     scoring: finalScoring,
     optimized,
     validation,

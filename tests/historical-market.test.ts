@@ -14,6 +14,8 @@ import {
 import type { RankingRow } from '../src/types.js';
 import { historicalFixture } from './historical-fixture.js';
 
+const TENCENT_KLINE_PATH = '/ifzqgtimg/appstock/app/newfqkline/get';
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -147,7 +149,7 @@ describe('market kline sources', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
       calls.push(url);
-      if (url.includes('web.ifzq.gtimg.cn')) return new Response('invalid', { status: 200 });
+      if (url.includes(TENCENT_KLINE_PATH)) return new Response('invalid', { status: 200 });
       if (url.includes('CN_MarketData.getKLineData')) return new Response('null', { status: 200 });
       if (url.includes('/qfq.js')) return new Response('var sh000300qfq={"total":0,"data":[]};', { status: 200 });
       if (url.includes('push2his.eastmoney.com')) {
@@ -163,9 +165,15 @@ describe('market kline sources', () => {
     const result = await fetchAdjustedKlines('sh000300', 5);
     expect(result.source).toBe('eastmoney');
     expect(result.klines[0]).toMatchObject({ close: 4050, volume: 100, amount: 200000 });
-    expect(calls[0]).toContain('web.ifzq.gtimg.cn');
-    expect(calls.findIndex((url) => url.includes('push2his.eastmoney.com')))
-      .toBeGreaterThan(calls.findIndex((url) => url.includes('CN_MarketData.getKLineData')));
+    const tencentIndex = calls.findIndex((url) => url.includes(TENCENT_KLINE_PATH));
+    const sinaIndices = calls
+      .map((url, index) => ({ url, index }))
+      .filter(({ url }) => url.includes('CN_MarketData.getKLineData') || url.includes('/qfq.js'))
+      .map(({ index }) => index);
+    const eastmoneyIndex = calls.findIndex((url) => url.includes('push2his.eastmoney.com'));
+    expect(tencentIndex).toBe(0);
+    expect(Math.min(...sinaIndices)).toBeGreaterThan(tencentIndex);
+    expect(eastmoneyIndex).toBeGreaterThan(Math.max(...sinaIndices));
   });
 
   it('uses the dedicated Tonghuashun block URL instead of a stock/index source', async () => {

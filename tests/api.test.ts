@@ -4,7 +4,9 @@ import path from 'node:path';
 import request from 'supertest';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../server/app.js';
+import { NOOP_AUDIT_LOGGER } from '../server/audit-log.js';
 import { DataStore } from '../server/data-store.js';
+import { resolveLatestTradingDate } from '../server/index-bootstrap.js';
 import { PaperTradingService } from '../server/paper-trading.js';
 import { TaskRegistry } from '../server/tasks.js';
 import type { SimulatedAccountSnapshot, SimulatedBroker } from '../server/ths-simulated-broker.js';
@@ -15,6 +17,17 @@ let root = '';
 let http: ReturnType<typeof request>;
 let simulatedBroker: FakeSimulatedBroker;
 let store: DataStore;
+
+const TENCENT_KLINE_PATH = '/ifzqgtimg/appstock/app/newfqkline/get';
+
+function isTencentKlineRequest(url: string): boolean {
+  return url.includes(TENCENT_KLINE_PATH);
+}
+
+function tencentKlineResponse(url: string, rows: unknown[][]): Response {
+  const symbol = new URL(url).searchParams.get('param')?.split(',')[0] ?? '';
+  return new Response(`kline_dayqfq=${JSON.stringify({ code: 0, data: { [symbol]: { qfqday: rows } } })}`, { status: 200 });
+}
 
 class FakeSimulatedBroker implements SimulatedBroker {
   snapshotCalls = 0;
@@ -125,7 +138,11 @@ function apiRankingFixture(): RankingRow[] {
     total_score: 80 - index,
     trend_score: 35 - index / 2,
     volume_price_score: 20,
+    position_score: 18,
     volatility_trend_score: 8,
+    relative_strength_score: 12,
+    relative_strength_label: '跑赢大盘',
+    relative_strength_pct: 7,
     alignment: 'bullish',
     strategy_action: 'accumulate',
     strategy_label: '趋势跟踪',
@@ -221,9 +238,24 @@ describe('Trending Polars API', () => {
     expect(task.status).toBe('completed');
     const ranking = await http.get('/api/ranking?page_size=5').expect(200);
     expect(ranking.body.rankings.length).toBeGreaterThanOrEqual(2);
+    expect(ranking.body.rankings[0]).toMatchObject({
+      relative_strength_score: expect.any(Number),
+      relative_strength_label: expect.any(String),
+    });
   });
 
   it('uses the latest trading day when refreshing analysis without an explicit date', async () => {
+    const latestRoot = await mkdtemp(path.join(os.tmpdir(), 'trending-polars-latest-date-'));
+    const latestStore = new DataStore(latestRoot);
+    await latestStore.saveAnalysis(apiAnalysisFixture(), '20260722');
+    const latestApp = createApp({
+      store: latestStore,
+      tasks: new TaskRegistry(),
+      paper: new PaperTradingService(new FakeSimulatedBroker()),
+      audit: NOOP_AUDIT_LOGGER as never,
+    });
+    const latestHttp = request(latestApp.app);
+    const expectedDate = await resolveLatestTradingDate(latestStore);
     const calls: string[] = [];
     const priceRows = Array.from({ length: 90 }, (_, index) => {
       const date = new Date(Date.UTC(2026, 3, 25 + index)).toISOString().slice(0, 10);
@@ -251,19 +283,19 @@ describe('Trending Polars API', () => {
       if (url.includes('d.10jqka.com.cn/v4/line/bk_885531/')) {
         return new Response(`callback({"name":"光伏概念","data":"${blockRows}"})`, { status: 200 });
       }
-      if (url.includes('web.ifzq.gtimg.cn')) {
-        const symbol = new URL(url).searchParams.get('param')?.split(',')[0] ?? '';
-        return new Response(`kline_dayqfq=${JSON.stringify({ code: 0, data: { [symbol]: { qfqday: priceRows } } })}`, { status: 200 });
-      }
+      if (isTencentKlineRequest(url)) return tencentKlineResponse(url, priceRows);
       return new Response('', { status: 404 });
     });
     try {
-      const started = await http.get('/api/analysis?refresh=1').expect(202);
-      const task = await waitForTask(started.body.task_id);
+      const started = await latestHttp.get('/api/analysis?refresh=1').expect(202);
+      const task = await waitForTaskFrom(latestHttp, started.body.task_id);
       expect(task.status).toBe('completed');
-      expect(calls.some((url) => url.includes('/dataapi/limit_up/block_top') && url.includes('date=20260722'))).toBe(true);
+      expect(task.result.date).toBe(expectedDate);
+      expect(calls.some((url) => url.includes('/dataapi/limit_up/block_top') && url.includes(`date=${expectedDate}`))).toBe(true);
     } finally {
       fetchSpy.mockRestore();
+      latestStore.close();
+      await rm(latestRoot, { recursive: true, force: true });
     }
   });
 
@@ -298,10 +330,7 @@ describe('Trending Polars API', () => {
       if (url.includes('d.10jqka.com.cn/v4/line/bk_885531/')) {
         return new Response(`callback({"name":"光伏概念","data":"${blockRows}"})`, { status: 200 });
       }
-      if (url.includes('web.ifzq.gtimg.cn')) {
-        const symbol = new URL(url).searchParams.get('param')?.split(',')[0] ?? '';
-        return new Response(`kline_dayqfq=${JSON.stringify({ code: 0, data: { [symbol]: { qfqday: priceRows } } })}`, { status: 200 });
-      }
+      if (isTencentKlineRequest(url)) return tencentKlineResponse(url, priceRows);
       return new Response('', { status: 404 });
     });
     try {
@@ -347,6 +376,7 @@ describe('Trending Polars API', () => {
       store: workflowStore,
       tasks: new TaskRegistry(),
       paper: workflowPaper,
+      audit: NOOP_AUDIT_LOGGER as never,
     });
     const workflowHttp = request(workflowApp.app);
     await workflowStore.saveAnalysis(apiAnalysisFixture(), '20260722');
@@ -366,10 +396,7 @@ describe('Trending Polars API', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       const url = String(input);
       calls.push(url);
-      if (url.includes('web.ifzq.gtimg.cn')) {
-        const symbol = new URL(url).searchParams.get('param')?.split(',')[0] ?? '';
-        return new Response(`kline_dayqfq=${JSON.stringify({ code: 0, data: { [symbol]: { qfqday: rows } } })}`, { status: 200 });
-      }
+      if (isTencentKlineRequest(url)) return tencentKlineResponse(url, rows);
       return new Response('', { status: 404 });
     });
     try {
@@ -386,7 +413,7 @@ describe('Trending Polars API', () => {
       expect(calls.length).toBeGreaterThan(beforeRanking);
 
       const beforeBacktest = calls.length;
-      const backtestStarted = await workflowHttp.post('/api/backtest/run?mode=random&days=60&strategy_count=8&max_hold_days=5&max_positions=8&position_size_pct=12&take_profit_pct=15&stop_loss_pct=5&trend_weight_pct=100&volume_price_weight_pct=100&volatility_weight_pct=100&date=20260723').expect(202);
+      const backtestStarted = await workflowHttp.post('/api/backtest/run?mode=random&days=60&strategy_count=8&max_hold_days=5&max_positions=8&position_size_pct=12&take_profit_pct=15&stop_loss_pct=5&trend_weight_pct=100&volume_price_weight_pct=100&distance_from_low_weight_pct=100&volatility_weight_pct=100&relative_strength_weight_pct=100&date=20260723').expect(202);
       const backtestTask = await waitForTaskFrom(workflowHttp, backtestStarted.body.task_id);
       expect(backtestTask.status).toBe('completed');
       expect(backtestTask.result).toMatchObject({ collected: true, run_id: expect.any(String) });
@@ -399,7 +426,7 @@ describe('Trending Polars API', () => {
   });
 
   it('runs randomized backtests as separate saved runs', async () => {
-    const started = await http.post('/api/backtest/run?mode=random&days=10&strategy_count=12&max_hold_days=3&max_positions=5&position_size_pct=20&take_profit_pct=15&stop_loss_pct=5&trend_weight_pct=100&volume_price_weight_pct=100&distance_from_low_weight_pct=100&volatility_weight_pct=100&date=20260722').expect(202);
+    const started = await http.post('/api/backtest/run?mode=random&days=10&strategy_count=12&max_hold_days=3&max_positions=5&position_size_pct=20&take_profit_pct=15&stop_loss_pct=5&trend_weight_pct=150&volume_price_weight_pct=150&distance_from_low_weight_pct=150&volatility_weight_pct=150&relative_strength_weight_pct=150&date=20260722').expect(202);
     const task = await waitForTask(started.body.task_id);
     expect(task.status).toBe('completed');
     expect(task.result.run_ids).toHaveLength(12);
@@ -425,19 +452,26 @@ describe('Trending Polars API', () => {
       position_size_upper_pct: 20,
       take_profit_upper_pct: 15,
       stop_loss_upper_pct: 5,
-      trend_weight_upper_pct: 100,
-      volume_price_weight_upper_pct: 100,
-      distance_from_low_weight_upper_pct: 100,
-      volatility_weight_upper_pct: 100,
+      trend_weight_upper_pct: 150,
+      volume_price_weight_upper_pct: 150,
+      distance_from_low_weight_upper_pct: 150,
+      volatility_weight_upper_pct: 150,
+      relative_strength_weight_upper_pct: 150,
     });
-    expect(result.config.trend_weight_pct).toBeGreaterThanOrEqual(1);
-    expect(result.config.trend_weight_pct).toBeLessThanOrEqual(100);
-    expect(result.config.distance_from_low_weight_pct).toBeGreaterThanOrEqual(1);
-    expect(result.config.distance_from_low_weight_pct).toBeLessThanOrEqual(100);
+    for (const key of [
+      'trend_weight_pct',
+      'volume_price_weight_pct',
+      'distance_from_low_weight_pct',
+      'volatility_weight_pct',
+      'relative_strength_weight_pct',
+    ]) {
+      expect(result.config[key]).toBeGreaterThanOrEqual(1);
+      expect(result.config[key]).toBeLessThanOrEqual(150);
+    }
   });
 
   it('runs a current-scheme backtest with exact parameters', async () => {
-    const started = await http.post('/api/backtest/run?mode=current&days=10&max_hold_days=3&max_positions=5&position_size_pct=10&take_profit_pct=15&stop_loss_pct=5&trend_weight_pct=60&volume_price_weight_pct=80&distance_from_low_weight_pct=70&volatility_weight_pct=100&date=20260722').expect(202);
+    const started = await http.post('/api/backtest/run?mode=current&days=10&max_hold_days=3&max_positions=5&position_size_pct=10&take_profit_pct=15&stop_loss_pct=5&trend_weight_pct=130&volume_price_weight_pct=130&distance_from_low_weight_pct=130&volatility_weight_pct=130&relative_strength_weight_pct=130&date=20260722').expect(202);
     const task = await waitForTask(started.body.task_id);
     expect(task.status).toBe('completed');
     const runId = task.result.run_id;
@@ -452,10 +486,11 @@ describe('Trending Polars API', () => {
       position_size_pct: 10,
       take_profit_pct: 15,
       stop_loss_pct: -5,
-      trend_weight_pct: 60,
-      volume_price_weight_pct: 80,
-      distance_from_low_weight_pct: 70,
-      volatility_weight_pct: 100,
+      trend_weight_pct: 130,
+      volume_price_weight_pct: 130,
+      distance_from_low_weight_pct: 130,
+      volatility_weight_pct: 130,
+      relative_strength_weight_pct: 130,
     });
     expect(typeof result.body.config.scoring_config_json).toBe('string');
   });
@@ -488,6 +523,7 @@ describe('Trending Polars API', () => {
         volumePriceWeightPct: 100,
         distanceFromLowWeightPct: 100,
         volatilityTrendWeightPct: 100,
+        relativeStrengthWeightPct: 100,
       },
       ranking_recomputed: true,
     });
@@ -499,6 +535,7 @@ describe('Trending Polars API', () => {
         volumePriceWeightPct: 100,
         distanceFromLowWeightPct: 100,
         volatilityTrendWeightPct: 100,
+        relativeStrengthWeightPct: 100,
       },
     });
     const overview = await http.get('/api/simulated-trading/overview').expect(200);
@@ -554,8 +591,8 @@ describe('Trending Polars API', () => {
   it('routes indices/stocks through multi-source qfq and block indices through Tonghuashun', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
       const url = String(input);
-      if (url.includes('web.ifzq.gtimg.cn')) {
-        return new Response('kline_dayqfq={"code":0,"data":{"sh000300":{"qfqday":[["2026-07-22","4000","4050","4060","3990","100"]]}}}', { status: 200 });
+      if (isTencentKlineRequest(url)) {
+        return tencentKlineResponse(url, [['2026-07-22', '4000', '4050', '4060', '3990', '100']]);
       }
       if (url.includes('d.10jqka.com.cn/v4/line/bk_885531/01/last.js')) {
         return new Response('callback({"name":"光伏概念","data":"20260722,100,110,90,105,1000,2000,,,,0"})', { status: 200 });
@@ -566,6 +603,10 @@ describe('Trending Polars API', () => {
       const index = await http.get('/api/index_prices?symbol=sh000300&limit=5').expect(200);
       expect(index.headers['x-market-data-source']).toBe('tencent');
       expect(index.body[0]).toMatchObject({ close: 4050, volume: 10_000 });
+
+      const stock = await http.get('/api/stock_prices?stock_code=600099&limit=5').expect(200);
+      expect(stock.headers['x-market-data-source']).toBe('tencent');
+      expect(stock.body[0]).toMatchObject({ close: 4050, volume: 10_000 });
 
       const block = await http.get('/api/block_prices?block_code=885531&period=01&limit=5').expect(200);
       expect(block.headers['x-market-data-source']).toBe('ths-block');

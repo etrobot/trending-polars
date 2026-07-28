@@ -8,7 +8,7 @@ import {
   shanghaiIndexHistoryStartThreshold,
 } from '../server/index-bootstrap.js';
 
-describe('shanghai index bootstrap', () => {
+describe('market dates and Shanghai index bootstrap', () => {
   it('picks the latest trading day on or before the ceiling date', () => {
     const calendar = ['20260720', '20260721', '20260722', '20260723', '20260724'];
     expect(latestTradingDayOnOrBefore(calendar, '20260725')).toBe('20260724');
@@ -16,18 +16,18 @@ describe('shanghai index bootstrap', () => {
     expect(latestTradingDayOnOrBefore(calendar, '20260719')).toBeNull();
   });
 
-  it('keeps an explicit future trading date when local calendar has not caught up yet', async () => {
-    const store = {
-      getIndexTradingDays: vi.fn().mockResolvedValue(['20260720', '20260721', '20260722']),
-      getHistoricalMarket: vi.fn(),
-      getLatestAnalysisDate: vi.fn(),
-    };
-    await expect(resolveLatestTradingDate(store as never, '20260723')).resolves.toBe('20260723');
+  it('preserves an explicit date beyond the generated calendar horizon', async () => {
+    await expect(resolveLatestTradingDate({} as never, '20990104')).resolves.toBe('20990104');
   });
 
-  it('resolves today as a trading day from the holiday-based calendar', async () => {
-    // resolveLatestTradingDate no longer reads from the store; it uses the holiday-based calendar.
-    await expect(resolveLatestTradingDate({} as never)).resolves.toMatch(/^\d{8}$/);
+  it('rolls a weekend back through the holiday-based calendar', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-26T04:00:00.000Z'));
+    try {
+      await expect(resolveLatestTradingDate({} as never)).resolves.toBe('20260724');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('requires both enough rows and a start date on or before the 3-year threshold', () => {

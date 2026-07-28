@@ -301,7 +301,11 @@ function defaultRunner(scriptPath: string, timeoutMs: number): ThsCommandRunner 
   return (args) => new Promise((resolve, reject) => {
     execFile('osascript', [scriptPath, ...args], { encoding: 'utf8', timeout: timeoutMs }, (error, stdout, stderr) => {
       if (error) {
-        const message = String(stderr || stdout || error.message).trim();
+        const processError = error as Error & { killed?: boolean; signal?: NodeJS.Signals | null; code?: string | number | null };
+        const timedOut = processError.killed || processError.signal === 'SIGTERM' || processError.code === 'ETIMEDOUT';
+        const message = timedOut
+          ? `同花顺 AppleScript 读取超时（${Math.round(timeoutMs / 1000)} 秒）：${args.join(' ')}。请确认同花顺模拟交易窗口位于当前桌面、未最小化且屏幕未锁定`
+          : String(stderr || stdout || error.message).trim();
         reject(new ThsSimulatedBrokerError(message || '同花顺 AppleScript 执行失败', { cause: error }));
         return;
       }
@@ -327,12 +331,14 @@ export class ThsSimulatedBroker implements SimulatedBroker {
   snapshot(context: BrokerCallContext = {}): Promise<SimulatedAccountSnapshot> {
     const operation = this.exclusive(async () => {
       const started = Date.now();
-      const fundsOutput = await this.loggedCommand(['snapshot', 'funds'], context);
-      const positionsOutput = await this.loggedCommand(['snapshot', 'positions'], context);
+      const accountArgs = ['snapshot', 'account'];
+      const hints = (context.hintStockCodes ?? []).filter((code) => /^\d{6}$/.test(code));
+      if (hints.length > 0) accountArgs.push(hints.join(','));
+      const accountOutput = await this.loggedCommand(accountArgs, context);
       const ordersOutput = await this.loggedCommand(['snapshot', 'orders'], context);
       const snapshot = this.parseAccountSnapshotParts(
-        parseThsFundsSnapshot(fundsOutput),
-        parseThsPositionsSnapshot(positionsOutput),
+        parseThsFundsSnapshot(accountOutput),
+        parseThsPositionsSnapshot(accountOutput),
         parseThsOrdersSnapshot(ordersOutput),
       );
       await this.audit.info('ths_broker', 'snapshot_parsed', {
@@ -342,6 +348,7 @@ export class ThsSimulatedBroker implements SimulatedBroker {
           stage: context.stage,
           source: context.source,
           mode: 'full',
+          hint_stock_codes: hints,
           available_cash: snapshot.availableCash,
           total_assets: snapshot.totalAssets,
           positions: snapshot.positions,
@@ -393,6 +400,11 @@ export class ThsSimulatedBroker implements SimulatedBroker {
     positions: PaperPosition[],
     orders: PaperOrder[],
   ): SimulatedAccountSnapshot {
+    if ((funds.marketValue ?? 0) > 0 && positions.length === 0) {
+      throw new ThsSimulatedBrokerError(
+        `同花顺显示持仓市值 ${round(funds.marketValue ?? 0, 2)}，但未读取到持仓明细；已拒绝用空持仓覆盖上次快照`,
+      );
+    }
     const marketValue = funds.marketValue ?? positions.reduce((sum, position) => sum + position.market_value, 0);
     if (funds.availableCash == null || funds.availableCash < 0) {
       throw new ThsSimulatedBrokerError('未能从同花顺读取可用资金');

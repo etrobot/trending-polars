@@ -33,6 +33,7 @@ function tradeAction(action: BacktestTrade['action']) {
 }
 
 const HISTORY_PAGE_SIZE = 15;
+const MAX_FACTOR_WEIGHT_PCT = 200;
 
 function historyItemTitle(item: BacktestListItem) {
   if (item.mode === 'random' && (item.strategy_count ?? 1) > 1) {
@@ -83,9 +84,22 @@ function isScoreStockConfigView(value: unknown): value is ScoreStockConfigView {
   return Array.isArray(candidate.distanceFromLow?.tiers) && Boolean(candidate.trend);
 }
 
-function resolveScoringConfig(applied: unknown, optimized: OptimizeResult | null): ScoreStockConfigView {
+function parseScoringConfig(value: unknown): ScoreStockConfigView | null {
+  if (typeof value !== 'string') return isScoreStockConfigView(value) ? value : null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return isScoreStockConfigView(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveScoringConfig(result: BacktestResult | null, applied: unknown): ScoreStockConfigView {
+  // 展示已完成回测实际使用的配置，不能拿“最近一次优化结果”冒充当前结果。
+  const persisted = parseScoringConfig(result?.config?.scoring_config_json);
+  if (persisted) return persisted;
+  if (result) return DEFAULT_SCORE_STOCK_CONFIG;
   if (isScoreStockConfigView(applied)) return applied;
-  if (optimized?.scoring.config) return optimized.scoring.config;
   return DEFAULT_SCORE_STOCK_CONFIG;
 }
 
@@ -103,18 +117,24 @@ function safeSignedFixed(value: number | undefined | null, digits: number): stri
   return `${value >= 0 ? '+' : ''}${value.toFixed(digits)}`;
 }
 
+function configNumberValue(config: Record<string, number | string | null>, key: string, fallback: number) {
+  const value = Number(config[key]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
 interface OptimizeResult {
   days: number;
-  topN: number;
   scoring: {
     config: ScoreStockConfigView;
-    topScoreGapPct: number;
-    topConcentrationPct: number;
+    scoreCorrelation: number;
+    topBottomSpreadPct: number;
     distanceBucketStats: Array<{
       label: string;
+      minPct: number;
+      maxPct: number | null;
       sampleCount: number;
-      avgDistancePct: number;
-      topConcentrationPct: number;
+      avgForwardReturnPct: number;
+      winRatePct: number;
       positionScore: number;
     }>;
     sweetSpotLabels: string[];
@@ -129,6 +149,7 @@ interface OptimizeResult {
     volumePriceWeightPct: number;
     distanceFromLowWeightPct: number;
     volatilityWeightPct: number;
+    relativeStrengthWeightPct?: number;
   };
   validation: {
     totalReturnPct: number;
@@ -174,6 +195,7 @@ export function BacktestPage() {
   const [volumePriceWeightPct, setVolumePriceWeightPct] = useState(100);
   const [distanceFromLowWeightPct, setDistanceFromLowWeightPct] = useState(100);
   const [volatilityWeightPct, setVolatilityWeightPct] = useState(100);
+  const [relativeStrengthWeightPct, setRelativeStrengthWeightPct] = useState(100);
   const [sortColumn, setSortColumn] = useState<'win_rate' | 'total_return_pct' | null>(null);
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
   const [historyPage, setHistoryPage] = useState(1);
@@ -323,8 +345,11 @@ export function BacktestPage() {
         volume_price_weight_pct: String(volumePriceWeightPct),
         distance_from_low_weight_pct: String(distanceFromLowWeightPct),
         volatility_weight_pct: String(volatilityWeightPct),
+        relative_strength_weight_pct: String(relativeStrengthWeightPct),
       });
-      const scoringConfigApplied = appliedScoringConfig ?? optimizeResult?.scoring.config ?? null;
+      // 优化结果只在用户点击“应用”后才进入回测；否则手动回测会被
+      // 页面上一次持久化的优化配置静默污染。
+      const scoringConfigApplied = appliedScoringConfig;
       if (scoringConfigApplied) {
         params.set('scoring_config', JSON.stringify(scoringConfigApplied));
       }
@@ -377,11 +402,34 @@ export function BacktestPage() {
     setVolumePriceWeightPct(params.volumePriceWeightPct);
     setDistanceFromLowWeightPct(params.distanceFromLowWeightPct);
     setVolatilityWeightPct(params.volatilityWeightPct);
+    setRelativeStrengthWeightPct(params.relativeStrengthWeightPct ?? 100);
+    setDays(optimizeResult.days);
     setAppliedScoringConfig(optimizeResult.scoring.config);
     setOptimizeOpen(false);
     setSettingsOpen(true);
     setAppliedMessage('已应用优化参数，可点击「回测当前方案」验证');
     setNotice('已应用优化参数，可运行「回测当前方案」验证');
+  };
+
+  const openSettingsWithDisplayedScheme = () => {
+    if (!result) return;
+    const config = result.config;
+    console.log('[backtest] open settings with displayed scheme', { run_id: result.run_id, config });
+    setDays(configNumberValue(config, 'days', days));
+    setStrategyCount(configNumberValue(config, 'strategy_count', strategyCount));
+    setPositionSizePct(configNumberValue(config, 'position_size_pct', positionSizePct));
+    setMaxPositions(configNumberValue(config, 'max_positions', maxPositions));
+    setMaxHoldDays(configNumberValue(config, 'max_hold_days', maxHoldDays));
+    setTakeProfitPct(configNumberValue(config, 'take_profit_pct', takeProfitPct));
+    setStopLossPct(Math.abs(configNumberValue(config, 'stop_loss_pct', stopLossPct)));
+    setTrendWeightPct(configNumberValue(config, 'trend_weight_pct', trendWeightPct));
+    setVolumePriceWeightPct(configNumberValue(config, 'volume_price_weight_pct', volumePriceWeightPct));
+    setDistanceFromLowWeightPct(configNumberValue(config, 'distance_from_low_weight_pct', distanceFromLowWeightPct));
+    setVolatilityWeightPct(configNumberValue(config, 'volatility_weight_pct', volatilityWeightPct));
+    setRelativeStrengthWeightPct(configNumberValue(config, 'relative_strength_weight_pct', relativeStrengthWeightPct));
+    setAppliedScoringConfig(parseScoringConfig(config.scoring_config_json));
+    setSettingsOpen(true);
+    setAppliedMessage('已加载当前展示方案，可修改参数后重新回测');
   };
 
   const loadRun = async (runId: string) => {
@@ -451,8 +499,8 @@ export function BacktestPage() {
   const resultDays = Number(result?.config.days ?? days);
   const configNumber = (key: string) => Number(result?.config?.[key] ?? 0);
   const displayScoringConfig = useMemo(
-    () => resolveScoringConfig(appliedScoringConfig, optimizeResult),
-    [appliedScoringConfig, optimizeResult],
+    () => resolveScoringConfig(result, appliedScoringConfig),
+    [result, appliedScoringConfig],
   );
 
   const [benchmark, setBenchmark] = useState<EquityPoint[] | null>(null);
@@ -521,12 +569,10 @@ export function BacktestPage() {
           <section className="panel flex min-w-0 flex-col p-3.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="font-display text-base text-ink">参数</h2>
-              {optimizeResult ? (
-                <Button variant="secondary" onClick={() => setOptimizeOpen(true)}>
-                  <SlidersHorizontal className="h-3.5 w-3.5" />
-                  最新优化方案
-                </Button>
-              ) : null}
+              <Button variant="secondary" onClick={openSettingsWithDisplayedScheme}>
+                <SlidersHorizontal className="h-3.5 w-3.5" />
+                用当前方案打开回测设置
+              </Button>
             </div>
             <div className="mt-3 grid grid-cols-3 gap-x-3 gap-y-0">
               <div>
@@ -556,6 +602,7 @@ export function BacktestPage() {
                     ['价量', `${configNumber('volume_price_weight_pct')}%`],
                     ['距低点', `${configNumber('distance_from_low_weight_pct')}%`],
                     ['波动', `${configNumber('volatility_weight_pct')}%`],
+                    ['相对强度', `${configNumber('relative_strength_weight_pct')}%`],
                   ].map(([label, value]) => <div key={label} className="flex items-center justify-between gap-1 font-mono text-[11px]"><span className="text-muted">{label}</span><span className="text-right text-ink">{value}</span></div>)}
                 </div>
                 <h3 className="mb-1.5 mt-3 font-mono text-[11px] text-ink font-semibold">趋势维度</h3>
@@ -573,8 +620,8 @@ export function BacktestPage() {
                 <h3 className="mb-1.5 font-mono text-[11px] text-ink font-semibold">评分参数</h3>
                 <div className="space-y-1">
                   {[
-                    [`Top${optimizeResult?.topN ?? ''}评分优势`, safeSignedFixed(optimizeResult?.scoring?.topScoreGapPct, 2)],
-                    [`Top${optimizeResult?.topN ?? ''}集中度`, optimizeResult?.scoring?.topConcentrationPct != null ? `${optimizeResult.scoring.topConcentrationPct.toFixed(1)}%` : '-'],
+                    ['评分相关性', safeSignedFixed(optimizeResult?.scoring?.scoreCorrelation, 3)],
+                    ['Top-Bottom 收益差', optimizeResult?.scoring?.topBottomSpreadPct != null ? `${safeSignedFixed(optimizeResult.scoring.topBottomSpreadPct, 2)}%` : '-'],
                     ['优选区间', optimizeResult?.scoring.sweetSpotLabels.length ? optimizeResult.scoring.sweetSpotLabels.join('、') : '-'],
                   ].map(([label, value]) => <div key={label} className="flex items-center justify-between gap-1 font-mono text-[11px]"><span className="text-muted">{label}</span><span className="text-right text-ink">{value}</span></div>)}
                 </div>
@@ -616,7 +663,7 @@ export function BacktestPage() {
                 </h3>
                 {optimizeResult ? (
                   <p className="mt-2 font-mono text-[11px] text-ink">
-                    已有优化结果：Top{optimizeResult.topN}评分优势 {safeSignedFixed(optimizeResult.scoring.topScoreGapPct, 2)}，
+                    已有优化结果：评分相关性 {safeSignedFixed(optimizeResult.scoring.scoreCorrelation, 3)}，
                     验证收益 {safeSignedFixed(optimizeResult.validation.totalReturnPct, 2)}%
                   </p>
                 ) : (
@@ -634,7 +681,7 @@ export function BacktestPage() {
                       <SlidersHorizontal className="h-3.5 w-3.5" />
                       最新优化方案
                     </Button>
-                    <Button variant="secondary" onClick={() => applyOptimizedParams()}>
+                    <Button variant="secondary" onClick={applyOptimizedParams}>
                       应用优化结果
                     </Button>
                   </>
@@ -653,10 +700,11 @@ export function BacktestPage() {
             <label className="block"><span className="font-mono text-[11px] text-muted">个股持仓天数（上限）</span><input type="number" min="1" max="60" value={maxHoldDays} onChange={(event) => setMaxHoldDays(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
             <label className="block"><span className="font-mono text-[11px] text-muted">止盈（%）（上限）</span><input type="number" min="1" max="60" value={takeProfitPct} onChange={(event) => setTakeProfitPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
             <label className="block"><span className="font-mono text-[11px] text-muted">止损（%）（上限）</span><input type="number" min="1" max="30" value={stopLossPct} onChange={(event) => setStopLossPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
-            <label className="block"><span className="font-mono text-[11px] text-muted">趋势因子权重（%）（上限）</span><input type="number" min="1" max="100" value={trendWeightPct} onChange={(event) => setTrendWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
-            <label className="block"><span className="font-mono text-[11px] text-muted">价量因子权重（%）（上限）</span><input type="number" min="1" max="100" value={volumePriceWeightPct} onChange={(event) => setVolumePriceWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
-            <label className="block"><span className="font-mono text-[11px] text-muted">距60日低点权重（%）（上限）</span><input type="number" min="1" max="100" value={distanceFromLowWeightPct} onChange={(event) => setDistanceFromLowWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
-            <label className="block"><span className="font-mono text-[11px] text-muted">波动因子权重（%）（上限）</span><input type="number" min="1" max="100" value={volatilityWeightPct} onChange={(event) => setVolatilityWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+            <label className="block"><span className="font-mono text-[11px] text-muted">趋势因子权重（%）（上限）</span><input type="number" min="1" max={MAX_FACTOR_WEIGHT_PCT} value={trendWeightPct} onChange={(event) => setTrendWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+            <label className="block"><span className="font-mono text-[11px] text-muted">价量因子权重（%）（上限）</span><input type="number" min="1" max={MAX_FACTOR_WEIGHT_PCT} value={volumePriceWeightPct} onChange={(event) => setVolumePriceWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+            <label className="block"><span className="font-mono text-[11px] text-muted">距60日低点权重（%）（上限）</span><input type="number" min="1" max={MAX_FACTOR_WEIGHT_PCT} value={distanceFromLowWeightPct} onChange={(event) => setDistanceFromLowWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+            <label className="block"><span className="font-mono text-[11px] text-muted">波动因子权重（%）（上限）</span><input type="number" min="1" max={MAX_FACTOR_WEIGHT_PCT} value={volatilityWeightPct} onChange={(event) => setVolatilityWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+            <label className="block"><span className="font-mono text-[11px] text-muted">相对强度权重（%）（上限）</span><input type="number" min="1" max={MAX_FACTOR_WEIGHT_PCT} value={relativeStrengthWeightPct} onChange={(event) => setRelativeStrengthWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
           </div>
           <div className="mt-3 bg-surface-elevated p-3 text-[11px] leading-4 text-muted">
             回测当前方案：直接使用上方参数原值跑 1 组结果。回测随机组合：在上限内随机取参，分别跑 {strategyCount} 组独立回测，可在历史记录中逐条查看。
@@ -677,8 +725,8 @@ export function BacktestPage() {
             <section className="border border-line bg-surface-elevated p-3">
               <h3 className="mb-2 font-display text-sm text-ink">阶段1 · scoreStock 评分参数</h3>
               <div className="mb-2 flex flex-wrap gap-4 font-mono text-[11px] text-muted">
-                <span>Top{optimizeResult.topN}评分优势 {safeSignedFixed(optimizeResult.scoring.topScoreGapPct, 2)}</span>
-                <span>Top{optimizeResult.topN}集中度 {safeFixed(optimizeResult.scoring.topConcentrationPct, 1)}%</span>
+                <span>评分相关性 {safeSignedFixed(optimizeResult.scoring.scoreCorrelation, 3)}</span>
+                <span>Top-Bottom 收益差 {safeSignedFixed(optimizeResult.scoring.topBottomSpreadPct, 2)}%</span>
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
                 <div>
@@ -729,6 +777,7 @@ export function BacktestPage() {
                       ['价量', `${optimizeResult.optimized.volumePriceWeightPct}%`],
                       ['距低点', `${optimizeResult.optimized.distanceFromLowWeightPct}%`],
                       ['波动', `${optimizeResult.optimized.volatilityWeightPct}%`],
+                      ['相对强度', `${optimizeResult.optimized.relativeStrengthWeightPct ?? 100}%`],
                     ].map(([label, value]) => <div key={label} className="flex justify-between gap-2"><span className="text-muted">{label}</span><span className="text-ink">{value}</span></div>)}
                   </div>
                 </div>
@@ -757,15 +806,15 @@ export function BacktestPage() {
 
             <div className="table-scroll">
               <table className="data-table min-w-[640px]">
-                <thead><tr><th>距60日低点区间（Top{optimizeResult.topN}样本分布）</th><th className="text-right">Top{optimizeResult.topN}样本</th><th className="text-right">分档得分</th><th className="text-right">平均距低点</th><th className="text-right">集中度</th></tr></thead>
+                <thead><tr><th>距60日低点区间（样本分布）</th><th className="text-right">样本数</th><th className="text-right">分档得分</th><th className="text-right">平均远期收益</th><th className="text-right">胜率</th></tr></thead>
                 <tbody>
                   {optimizeResult.scoring.distanceBucketStats.map((bucket) => (
                     <tr key={bucket.label} className={optimizeResult.scoring.sweetSpotLabels.includes(bucket.label) ? 'bg-surface-elevated' : undefined}>
                       <td className="font-mono text-[11px] text-ink">{bucket.label}{optimizeResult.scoring.sweetSpotLabels.includes(bucket.label) ? ' ★' : ''}</td>
                       <td className="text-right font-mono text-[11px] text-muted">{bucket.sampleCount}</td>
                       <td className="text-right font-mono text-[11px] text-ink">{bucket.positionScore}</td>
-                      <td className={`text-right font-mono text-[11px] ${pctColor(bucket.avgDistancePct)}`}>{safeSignedFixed(bucket.avgDistancePct, 2)}%</td>
-                      <td className="text-right font-mono text-[11px] text-ink">{safeFixed(bucket.topConcentrationPct, 1)}%</td>
+                      <td className={`text-right font-mono text-[11px] ${pctColor(bucket.avgForwardReturnPct)}`}>{safeSignedFixed(bucket.avgForwardReturnPct, 2)}%</td>
+                      <td className="text-right font-mono text-[11px] text-ink">{safeFixed(bucket.winRatePct, 1)}%</td>
                     </tr>
                   ))}
                 </tbody>

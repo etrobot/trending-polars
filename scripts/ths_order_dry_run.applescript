@@ -187,9 +187,14 @@ on takeSnapshot(snapshotKind, hintCodes)
             my ensureWindowAvailable(it)
             set simulationWindow to my findSimulationWindow(it)
             if simulationWindow is missing value then error "未找到包含“模拟练习”的窗口，已停止"
-            my refreshSimulationConnection(simulationWindow)
-            my navigateTo(simulationWindow, snapshotKind)
-            my waitForSimulationPage(simulationWindow, snapshotKind)
+            -- 快照只读取当前模拟账户界面，不点击连接刷新按钮。
+            -- 非交易时段或连接异常时该按钮可能让同花顺的 AXPress 长时间不返回，
+            -- 下单/撤单/报价路径仍会在操作前主动刷新连接。
+            -- 资金汇总在所有模拟交易子页常驻，直接读取可避免无意义的页面就绪轮询。
+            if snapshotKind is not "funds" then
+                my navigateTo(simulationWindow, snapshotKind)
+                my waitForSimulationPage(simulationWindow, snapshotKind)
+            end if
             if not my elementContainsText(simulationWindow, "模拟练习") then error "查询前无法确认模拟交易状态，已停止"
             set snapshotResult to my snapshotWindow(simulationWindow, snapshotKind)
             my restoreForegroundApp(previousApp)
@@ -402,10 +407,12 @@ on simulationPageReady(simulationWindow, destination)
     if destination is "funds" then
         return my shallowTextContains(simulationWindow, {"可用资金", "可用金额", "总资产", "资金余额"})
     else if destination is "positions" then
-        if my shallowTextContains(simulationWindow, {"可用股份", "可用金额", "总资产", "证券代码", "股票余额", "资金余额"}) then return true
+        -- 资金汇总在买入/卖出/委托/持仓页都会常驻，不能据此判断已进入持仓页。
+        if my shallowTextContains(simulationWindow, {"可用股份", "证券代码", "股票余额"}) then return true
         return my hasSmallPositionTable(simulationWindow)
     else if destination is "orders" then
-        return my shallowTextContains(simulationWindow, {"委托状态", "当日委托"})
+        if my shallowTextContains(simulationWindow, {"委托状态", "当日委托"}) then return true
+        return my hasOrderTable(simulationWindow)
     else if destination is "buy" then
         return my shallowTextContains(simulationWindow, {"确定买入", "买入"})
     else if destination is "sell" then
@@ -445,7 +452,9 @@ on hasSmallPositionTable(simulationWindow)
                 repeat with scrollItem in scroll areas
                     repeat with tableItem in tables of scrollItem
                         set rowCount to count of rows of tableItem
-                        if rowCount > 0 and rowCount <= 100 and (count of columns of tableItem) <= 20 then return true
+                        set colCount to count of columns of tableItem
+                        -- 当前持仓表为 15 列；允许空仓的 0 行表，但排除 2 列资金表和 13 列委托表。
+                        if rowCount <= 100 and colCount >= 15 and colCount <= 20 then return true
                     end repeat
                 end repeat
             end try
@@ -453,6 +462,25 @@ on hasSmallPositionTable(simulationWindow)
     end tell
     return false
 end hasSmallPositionTable
+
+on hasOrderTable(simulationWindow)
+    tell application "System Events"
+        tell simulationWindow
+            try
+                repeat with scrollItem in scroll areas
+                    repeat with tableItem in tables of scrollItem
+                        set rowCount to count of rows of tableItem
+                        set colCount to count of columns of tableItem
+                        -- 当前同花顺委托表为 13 列；空委托时仍保留 0 行表格。
+                        -- 持仓表为 15 列，因此不会把持仓页误判为委托页。
+                        if rowCount <= 100 and colCount >= 3 and colCount <= 14 then return true
+                    end repeat
+                end repeat
+            end try
+        end tell
+    end tell
+    return false
+end hasOrderTable
 
 on refreshSimulationConnection(simulationWindow)
     -- 点击模拟练习标签页右侧的刷新图标，确保会话处于已连接状态。
@@ -700,7 +728,7 @@ end allTextFields
 on snapshotWindow(simulationWindow, snapshotKind)
     set hintCodes to my snapshotHintCodes
     set outputLines to {"THS_SIMULATOR_V1", "MODE|" & snapshotKind, "SIMULATION|confirmed"}
-    set skipTextScan to snapshotKind is in {"account", "positions"}
+    set skipTextScan to snapshotKind is in {"account", "positions", "funds"}
     set tableRows to my collectSnapshotTableRows(simulationWindow, snapshotKind, hintCodes)
     repeat with i from 1 to count of tableRows
         set end of outputLines to item i of tableRows as text
@@ -708,6 +736,9 @@ on snapshotWindow(simulationWindow, snapshotKind)
     if skipTextScan and my snapshotScanComplete(hintCodes, tableRows) then return my joinList(outputLines, linefeed)
     if skipTextScan and (count of hintCodes) is 0 and my snapshotHasFundRows(tableRows) then return my joinList(outputLines, linefeed)
     if skipTextScan and (count of tableRows) > 0 and snapshotKind is "account" and my snapshotHasFundRows(tableRows) and my snapshotHasPositionRows(tableRows) then return my joinList(outputLines, linefeed)
+    -- 委托快照完全来自表格；空表也代表当前没有可见委托。
+    -- 避免继续读取某些 AXTextField.value 时被同花顺辅助功能接口永久阻塞。
+    if snapshotKind is "orders" then return my joinList(outputLines, linefeed)
     tell application "System Events"
         try
             repeat with uiItem in (static texts of simulationWindow) & (text fields of simulationWindow) & (buttons of simulationWindow)
@@ -737,10 +768,19 @@ on collectSnapshotTableRows(simulationWindow, snapshotKind, hintCodes)
                     try
                         set colCount to count of columns of tableItem
                     end try
-                    if rowCount is 0 or rowCount > maxRowsToScan or colCount > 20 then
-                        cycle
+                    set tableShapeMatches to false
+                    if snapshotKind is "funds" then
+                        -- 当前同花顺资金汇总固定为两列：指标名、金额。
+                        set tableShapeMatches to colCount is 2
+                    else if snapshotKind is in {"account", "positions"} then
+                        -- 账户页由两列资金表和 10–20 列持仓表组成；跳过一列导航表与行情大表。
+                        set tableShapeMatches to colCount is 2 or (colCount >= 10 and colCount <= 20)
+                    else if snapshotKind is "orders" then
+                        set tableShapeMatches to colCount >= 3 and colCount <= 20
                     end if
-                    if (count of rows of tableItem) <= 100 and (count of columns of tableItem) <= 20 then
+                    -- AppleScript 没有 continue/cycle 语句；直接用条件包住可扫描表格。
+                    -- 这里沿用 100 行上限，避免行情大表拖住辅助功能读取。
+                    if tableShapeMatches and rowCount > 0 and rowCount <= 100 and rowCount <= maxRowsToScan then
                         set scanAllRows to false
                         if not primaryHandled then
                             if (count of hintCodes) > 0 then
@@ -753,9 +793,9 @@ on collectSnapshotTableRows(simulationWindow, snapshotKind, hintCodes)
                                 set primaryHandled to true
                             end if
                         end if
-                        if scanAllRows or (count of hintCodes) > 0 then
-                            my appendTableSnapshotRows(tableItem, hintCodes, capturedRows, scanAllRows)
-                        end if
+                        -- 每个小表都要检查：同花顺会把资金汇总与持仓拆成相邻的两个表格。
+                        -- 只扫描第一个命中的表会漏掉全部持仓。
+                        my appendTableSnapshotRows(tableItem, hintCodes, capturedRows, scanAllRows)
                         if (count of hintCodes) > 0 and my snapshotScanComplete(hintCodes, capturedRows) then
                             set plainRows to {}
                             repeat with i from 1 to count of capturedRows

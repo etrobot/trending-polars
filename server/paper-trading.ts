@@ -36,6 +36,7 @@ import {
 } from './ths-simulated-broker.js';
 import {
   assessMarketTiming,
+  ACCOUNT_SYNC_SESSION_END_MINUTE,
   buildTradingSession,
   compactDate,
   defaultAutomation,
@@ -50,6 +51,7 @@ import {
   isTradingDay,
   isWeakMarket,
   MARKET_CLOSE_MINUTE,
+  nextTradingDateAfter,
   type MarketTimingAssessment,
   MemoryPaperTradingStateStore,
   NEAR_CLOSE_WINDOW_START_MINUTE,
@@ -272,6 +274,7 @@ export class PaperTradingService extends EventEmitter {
       ? { status: 'cached', source: 'runtime-state', observed_at: observation.observed_at }
       : { status: 'unavailable', source: 'runtime-state' };
     const clock = shanghaiClock(this.now());
+    this.expirePendingPlans(state, clock, calendar);
     const accountOnly = isAccountSyncOnlyPeriod(clock, calendar);
     if (observation && !accountOnly) {
       this.initializeCapital(state, snapshot);
@@ -334,6 +337,7 @@ export class PaperTradingService extends EventEmitter {
       this.validateWindowTime(window, clock, options.trigger ?? 'scheduled');
 
       const market = context ?? await this.requireMarketContext(window, traceId);
+      this.expirePendingPlans(state, clock, market.calendar ?? []);
       let snapshot = await this.readAndObserveAccount(state, traceId, `window:${window}:initial`);
       this.initializeCapital(state, snapshot);
       this.reconcileState(state, snapshot, clock.date);
@@ -354,7 +358,6 @@ export class PaperTradingService extends EventEmitter {
         ));
         this.reconcileState(state, snapshot, clock.date);
       } else {
-        this.expireMissedEntries(state, clock.date);
         this.reconcileState(state, snapshot, clock.date);
         this.recordEvent(state, 'post_close', 'reconciled', `盘后已核对 ${snapshot.positions.length} 只持仓和 ${snapshot.orders.length} 笔当日委托`);
       }
@@ -438,6 +441,7 @@ export class PaperTradingService extends EventEmitter {
         : await this.readAndObserveAccount(state, traceId, source);
       this.initializeCapital(state, snapshot);
       this.reconcileState(state, snapshot, clock.date);
+      this.expirePendingPlans(state, clock, this.cachedTradingCalendar);
       await this.persist(state);
       await this.audit.info('account_monitor', 'monitor_completed', {
         traceId,
@@ -484,6 +488,7 @@ export class PaperTradingService extends EventEmitter {
       : await this.readAndObserveAccount(state, traceId, 'overview');
     this.initializeCapital(state, snapshot);
     this.reconcileState(state, snapshot, clock.date);
+    this.expirePendingPlans(state, clock, context.calendar ?? []);
     if (!accountOnly) {
       await this.ensurePreviousClosePlan(state, snapshot, context, clock.date, traceId);
       await this.ensureSameDayCloseSignals(state, snapshot, context, clock, traceId);
@@ -631,7 +636,7 @@ export class PaperTradingService extends EventEmitter {
       throw new Error(`排行日期 ${context.rankingDate} 不是当前交易日 ${displayDate(tradingDate)}，拒绝生成收盘信号`);
     }
 
-    this.expireMissedEntries(state, tradingDate);
+    this.expirePendingPlans(state, shanghaiClock(this.now()), context.calendar ?? []);
     await this.audit.info('strategy', 'close_evaluation_started', {
       traceId,
       data: {
@@ -755,6 +760,8 @@ export class PaperTradingService extends EventEmitter {
   ): Promise<PaperStrategyInstruction[]> {
     const signalDate = compactDate(context.rankingDate);
     if (!/^\d{8}$/.test(signalDate) || signalDate >= tradingDate) return [];
+    const executionCalendar = this.effectiveTradingCalendar(context.calendar ?? []);
+    if (nextTradingDateAfter(signalDate, executionCalendar) !== tradingDate) return [];
     if (state.last_signal_date && state.last_signal_date > signalDate) return [];
     let migratedInstructions = 0;
     for (const instruction of state.instructions) {
@@ -938,9 +945,10 @@ export class PaperTradingService extends EventEmitter {
     if (unresolved.length > 0) {
       throw new Error(`存在 ${unresolved.length} 笔提交结果不确定的委托，请先根据同花顺委托和持仓人工核对，已停止本次交易窗口执行`);
     }
+    const executionCalendar = this.effectiveTradingCalendar(context.calendar ?? []);
     const eligible = (instruction: PaperStrategyInstruction) => (
       instruction.status === 'pending'
-      && instruction.signal_date < tradingDate
+      && nextTradingDateAfter(instruction.signal_date, executionCalendar) === tradingDate
       && (immediate || (instruction.execution_window ?? 'open') === executionWindow)
     );
     const sells = state.instructions.filter((instruction) => instruction.side === 'sell' && eligible(instruction));
@@ -1050,7 +1058,6 @@ export class PaperTradingService extends EventEmitter {
     }
 
     if (results.length > 0) snapshot = await this.readAndObserveAccount(state, traceId, `${executionWindow}:after_orders`);
-    this.expireMissedEntries(state, tradingDate, immediate ? undefined : executionWindow);
     await this.audit.info('strategy', 'window_execution_completed', {
       traceId,
       data: { trading_date: tradingDate, execution_window: executionWindow, immediate, results, final_account: snapshot },
@@ -1113,19 +1120,36 @@ export class PaperTradingService extends EventEmitter {
     state.tracked_positions = tracked;
   }
 
-  private expireMissedEntries(
+  private effectiveTradingCalendar(calendar: readonly string[] = []): string[] {
+    return [...new Set([...this.cachedTradingCalendar, ...calendar]
+      .map(compactDate)
+      .filter((item) => /^\d{8}$/.test(item)))]
+      .sort();
+  }
+
+  private expirePendingPlans(
     state: PaperTradingRuntimeState,
-    tradingDate: string,
-    executionWindow?: PlanExecutionWindow,
-  ) {
+    clock: ReturnType<typeof shanghaiClock>,
+    calendar: readonly string[] = [],
+  ): number {
+    const executionCalendar = this.effectiveTradingCalendar(calendar);
+    let expired = 0;
     for (const instruction of state.instructions) {
-      if (instruction.side !== 'buy' || instruction.status !== 'pending') continue;
-      if (instruction.signal_date >= tradingDate) continue;
-      if (executionWindow && (instruction.execution_window ?? 'open') !== executionWindow) continue;
-      instruction.status = 'skipped';
-      instruction.completed_at = shanghaiClock(this.now()).timestamp;
-      instruction.reason = `${instruction.reason}；已错过${executionWindowLabel(instruction.execution_window ?? 'open')}窗口`;
+      if (instruction.status !== 'pending') continue;
+      const executionDate = nextTradingDateAfter(instruction.signal_date, executionCalendar);
+      if (!executionDate) continue;
+      const missedExecutionDay = executionDate < clock.date
+        || (executionDate === clock.date && clock.minute >= MARKET_CLOSE_MINUTE);
+      if (!missedExecutionDay) continue;
+      instruction.status = 'expired';
+      instruction.completed_at = clock.timestamp;
+      instruction.reason = `${instruction.reason}；${displayDate(executionDate)} ${executionWindowLabel(instruction.execution_window ?? 'open')}计划当日未执行，已过期`;
+      expired += 1;
     }
+    if (expired > 0) {
+      this.recordEvent(state, 'system', 'plans_expired', `${expired} 个当日未执行计划已置为过期`);
+    }
+    return expired;
   }
 
   private initializeCapital(state: PaperTradingRuntimeState, snapshot: SimulatedAccountSnapshot) {
@@ -1354,9 +1378,9 @@ export class PaperTradingService extends EventEmitter {
         due = 'open';
       } else if (clock.minute >= NEAR_CLOSE_WINDOW_START_MINUTE && clock.minute < MARKET_CLOSE_MINUTE && !this.isWindowCompleted(state, clock.date, 'near_close')) {
         due = 'near_close';
-      } else if (clock.minute >= 15 * 60 + 5 && !this.isWindowCompleted(state, clock.date, 'close')) {
+      } else if (clock.minute >= 15 * 60 + 5 && clock.minute <= ACCOUNT_SYNC_SESSION_END_MINUTE && !this.isWindowCompleted(state, clock.date, 'close')) {
         due = 'close';
-      } else if (clock.minute >= 15 * 60 + 10 && !this.isWindowCompleted(state, clock.date, 'post_close')) {
+      } else if (clock.minute >= 15 * 60 + 10 && clock.minute <= ACCOUNT_SYNC_SESSION_END_MINUTE && !this.isWindowCompleted(state, clock.date, 'post_close')) {
         due = 'post_close';
       }
       if (due) {
@@ -1437,7 +1461,7 @@ export class PaperTradingService extends EventEmitter {
     state.engine_version = PAPER_ENGINE_VERSION;
     state.automation.next_window = this.nextWindowLabel(state, clock);
     state.events = state.events.slice(-200);
-    // 策略计划是交易审计账本，已成交、跳过、失败和已撤记录都永久保留。
+    // 策略计划是交易审计账本，已成交、跳过、失败、已撤和过期记录都永久保留。
     state.instructions = [...state.instructions].sort((left, right) => left.created_at.localeCompare(right.created_at));
     const completedDates = Object.keys(state.completed_windows).sort().slice(-30);
     state.completed_windows = Object.fromEntries(completedDates.map((date) => [date, state.completed_windows[date]]));

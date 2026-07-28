@@ -568,7 +568,8 @@ for each date in 交易日:
    └─ backtestObjective() = 收益 − 0.45×回撤 + (胜率≥50 ? 1 : 0)
                                 − max(0, (35−胜率)×0.08)
                                 − 交易<6 罚 12 / 交易<8 罚 4
-4. 选 objective 最高的 config → 关联该次回测得到的 actualValidation
+4. 优先保留交易数 ≥ 6 的可靠样本，再按 `totalReturnPct` 选最高收益；收益率相同时才用 objective 作为风险 tie-breaker
+   → 关联该次回测得到的 actualValidation
 ```
 
 **阶段 2：回测交易参数网格**
@@ -579,7 +580,7 @@ for each date in 交易日:
 2a 核心交易参数：6 持仓天数 × 5 止盈 × 5 止损 = 150 组
 2b 仓位（在 2a 最优基础上）：4 持仓个数 × 4 单票仓位 = 16 组
 2c 五个因子权重坐标下降：2 轮 × 5 维 × 3 取值 = 30 组
-合计约 196 组回测 → 选 objective 最高
+合计约 187 组回测（含种子方案；跳过与当前值相同的权重）→ 先排除交易样本不足的方案，再选收益率最高；收益相同时才选 objective 更优
 ```
 
 > **2c 的三处修正**：
@@ -590,7 +591,7 @@ for each date in 交易日:
 >
 > 全网格是 3⁵ = 243 组；坐标下降只要 30 组，覆盖的维度反而更多。
 
-若阶段 2 仍未超过阶段 0 的默认基线（默认 scoreStock + 默认策略参数跑出的 `baseline.validation`），将 `optimized/validation` 回退为默认，并在 `methodology` 中说明「未超越默认方案」。
+若阶段 2 的 `totalReturnPct` 仍未严格超过阶段 0 的默认基线（默认 scoreStock + 默认策略参数跑出的 `baseline.validation`），将 `optimized/validation/scoring.config` 一并回退为默认，并在 `methodology` 中说明「未超越默认方案」。风险调整 objective 不再允许覆盖这个收益率门槛。
 
 **复用工具** —— `server/backtest-engine.ts`：
 

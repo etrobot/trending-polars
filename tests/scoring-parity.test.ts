@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { computeBacktestScores } from '../server/backtest-scoring.js';
+import { benchmarkReturns, computeBacktestScores } from '../server/backtest-scoring.js';
 import {
   computeADX,
   classifyMarketState,
   compareByScore,
+  DEFAULT_SCORE_STOCK_CONFIG,
   prepareSeries,
   scoreStock,
   singlePeriodTrend,
@@ -38,22 +39,26 @@ function barsFromReturns(startPrice: number, returns: number[], volumes?: number
 }
 
 describe('实盘 scoreStock 与向量化 computeBacktestScores 口径一致', () => {
-  // 这两条路径各自实现了同一套四维评分，历史上已经漂移过两次：
+  // 这两条路径各自实现了同一套五维评分，历史上已经漂移过：
   //   1. 向量化路径漏了 trendBonus 的死区判断（trendStrengthThreshold 形同虚设）；
   //   2. 实盘路径在拿不到板块状态时用个股 alignment 冒充板块趋势，白拿 ±4 板块分。
+  //   3. 相对强度维度必须读取同一条基准收益曲线，不能一边给真实分、一边给中性分。
   // 任何一处改动只落到单边，这个测试就会红。
-  it('produces identical four-dimension scores for every stock on every date', () => {
+  it('produces identical five-dimension scores for every stock on every date', () => {
     const history = historicalFixture();
     const dates = history.calendar.slice(-5);
     const limitUpDates = new Map<string, Set<string>>();
     const matrix = computeBacktestScores(history, dates, limitUpDates);
+    const benchmarkByDate = benchmarkReturns(history, DEFAULT_SCORE_STOCK_CONFIG.relativeStrength.lookback);
 
     for (const date of dates) {
       const vectorized = new Map((matrix.get(date) ?? []).map((row) => [row.stock_code, row]));
       expect(vectorized.size).toBeGreaterThan(0);
       for (const stock of history.stocks) {
         // 无板块归属：向量化路径 sector_state_id=0，实盘路径必须同样给 sectorBonus=0。
-        const live = scoreStock(prepareSeries(stock), date);
+        const live = scoreStock(prepareSeries(stock), date, {
+          benchmarkReturnPct: benchmarkByDate.get(date),
+        });
         const vector = vectorized.get(stock.stock_code);
         if (!live || !vector) {
           expect(live == null && vector == null).toBe(true);
@@ -64,6 +69,9 @@ describe('实盘 scoreStock 与向量化 computeBacktestScores 口径一致', ()
         expect(`${label} vp=${vector.volume_price_score}`).toBe(`${label} vp=${live.volume_price_score}`);
         expect(`${label} pos=${vector.position_score}`).toBe(`${label} pos=${live.position_score}`);
         expect(`${label} vol=${vector.volatility_trend_score}`).toBe(`${label} vol=${live.volatility_trend_score}`);
+        expect(`${label} rs=${vector.relative_strength_score}`).toBe(`${label} rs=${live.relative_strength_score}`);
+        expect(`${label} rsLabel=${vector.relative_strength_label}`).toBe(`${label} rsLabel=${live.relative_strength_label}`);
+        expect(`${label} rsPct=${vector.relative_strength_pct}`).toBe(`${label} rsPct=${live.relative_strength_pct}`);
         expect(`${label} total=${vector.total_score}`).toBe(`${label} total=${live.total_score}`);
       }
     }
@@ -83,7 +91,9 @@ describe('实盘 scoreStock 与向量化 computeBacktestScores 口径一致', ()
     expect(flat.length).toBeGreaterThan(20);
     const scoped = { ...history, stocks: [flatStock] };
     const date = history.calendar.at(-1)!;
-    const live = scoreStock(prepareSeries(flatStock), date)!;
+    const live = scoreStock(prepareSeries(flatStock), date, {
+      benchmarkReturnPct: benchmarkReturns(scoped, DEFAULT_SCORE_STOCK_CONFIG.relativeStrength.lookback).get(date),
+    })!;
     const vector = (computeBacktestScores(scoped, [date], new Map()).get(date) ?? [])[0];
     expect(live.trend_strength).toBe(0);
     expect(vector.trend_score).toBe(live.trend_score);

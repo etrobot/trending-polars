@@ -12,9 +12,10 @@ import {
 import { Modal } from '../components/Modal';
 import { PageHeaderActions } from '../components/HeaderActions';
 import { Button, EmptyState, LoadingPanel, Pagination, SectionHeading } from '../components/Ui';
+import { useTaskResult, useTasks } from '../context/TasksContext';
 import { api, formatMoney, pctColor } from '../lib/api';
 import { clientImmediateAutoRejection } from '../lib/trading-session';
-import type { AutomationState, BacktestListItem, PaperOverview, PaperPlanHistoryItem, TradingSession, TradingWindow } from '../types';
+import type { AutomationState, BacktestListItem, PaperOverview, PaperPlanHistoryItem, TaskSnapshot, TradingSession, TradingWindow } from '../types';
 
 const HISTORY_PAGE_SIZE = 15;
 const BACKTEST_HISTORY_PAGE_SIZE = 15;
@@ -38,11 +39,15 @@ function PlanHistoryTable({
   page,
   pageSize,
   onPage,
+  emptyTitle = '尚无已执行计划',
+  emptyDescription = '收盘决策生成的计划执行后会显示在这里。历史记录会持久保存在 Node.js 交易状态中。',
 }: {
   history: PaperPlanHistoryItem[];
   page: number;
   pageSize: number;
   onPage: (page: number) => void;
+  emptyTitle?: string;
+  emptyDescription?: string;
 }) {
   const totalPages = Math.max(1, Math.ceil(history.length / pageSize));
   const safePage = Math.min(page, totalPages);
@@ -54,7 +59,7 @@ function PlanHistoryTable({
       <div className="overflow-auto">
         <table className="data-table min-w-[1180px]">
           <thead><tr><th>信号日</th><th>方向</th><th>状态</th><th>代码</th><th>名称</th><th className="text-right">排名</th><th className="text-right">数量</th><th className="text-right">参考/成交价</th><th>创建时间</th><th>提交/完成时间</th><th>原因与回查状态</th></tr></thead>
-          <tbody>{pageItems.length === 0 ? <tr><td colSpan={11}><EmptyState title="尚无已执行计划" description="收盘决策生成的计划执行后会显示在这里。历史记录会持久保存在 Node.js 交易状态中。" /></td></tr> : pageItems.map((item) => (
+          <tbody>{pageItems.length === 0 ? <tr><td colSpan={11}><EmptyState title={emptyTitle} description={emptyDescription} /></td></tr> : pageItems.map((item) => (
             <tr key={item.id}>
               <td className="font-mono text-xs text-muted">{item.signal_date}</td>
               <td className={item.side === 'buy' ? 'font-semibold text-trading-up' : 'font-semibold text-trading-down'}>{item.side === 'buy' ? '买入' : '卖出'}</td>
@@ -77,6 +82,7 @@ function PlanHistoryTable({
 }
 
 export function SimulatedTradingPage() {
+  const { setPanelOpen } = useTasks();
   const [overview, setOverview] = useState<PaperOverview | null>(null);
   const [automation, setAutomation] = useState<AutomationState | null>(null);
   const [tradingSession, setTradingSession] = useState<TradingSession | null>(null);
@@ -86,7 +92,7 @@ export function SimulatedTradingPage() {
   const [executeOpen, setExecuteOpen] = useState(false);
   const [selectedWindow, setSelectedWindow] = useState<TradingWindow | 'auto'>('auto');
   const [connected, setConnected] = useState(false);
-  const [planTab, setPlanTab] = useState<'pending' | 'executed'>('pending');
+  const [planTab, setPlanTab] = useState<'pending' | 'executed' | 'expired'>('pending');
   const [historyPage, setHistoryPage] = useState(1);
   const [backtestHistoryOpen, setBacktestHistoryOpen] = useState(false);
   const [backtestHistory, setBacktestHistory] = useState<BacktestListItem[]>([]);
@@ -95,6 +101,7 @@ export function SimulatedTradingPage() {
   const [backtestSortColumn, setBacktestSortColumn] = useState<'win_rate' | 'total_return_pct' | null>(null);
   const [backtestSortDirection, setBacktestSortDirection] = useState<'asc' | 'desc'>('desc');
   const [applyingBacktestRunId, setApplyingBacktestRunId] = useState('');
+  const [windowTaskId, setWindowTaskId] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const refreshInFlight = useRef<Promise<void> | null>(null);
 
@@ -109,6 +116,19 @@ export function SimulatedTradingPage() {
       setError(bootstrapError instanceof Error ? bootstrapError.message : String(bootstrapError));
     }
   }, []);
+
+  const onWindowTaskDone = useCallback((task: TaskSnapshot) => {
+    setWindowTaskId(null);
+    if (task.status !== 'completed') {
+      setNotice('');
+      setError(task.message || '收盘决策未完成');
+      return;
+    }
+    setError('');
+    setNotice(task.message || '收盘决策已完成');
+    void loadBootstrap();
+  }, [loadBootstrap]);
+  useTaskResult(windowTaskId, onWindowTaskDone);
 
   const refreshAccount = useCallback((): Promise<void> => {
     if (refreshInFlight.current) return refreshInFlight.current;
@@ -297,11 +317,17 @@ export function SimulatedTradingPage() {
   const execute = async () => {
     setBusy(true);
     try {
-      await api('/api/simulated-trading/automation/run-window', {
+      const result = await api<{ task_id?: string; message?: string }>('/api/simulated-trading/automation/run-window', {
         method: 'POST',
         body: JSON.stringify({ window: selectedWindow }),
       });
       setExecuteOpen(false);
+      if (result.task_id) {
+        setWindowTaskId(result.task_id);
+        setNotice(result.message ?? '收盘决策已转入后台执行');
+        setPanelOpen(true);
+        return;
+      }
       await loadBootstrap();
     } catch (executeError) {
       setError(executeError instanceof Error ? executeError.message : String(executeError));
@@ -335,13 +361,16 @@ export function SimulatedTradingPage() {
   const hasAccountSnapshot = Boolean(overview && overview.connection.status !== 'unavailable' && (overview.account.positions.length > 0 || overview.connection.status === 'live'));
   const connectionLabel = connecting ? (hasAccountSnapshot ? `上次同步(${overview?.connection.observed_at?.slice(5, 16).replace('-', '/') ?? ''})` : '连接中') : overview?.connection.status === 'live' ? `已同步(${overview.connection.observed_at?.slice(5, 16).replace('-', '/') ?? ''})` : overview?.connection.status === 'cached' ? (hasAccountSnapshot ? '上次快照' : '未同步') : '未连接';
   const connectionDot = connecting ? 'bg-primary animate-pulse' : overview?.connection.status === 'live' && connected ? 'bg-green' : 'bg-muted';
-  const tradingDisabled = busy || connecting || !overview || overview.connection.status === 'unavailable';
+  const tradingDisabled = busy || Boolean(windowTaskId) || connecting || !overview || overview.connection.status === 'unavailable';
 
   const executedHistory = plan?.history.filter((item) => {
     return ['filled', '已成交', 'skipped', '已跳过', 'failed', '失败', 'cancelled', '已撤'].some(
       (marker) => item.status.includes(marker),
     );
   }) ?? [];
+  const expiredHistory = plan?.history.filter((item) => (
+    item.status === 'expired' || item.status.includes('过期')
+  )) ?? [];
 
   const tabStyle = (active: boolean) =>
     `px-3 py-1.5 font-mono text-[11px] transition cursor-pointer ${
@@ -380,6 +409,9 @@ export function SimulatedTradingPage() {
               <button className={tabStyle(planTab === 'executed')} onClick={() => { setPlanTab('executed'); setHistoryPage(1); }}>
                 已执行{executedHistory.length > 0 && <span className="ml-1.5 font-mono text-[10px] text-muted">({executedHistory.length})</span>}
               </button>
+              <button className={tabStyle(planTab === 'expired')} onClick={() => { setPlanTab('expired'); setHistoryPage(1); }}>
+                过期{expiredHistory.length > 0 && <span className="ml-1.5 font-mono text-[10px] text-muted">({expiredHistory.length})</span>}
+              </button>
             </div>
             {planTab === 'pending' ? (
               <div className="overflow-auto">
@@ -389,8 +421,17 @@ export function SimulatedTradingPage() {
                 </table>
                 {plan.skipped.length > 0 && <div className="border-t border-primary/30 bg-primary/5 px-3 py-2 text-[11px] leading-4 text-primary-active">{plan.skipped.join(' ')}</div>}
               </div>
-            ) : (
+            ) : planTab === 'executed' ? (
               <PlanHistoryTable history={executedHistory} page={historyPage} pageSize={HISTORY_PAGE_SIZE} onPage={setHistoryPage} />
+            ) : (
+              <PlanHistoryTable
+                history={expiredHistory}
+                page={historyPage}
+                pageSize={HISTORY_PAGE_SIZE}
+                onPage={setHistoryPage}
+                emptyTitle="暂无过期计划"
+                emptyDescription="计划仅在信号日后的首个交易日有效；当日收盘仍未执行时会自动归入这里。"
+              />
             )}
           </section>
 

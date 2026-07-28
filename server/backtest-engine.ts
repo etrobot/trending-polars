@@ -764,9 +764,9 @@ export function runRandomizedBacktest(
     stopLossPct: Math.min(30, Math.max(1, Math.trunc(options.stopLossPctUpper || Math.abs(DEFAULT_T1_STRATEGY.stopLossPct)))),
     takeProfitPct: Math.min(60, Math.max(1, Math.trunc(options.takeProfitPctUpper || DEFAULT_T1_STRATEGY.takeProfitPct))),
     positionSizePct: Math.min(100, Math.max(1, Math.trunc(options.positionSizePctUpper || DEFAULT_T1_STRATEGY.positionSizePct))),
-    trendWeightPct: Math.min(100, Math.max(1, Math.trunc(options.trendWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.trendWeightPct))),
-    volumePriceWeightPct: Math.min(100, Math.max(1, Math.trunc(options.volumePriceWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct))),
-    distanceFromLowWeightPct: Math.min(100, Math.max(1, Math.trunc(options.distanceFromLowWeightPctUpper ?? DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct))),
+    trendWeightPct: clampWeightPct(options.trendWeightPctUpper, DEFAULT_FACTOR_WEIGHTS.trendWeightPct),
+    volumePriceWeightPct: clampWeightPct(options.volumePriceWeightPctUpper, DEFAULT_FACTOR_WEIGHTS.volumePriceWeightPct),
+    distanceFromLowWeightPct: clampWeightPct(options.distanceFromLowWeightPctUpper, DEFAULT_FACTOR_WEIGHTS.distanceFromLowWeightPct),
     volatilityTrendWeightPct: clampWeightPct(options.volatilityTrendWeightPctUpper, DEFAULT_FACTOR_WEIGHTS.volatilityTrendWeightPct),
     relativeStrengthWeightPct: clampWeightPct(options.relativeStrengthWeightPctUpper, DEFAULT_FACTOR_WEIGHTS.relativeStrengthWeightPct),
   };

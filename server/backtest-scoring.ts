@@ -495,22 +495,27 @@ export function computeBacktestScores(
   for (const row of records) {
     const date = String(row.date);
     const list = byDate.get(date) ?? [];
+    const trendScore = round(Number(row.trend_score), 1);
+    const volumePriceScore = Number(row.volume_price_score);
+    const positionScore = Number(row.position_score);
+    const volatilityTrendScore = Number(row.volatility_trend_score);
+    const relativeStrengthScore = round(Number(row.relative_strength_score), 1);
     list.push({
       rank: 0,
       stock_code: String(row.stock_code),
       stock_name: String(row.stock_name),
-      total_score: round(Number(row.total_score), 1),
-      trend_score: round(Number(row.trend_score), 1),
-      volume_price_score: Number(row.volume_price_score),
-      volume_score: Number(row.volume_price_score),
+      total_score: round((Number(row.trend_score) + volumePriceScore + positionScore + volatilityTrendScore + relativeStrengthScore) * SCORE_SCALE / RAW_SCORE_MAX, 1),
+      trend_score: trendScore,
+      volume_price_score: volumePriceScore,
+      volume_score: volumePriceScore,
       volume_price_label: String(row.volume_price_label),
       volume_label: String(row.volume_price_label),
-      position_score: Number(row.position_score),
+      position_score: positionScore,
       position_label: String(row.position_label),
-      volatility_trend_score: Number(row.volatility_trend_score),
+      volatility_trend_score: volatilityTrendScore,
       volatility_class: String(row.volatility_class) as VolatilityClass,
       volatility_label: ({ high: '高波动', medium: '中波动', low: '低波动' } as Record<string, string>)[String(row.volatility_class)] ?? '',
-      relative_strength_score: round(Number(row.relative_strength_score), 1),
+      relative_strength_score: relativeStrengthScore,
       relative_strength_label: String(row.relative_strength_label),
       relative_strength_pct: row.relative_strength_pct == null ? null : round(Number(row.relative_strength_pct), 2),
       limit_up_count_20d: Number(row.limit_up_count_20d),

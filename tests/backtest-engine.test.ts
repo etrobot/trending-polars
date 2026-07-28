@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { historicalCrossSectionRankings, historicalStrategyCandidates, runPolarsBacktest, sectorTrendLookupMap } from '../server/backtest-engine.js';
+import {
+  historicalCrossSectionRankings,
+  historicalStrategyCandidates,
+  runPolarsBacktest,
+  sectorTrendLookupMap,
+} from '../server/backtest-engine.js';
 import { parseEastmoneyKlines } from '../server/historical-market.js';
 import { historicalFixture } from './historical-fixture.js';
 
-describe('historical backtest timing', () => {
+describe('historical scoring and backtest timing', () => {
   it('joins sector trend names from the lookup map when scoring the cross section', () => {
     const fixture = historicalFixture();
     const previousRows = fixture.stocks.map((stock, index) => ({
@@ -30,6 +35,25 @@ describe('historical backtest timing', () => {
     expect(rankings.length).toBeGreaterThan(0);
     expect(rankings.every((row) => row.sector_trend_name === '主线主升')).toBe(true);
     expect(rankings.every((row) => row.sector_trend_state_id === 1)).toBe(true);
+  });
+
+  it('keeps the 100-point score scale when every factor weight is boosted equally', () => {
+    const fixture = historicalFixture();
+    const date = fixture.calendar.at(-1)!;
+    const baseline = historicalCrossSectionRankings(fixture, date);
+    const boosted = historicalCrossSectionRankings(fixture, date, [], new Map(), {
+      factorWeights: {
+        trendWeightPct: 150,
+        volumePriceWeightPct: 150,
+        distanceFromLowWeightPct: 150,
+        volatilityTrendWeightPct: 150,
+        relativeStrengthWeightPct: 150,
+      },
+    });
+
+    expect(boosted.map((row) => ({ code: row.stock_code, score: row.total_score })))
+      .toEqual(baseline.map((row) => ({ code: row.stock_code, score: row.total_score })));
+    expect(Math.max(...boosted.map((row) => row.total_score))).toBeLessThanOrEqual(100);
   });
 
   it('parses real daily bars without inventing fields', () => {

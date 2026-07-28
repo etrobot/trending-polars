@@ -357,7 +357,7 @@ export interface TradingSession {
 
 export type PlanExecutionWindow = 'open' | 'near_close';
 export type TradingWindow = PlanExecutionWindow | 'close' | 'post_close';
-export type StrategyInstructionStatus = 'pending' | 'submitting' | 'submitted' | 'uncertain' | 'filled' | 'skipped' | 'failed' | 'cancelled';
+export type StrategyInstructionStatus = 'pending' | 'submitting' | 'submitted' | 'uncertain' | 'filled' | 'skipped' | 'failed' | 'cancelled' | 'expired';
 
 export interface PaperStrategyInstruction {
   id: string;

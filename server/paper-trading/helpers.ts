@@ -112,6 +112,27 @@ export function displayDate(value: string): string {
   return `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`;
 }
 
+/** 取信号日后的首个交易日；日历不可用时按工作日兜底。 */
+export function nextTradingDateAfter(value: string, calendar: readonly string[] = []): string | null {
+  const date = compactDate(value);
+  if (!/^\d{8}$/.test(date)) return null;
+  const nextFromCalendar = [...new Set(calendar.map(compactDate).filter((item) => /^\d{8}$/.test(item)))]
+    .sort()
+    .find((item) => item > date);
+  if (nextFromCalendar) return nextFromCalendar;
+
+  const cursor = new Date(Date.UTC(
+    Number(date.slice(0, 4)),
+    Number(date.slice(4, 6)) - 1,
+    Number(date.slice(6, 8)),
+  ));
+  if (Number.isNaN(cursor.getTime())) return null;
+  do {
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  } while (cursor.getUTCDay() === 0 || cursor.getUTCDay() === 6);
+  return `${cursor.getUTCFullYear()}${String(cursor.getUTCMonth() + 1).padStart(2, '0')}${String(cursor.getUTCDate()).padStart(2, '0')}`;
+}
+
 /** 与调度器持仓监控窗口一致：9:25–15:20 视为账户监控时段。 */
 export const ACCOUNT_SYNC_SESSION_START_MINUTE = 9 * 60 + 25;
 export const ACCOUNT_SYNC_SESSION_END_MINUTE = 15 * 60 + 20;
@@ -256,6 +277,7 @@ export function instructionStatusLabel(instruction: PaperStrategyInstruction): s
     skipped: '已跳过',
     failed: '失败',
     cancelled: '已撤',
+    expired: '已过期',
   } as Record<string, string>)[instruction.status] ?? instruction.status;
 }
 

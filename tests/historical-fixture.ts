@@ -56,7 +56,7 @@ export function historicalFixture(endDate = '20260722'): HistoricalMarketData {
   const dates = businessDates(endDate, 90);
   return {
     schema_version: 1,
-    source: 'eastmoney-unadjusted',
+    source: 'multi-source-qfq',
     generated_at: '2026-07-22 16:00:00',
     as_of_date: endDate,
     universe_as_of_date: endDate,
@@ -86,6 +86,10 @@ export function historicalFixture(endDate = '20260722'): HistoricalMarketData {
         bars: stockBars(dates, 20, () => -0.002, 9_000_000),
       },
     ],
+    indices: [{
+      symbol: 'sh000001',
+      index_name: '上证指数',
+      bars: stockBars(dates, 3_000, (index) => 0.001 + (index % 9 === 0 ? -0.0005 : 0), 200_000_000),
+    }],
   };
 }
-

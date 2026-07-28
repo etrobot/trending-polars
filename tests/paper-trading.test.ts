@@ -5,7 +5,15 @@ import {
   type PaperMarketContext,
   type PaperTradingStateStore,
 } from '../server/paper-trading.js';
-import { immediateAutoWindowRejection, isAccountSyncOnlyPeriod, isTradingDay, resolveAutoTradingWindow, shanghaiClock } from '../server/paper-trading/helpers.js';
+import {
+  defaultState,
+  immediateAutoWindowRejection,
+  isAccountSyncOnlyPeriod,
+  isTradingDay,
+  nextTradingDateAfter,
+  resolveAutoTradingWindow,
+  shanghaiClock,
+} from '../server/paper-trading/helpers.js';
 import type { SimulatedAccountSnapshot, SimulatedBroker } from '../server/ths-simulated-broker.js';
 import type { AnalysisData, PaperOrder, PaperTradingRuntimeState, RankingRow } from '../src/types.js';
 
@@ -343,6 +351,83 @@ describe('Node T+1 paper-trading core', () => {
     expect(cached.plan.history).toHaveLength(2);
     expect(cached.plan.history.map((item) => item.status)).toEqual(['已成交', '已成交']);
     expect(cached.plan.history.every((item) => item.signal_date === '20260723')).toBe(true);
+  });
+
+  it('expires every pending plan after its execution day and never carries it into a later trading day', async () => {
+    let now = new Date('2026-07-24T14:59:00+08:00');
+    const store = new TestStateStore();
+    store.state = {
+      ...defaultState('2026-07-23 15:05:00'),
+      reference_capital: 100_000,
+      last_signal_date: '20260723',
+      instructions: [
+        {
+          id: 'pending-buy',
+          side: 'buy',
+          stock_code: '000001',
+          stock_name: '待买入',
+          signal_date: '20260723',
+          signal_price: 10,
+          quantity: 1_000,
+          rank: 1,
+          reason: '测试买入计划 次日开盘',
+          execution_window: 'open',
+          status: 'pending',
+          created_at: '2026-07-23 15:05:00',
+        },
+        {
+          id: 'pending-sell',
+          side: 'sell',
+          stock_code: '600100',
+          stock_name: '待卖出',
+          signal_date: '20260723',
+          signal_price: 10,
+          quantity: 1_000,
+          reason: '测试卖出计划；次日临近收盘卖出',
+          execution_window: 'near_close',
+          status: 'pending',
+          created_at: '2026-07-23 15:05:00',
+        },
+      ],
+    };
+    const broker = new FlowBroker({
+      availableCash: 90_000,
+      totalAssets: 100_000,
+      positions: [{
+        stock_code: '600100',
+        stock_name: '待卖出',
+        shares: 1_000,
+        available_shares: 1_000,
+        cost_price: 10,
+        current_price: 10,
+        market_value: 10_000,
+        pnl_amount: 0,
+        pnl_pct: 0,
+      }],
+      orders: [],
+    });
+    const service = new PaperTradingService(broker, { stateStore: store, now: () => now });
+    const calendar = ['20260723', '20260724', '20260727'];
+
+    const beforeClose = await service.overview(analysis, '20260723', [], calendar);
+    expect(beforeClose.plan.orders.map((item) => item.id).sort()).toEqual(['pending-buy', 'pending-sell']);
+
+    now = new Date('2026-07-24T15:01:00+08:00');
+    const afterClose = await service.overview(analysis, '20260723', [], calendar);
+    expect(afterClose.plan.orders).toHaveLength(0);
+    expect(afterClose.plan.history.filter((item) => item.status === '已过期').map((item) => item.id).sort()).toEqual([
+      'pending-buy',
+      'pending-sell',
+    ]);
+    expect((await service.getRuntimeState()).instructions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'pending-buy', status: 'expired', reason: expect.stringContaining('2026-07-24') }),
+      expect.objectContaining({ id: 'pending-sell', status: 'expired', reason: expect.stringContaining('当日未执行') }),
+    ]));
+
+    now = new Date('2026-07-27T09:31:00+08:00');
+    const laterOpen = await service.runWindow('open', context('20260724', [], calendar));
+    expect(laterOpen.results).toHaveLength(0);
+    expect(broker.placed).toHaveLength(0);
   });
 
   it('uses the five-trading-day exit rule and schedules strong-market buys at open and sells near close', async () => {
@@ -720,7 +805,7 @@ describe('Node T+1 paper-trading core', () => {
     expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T15:10:00+08:00')))).toBe('post_close');
   });
 
-  it('detects trading day from shanghai index calendar', () => {
+  it('detects trading days from the shared market calendar', () => {
     const calendar = ['20260722', '20260723', '20260724'];
     expect(isTradingDay(shanghaiClock(new Date('2026-07-25T10:00:00+08:00')), calendar)).toBe(false);
     expect(isTradingDay(shanghaiClock(new Date('2026-07-24T10:00:00+08:00')), calendar)).toBe(true);
@@ -729,5 +814,11 @@ describe('Node T+1 paper-trading core', () => {
       calendar,
       { calendarRefreshed: true },
     )).toBe(false);
+  });
+
+  it('resolves the first trading day after a signal from the calendar or weekday fallback', () => {
+    expect(nextTradingDateAfter('20260724', ['20260724', '20260727', '20260728'])).toBe('20260727');
+    expect(nextTradingDateAfter('20260724')).toBe('20260727');
+    expect(nextTradingDateAfter('invalid')).toBeNull();
   });
 });
