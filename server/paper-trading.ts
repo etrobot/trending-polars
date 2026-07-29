@@ -47,6 +47,9 @@ import {
   executionWindowLabel,
   isActiveInstruction,
   instructionStatusLabel,
+  isAmbiguousSubmissionFailure,
+  normalizeInstructionOnLoad,
+  summarizeSubmissionError,
   isAccountSyncOnlyPeriod,
   isTradingDay,
   isWeakMarket,
@@ -278,6 +281,7 @@ export class PaperTradingService extends EventEmitter {
     const accountOnly = isAccountSyncOnlyPeriod(clock, calendar);
     if (observation && !accountOnly) {
       this.initializeCapital(state, snapshot);
+      this.reconcileUncertainInstructions(state, snapshot, traceId);
       this.reconcileState(state, snapshot, clock.date);
       await this.ensurePreviousClosePlan(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange, limitUpRecords }, clock.date, traceId, true);
       await this.ensureSameDayCloseSignals(state, snapshot, { analysis, rankingDate, rankings, calendar, marketAverageChange, limitUpRecords }, clock, traceId, true);
@@ -340,14 +344,16 @@ export class PaperTradingService extends EventEmitter {
       this.expirePendingPlans(state, clock, market.calendar ?? []);
       let snapshot = await this.readAndObserveAccount(state, traceId, `window:${window}:initial`);
       this.initializeCapital(state, snapshot);
+      this.reconcileUncertainInstructions(state, snapshot, traceId);
       this.reconcileState(state, snapshot, clock.date);
       let results: PaperOrder[] = [];
+      let pendingRemaining = 0;
 
       if (window === 'close') {
         results = await this.generateCloseSignals(state, snapshot, market, clock.date, traceId);
       } else if (window === 'open' || window === 'near_close') {
         await this.ensurePreviousClosePlan(state, snapshot, market, clock.date, traceId);
-        ({ snapshot, results } = await this.executePlannedOrders(
+        ({ snapshot, results, pendingRemaining } = await this.executePlannedOrders(
           state,
           snapshot,
           market,
@@ -362,7 +368,19 @@ export class PaperTradingService extends EventEmitter {
         this.recordEvent(state, 'post_close', 'reconciled', `盘后已核对 ${snapshot.positions.length} 只持仓和 ${snapshot.orders.length} 笔当日委托`);
       }
 
-      this.markWindowCompleted(state, clock.date, window);
+      if (window === 'open' || window === 'near_close') {
+        if (pendingRemaining === 0) {
+          this.markWindowCompleted(state, clock.date, window);
+        } else {
+          console.log('[paper] window still has pending orders, not marking completed', {
+            window,
+            trading_date: clock.date,
+            pending_remaining: pendingRemaining,
+          });
+        }
+      } else {
+        this.markWindowCompleted(state, clock.date, window);
+      }
       state.automation = {
         ...state.automation,
         last_run: clock.timestamp,
@@ -440,6 +458,7 @@ export class PaperTradingService extends EventEmitter {
         ? await this.readAndObserveAccountOnly(state, traceId, source)
         : await this.readAndObserveAccount(state, traceId, source);
       this.initializeCapital(state, snapshot);
+      this.reconcileUncertainInstructions(state, snapshot, traceId);
       this.reconcileState(state, snapshot, clock.date);
       this.expirePendingPlans(state, clock, this.cachedTradingCalendar);
       await this.persist(state);
@@ -487,6 +506,7 @@ export class PaperTradingService extends EventEmitter {
       ? await this.readAndObserveAccountOnly(state, traceId, 'overview')
       : await this.readAndObserveAccount(state, traceId, 'overview');
     this.initializeCapital(state, snapshot);
+    this.reconcileUncertainInstructions(state, snapshot, traceId);
     this.reconcileState(state, snapshot, clock.date);
     this.expirePendingPlans(state, clock, context.calendar ?? []);
     if (!accountOnly) {
@@ -551,15 +571,19 @@ export class PaperTradingService extends EventEmitter {
     const active = state.instructions.filter(isActiveInstruction);
     const trackedByCode = new Map(state.tracked_positions.map((position) => [position.stock_code, position]));
     const planOrders = active.map((instruction) => this.instructionToOrder(instruction));
-    const history = [...state.instructions].reverse().map((instruction) => ({
-      ...this.instructionToOrder(instruction, instruction.execution_price ?? instruction.signal_price),
-      signal_date: instruction.signal_date,
-      rank: instruction.rank,
-      created_at: instruction.created_at,
-      submitted_at: instruction.submitted_at,
-      completed_at: instruction.completed_at,
-      broker_status: instruction.broker_status,
-    }));
+    // 活动中的计划只在 plan.orders 展示；状态变更（pending→uncertain 等）在原记录上更新，不进入 history。
+    const history = [...state.instructions]
+      .filter((instruction) => !isActiveInstruction(instruction))
+      .reverse()
+      .map((instruction) => ({
+        ...this.instructionToOrder(instruction, instruction.execution_price ?? instruction.signal_price),
+        signal_date: instruction.signal_date,
+        rank: instruction.rank,
+        created_at: instruction.created_at,
+        submitted_at: instruction.submitted_at,
+        completed_at: instruction.completed_at,
+        broker_status: instruction.broker_status,
+      }));
     const skipped = state.instructions
       .filter((instruction) => instruction.status === 'skipped' || instruction.status === 'failed')
       .slice(-8)
@@ -634,6 +658,15 @@ export class PaperTradingService extends EventEmitter {
     const signalDate = compactDate(context.rankingDate);
     if (signalDate !== tradingDate) {
       throw new Error(`排行日期 ${context.rankingDate} 不是当前交易日 ${displayDate(tradingDate)}，拒绝生成收盘信号`);
+    }
+    if (state.last_signal_date === signalDate) {
+      await this.audit.info('strategy', 'close_signals_already_generated', {
+        traceId,
+        data: { trading_date: tradingDate, signal_date: signalDate },
+      });
+      return state.instructions
+        .filter((instruction) => instruction.signal_date === signalDate)
+        .map((instruction) => this.instructionToOrder(instruction));
     }
 
     this.expirePendingPlans(state, shanghaiClock(this.now()), context.calendar ?? []);
@@ -938,12 +971,13 @@ export class PaperTradingService extends EventEmitter {
     traceId: string,
     executionWindow: PlanExecutionWindow,
     immediate = false,
-  ): Promise<{ snapshot: SimulatedAccountSnapshot; results: PaperOrder[] }> {
+  ): Promise<{ snapshot: SimulatedAccountSnapshot; results: PaperOrder[]; pendingRemaining: number }> {
     let snapshot = initialSnapshot;
     const results: PaperOrder[] = [];
-    const unresolved = state.instructions.filter((instruction) => instruction.status === 'submitting' || instruction.status === 'uncertain');
-    if (unresolved.length > 0) {
-      throw new Error(`存在 ${unresolved.length} 笔提交结果不确定的委托，请先根据同花顺委托和持仓人工核对，已停止本次交易窗口执行`);
+    this.reconcileUncertainInstructions(state, snapshot, traceId);
+    const inFlight = state.instructions.filter((instruction) => instruction.status === 'submitting');
+    if (inFlight.length > 0) {
+      throw new Error(`存在 ${inFlight.length} 笔正在提交中的委托，请稍候重试`);
     }
     const executionCalendar = this.effectiveTradingCalendar(context.calendar ?? []);
     const eligible = (instruction: PaperStrategyInstruction) => (
@@ -985,9 +1019,22 @@ export class PaperTradingService extends EventEmitter {
       }
       instruction.quantity = quantity;
       const order = this.instructionToOrder(instruction, position.current_price);
-      await this.submitBrokerOrder(state, instruction, order, traceId);
-      results.push({ ...this.instructionToOrder(instruction, instruction.execution_price), status: '已提交并回查' });
-      this.recordEvent(state, executionWindow, 'sell_submitted', `卖出 ${instruction.stock_code} ${quantity} 股`, instruction.stock_code);
+      try {
+        await this.submitBrokerOrder(state, instruction, order, traceId);
+      } catch (error) {
+        if (instruction.status !== 'uncertain') throw error;
+        await this.audit.warn('strategy', 'sell_submission_aborted', {
+          traceId,
+          data: { instruction, error: error instanceof Error ? error.message : String(error) },
+        });
+        break;
+      }
+      if (instruction.status === 'submitted') {
+        results.push({ ...this.instructionToOrder(instruction, instruction.execution_price), status: '已提交并回查' });
+        this.recordEvent(state, executionWindow, 'sell_submitted', `卖出 ${instruction.stock_code} ${quantity} 股`, instruction.stock_code);
+      } else if (instruction.status === 'pending') {
+        this.recordEvent(state, executionWindow, 'sell_retryable', `卖出 ${instruction.stock_code} 提交失败，已恢复待执行`, instruction.stock_code);
+      }
     }
 
     if (sells.some((instruction) => instruction.status === 'submitted')) {
@@ -1050,19 +1097,54 @@ export class PaperTradingService extends EventEmitter {
       }
       instruction.quantity = sizing.shares;
       const order = this.instructionToOrder(instruction, quote);
-      await this.submitBrokerOrder(state, instruction, order, traceId);
-      results.push({ ...this.instructionToOrder(instruction, instruction.execution_price), status: '已提交并回查' });
-      availableCash = round(availableCash - sizing.totalCost, 2);
-      occupiedCodes.add(instruction.stock_code);
-      this.recordEvent(state, executionWindow, 'buy_submitted', `买入 ${instruction.stock_code} ${sizing.shares} 股`, instruction.stock_code);
+      try {
+        await this.submitBrokerOrder(state, instruction, order, traceId);
+      } catch (error) {
+        if (instruction.status !== 'uncertain') throw error;
+        await this.audit.warn('strategy', 'buy_submission_aborted', {
+          traceId,
+          data: { instruction, error: error instanceof Error ? error.message : String(error) },
+        });
+        break;
+      }
+      if (instruction.status === 'submitted') {
+        results.push({ ...this.instructionToOrder(instruction, instruction.execution_price), status: '已提交并回查' });
+        availableCash = round(availableCash - sizing.totalCost, 2);
+        occupiedCodes.add(instruction.stock_code);
+        this.recordEvent(state, executionWindow, 'buy_submitted', `买入 ${instruction.stock_code} ${sizing.shares} 股`, instruction.stock_code);
+      } else if (instruction.status === 'pending') {
+        this.recordEvent(state, executionWindow, 'buy_retryable', `买入 ${instruction.stock_code} 提交失败，已恢复待执行`, instruction.stock_code);
+      }
     }
 
     if (results.length > 0) snapshot = await this.readAndObserveAccount(state, traceId, `${executionWindow}:after_orders`);
+    const pendingRemaining = this.countPendingWindowOrders(
+      state,
+      tradingDate,
+      executionWindow,
+      immediate,
+      context.calendar ?? [],
+    );
     await this.audit.info('strategy', 'window_execution_completed', {
       traceId,
-      data: { trading_date: tradingDate, execution_window: executionWindow, immediate, results, final_account: snapshot },
+      data: { trading_date: tradingDate, execution_window: executionWindow, immediate, results, pending_remaining: pendingRemaining, final_account: snapshot },
     });
-    return { snapshot, results };
+    return { snapshot, results, pendingRemaining };
+  }
+
+  private countPendingWindowOrders(
+    state: PaperTradingRuntimeState,
+    tradingDate: string,
+    executionWindow: PlanExecutionWindow,
+    immediate: boolean,
+    calendar: readonly string[] = [],
+  ): number {
+    const executionCalendar = this.effectiveTradingCalendar(calendar);
+    return state.instructions.filter((instruction) => (
+      instruction.status === 'pending'
+      && nextTradingDateAfter(instruction.signal_date, executionCalendar) === tradingDate
+      && (immediate || (instruction.execution_window ?? 'open') === executionWindow)
+    )).length;
   }
 
   private reconcileState(state: PaperTradingRuntimeState, snapshot: SimulatedAccountSnapshot, tradingDate: string) {
@@ -1298,10 +1380,17 @@ export class PaperTradingService extends EventEmitter {
     instruction.submitted_at = shanghaiClock(this.now()).timestamp;
     instruction.broker_status = '正在调用 AppleScript 提交并回查';
     await this.persist(state);
-    await this.audit.info('order', 'submission_started', {
-      traceId,
-      data: { instruction, order },
-    });
+    try {
+      await this.audit.info('order', 'submission_started', {
+        traceId,
+        data: { instruction, order },
+      });
+    } catch (error) {
+      instruction.status = 'pending';
+      instruction.submitted_at = undefined;
+      await this.persist(state);
+      throw error;
+    }
     try {
       const action = await this.broker.placeOrder(order, {
         traceId,
@@ -1320,18 +1409,100 @@ export class PaperTradingService extends EventEmitter {
       return action;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      instruction.status = 'uncertain';
-      instruction.broker_status = `提交结果不确定：${message}`;
-      state.automation = { ...state.automation, last_error: message };
-      this.recordEvent(state, instruction.execution_window ?? 'open', 'order_submission_uncertain', `${instruction.stock_code} ${message}`, instruction.stock_code);
+      if (isAmbiguousSubmissionFailure(message)) {
+        instruction.status = 'uncertain';
+        instruction.broker_status = `提交结果不确定：${summarizeSubmissionError(message)}`;
+        state.automation = { ...state.automation, last_error: summarizeSubmissionError(message) };
+        this.recordEvent(state, instruction.execution_window ?? 'open', 'order_submission_uncertain', `${instruction.stock_code} ${summarizeSubmissionError(message)}`, instruction.stock_code);
+        await this.persist(state);
+        await this.audit.error('order', 'submission_uncertain', {
+          traceId,
+          data: { instruction, order },
+          error,
+        });
+        throw error;
+      }
+      instruction.status = 'pending';
+      instruction.submitted_at = undefined;
+      instruction.broker_status = `上次提交失败：${summarizeSubmissionError(message)}`;
+      state.automation = { ...state.automation, last_error: summarizeSubmissionError(message) };
       await this.persist(state);
-      await this.audit.error('order', 'submission_uncertain', {
+      await this.audit.warn('order', 'submission_failed_retryable', {
         traceId,
         data: { instruction, order },
         error,
       });
-      throw error;
+      return { verified: false, brokerOutput: message };
     }
+  }
+
+  private reconcileUncertainInstructions(
+    state: PaperTradingRuntimeState,
+    snapshot: SimulatedAccountSnapshot,
+    traceId: string,
+  ): number {
+    const timestamp = shanghaiClock(this.now()).timestamp;
+    const resolved: PaperStrategyInstruction[] = [];
+    for (const instruction of state.instructions) {
+      if (instruction.status !== 'uncertain') continue;
+      const brokerOrder = snapshot.orders.find((order) => (
+        order.side === instruction.side
+        && order.stock_code === instruction.stock_code
+      ));
+      const position = snapshot.positions.find((item) => item.stock_code === instruction.stock_code);
+      if (instruction.side === 'sell') {
+        if (!position) {
+          instruction.status = 'filled';
+          instruction.completed_at = timestamp;
+          instruction.broker_status = '同花顺持仓已清零，视为已卖出';
+          resolved.push(instruction);
+        } else if (brokerOrder) {
+          instruction.status = 'submitted';
+          instruction.broker_status = brokerOrder.status || '委托列表已核对';
+          resolved.push(instruction);
+        } else {
+          instruction.status = 'pending';
+          instruction.submitted_at = undefined;
+          instruction.broker_status = '同花顺无对应委托，已恢复待执行';
+          resolved.push(instruction);
+        }
+        continue;
+      }
+      if (position) {
+        instruction.status = 'filled';
+        instruction.completed_at = timestamp;
+        instruction.broker_status = '持仓已核对';
+        resolved.push(instruction);
+      } else if (brokerOrder) {
+        instruction.status = 'submitted';
+        instruction.broker_status = brokerOrder.status || '委托列表已核对';
+        resolved.push(instruction);
+      } else {
+        instruction.status = 'pending';
+        instruction.submitted_at = undefined;
+        instruction.broker_status = '同花顺无对应委托，已恢复待执行';
+        resolved.push(instruction);
+      }
+    }
+    if (resolved.length > 0) {
+      console.log('[paper] reconciled uncertain instructions', {
+        count: resolved.length,
+        stocks: resolved.map((instruction) => instruction.stock_code),
+      });
+      void this.audit.info('strategy', 'uncertain_instructions_reconciled', {
+        traceId,
+        data: {
+          resolved: resolved.map((instruction) => ({
+            id: instruction.id,
+            side: instruction.side,
+            stock_code: instruction.stock_code,
+            status: instruction.status,
+            broker_status: instruction.broker_status,
+          })),
+        },
+      });
+    }
+    return resolved.length;
   }
 
   private instructionToOrder(instruction: PaperStrategyInstruction, price = instruction.signal_price): PaperOrder {
@@ -1346,14 +1517,15 @@ export class PaperTradingService extends EventEmitter {
       price: round(price, 4),
       amount: round(price * instruction.quantity, 2),
       status: instructionStatusLabel(instruction),
-      reason: instruction.status === 'uncertain' && instruction.broker_status
-        ? `${instruction.reason}；${instruction.broker_status}`
-        : instruction.reason,
+      reason: instruction.reason,
       window: `${timing}·${instruction.side === 'sell' ? '卖出' : '买入'}`,
       execution_window: executionWindow,
       signal_date: instruction.signal_date,
       rank: instruction.rank,
       cancelable: instruction.status === 'submitted',
+      broker_status: instruction.broker_status,
+      created_at: instruction.created_at,
+      submitted_at: instruction.submitted_at,
     };
   }
 
@@ -1442,9 +1614,7 @@ export class PaperTradingService extends EventEmitter {
         engine_version: PAPER_ENGINE_VERSION,
         automation: { ...defaultAutomation(), ...stored.automation },
         completed_windows: stored.completed_windows ?? {},
-        instructions: (stored.instructions ?? []).map((instruction) => instruction.status === 'submitting'
-          ? { ...instruction, status: 'uncertain' as const, broker_status: '服务重启时委托仍处于提交中，请根据同花顺委托和持仓人工核对' }
-          : instruction),
+        instructions: (stored.instructions ?? []).map((instruction) => normalizeInstructionOnLoad(instruction)),
         tracked_positions: stored.tracked_positions ?? [],
         events: stored.events ?? [],
       };

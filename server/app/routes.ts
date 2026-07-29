@@ -708,42 +708,53 @@ export function registerRoutes(
       response.status(400).json({ ok: false, error: '交易窗口必须是 open、near_close、close 或 post_close' });
       return;
     }
-    if (requestedWindow === 'close') {
-      const task = tasks.start('paper_close_decision', '收盘决策：刷新行情并生成交易计划', async ({ progress, cancelled, traceId }) => {
-        try {
-          progress(5, '准备收盘行情与策略上下文');
-          const context = await marketService.loadPaperContext(true, traceId);
-          if (cancelled()) return null;
-          progress(82, '行情与排行已准备，正在生成下一交易日计划');
-          const result = await paper.runWindowConfirmed('close', context, traceId);
-          progress(98, result.message);
-          return result;
-        } catch (error) {
-          await audit.error('paper_trading', 'manual_window_failed', {
-            traceId,
-            data: { window: 'close' },
-            error,
-          });
-          throw error;
-        }
-      });
-      response.status(202).json({ task_id: task.id, status: 'started', message: '收盘决策任务已启动' });
-      return;
-    }
-    try {
-      response.json(await paper.runWindowConfirmed(
-        requestedWindow as 'open' | 'near_close' | 'post_close',
-        await marketService.loadPaperContext(false, String(response.locals.traceId)),
-        String(response.locals.traceId),
-      ));
-    } catch (error) {
-      await audit.error('paper_trading', 'manual_window_failed', {
-        traceId: String(response.locals.traceId),
-        data: { window: requestedWindow },
-        error,
-      });
-      response.status(error instanceof ThsSimulatedBrokerError ? 409 : 400).json({ ok: false, error: error instanceof Error ? error.message : String(error) });
-    }
+    const window = requestedWindow as 'open' | 'near_close' | 'close' | 'post_close';
+    const windowTaskMeta: Record<typeof window, { type: string; name: string; startedMessage: string; refreshMarket: boolean }> = {
+      open: {
+        type: 'paper_open_window',
+        name: '开盘执行：读取账户并提交策略委托',
+        startedMessage: '开盘执行任务已启动',
+        refreshMarket: false,
+      },
+      near_close: {
+        type: 'paper_near_close_window',
+        name: '临收盘执行：读取账户并提交策略委托',
+        startedMessage: '临收盘执行任务已启动',
+        refreshMarket: false,
+      },
+      close: {
+        type: 'paper_close_decision',
+        name: '收盘决策：刷新行情并生成交易计划',
+        startedMessage: '收盘决策任务已启动',
+        refreshMarket: true,
+      },
+      post_close: {
+        type: 'paper_post_close_window',
+        name: '盘后核对：同步账户与持仓',
+        startedMessage: '盘后核对任务已启动',
+        refreshMarket: false,
+      },
+    };
+    const meta = windowTaskMeta[window];
+    const task = tasks.start(meta.type, meta.name, async ({ progress, cancelled, traceId }) => {
+      try {
+        progress(5, meta.refreshMarket ? '准备收盘行情与策略上下文' : '准备策略上下文');
+        const context = await marketService.loadPaperContext(meta.refreshMarket, traceId);
+        if (cancelled()) return null;
+        progress(meta.refreshMarket ? 82 : 35, meta.refreshMarket ? '行情与排行已准备，正在生成下一交易日计划' : '正在执行交易窗口');
+        const result = await paper.runWindowConfirmed(window, context, traceId);
+        progress(98, result.message);
+        return result;
+      } catch (error) {
+        await audit.error('paper_trading', 'manual_window_failed', {
+          traceId,
+          data: { window },
+          error,
+        });
+        throw error;
+      }
+    });
+    response.status(202).json({ task_id: task.id, status: 'started', message: meta.startedMessage });
   }));
 
   app.post('/api/simulated-trading/execute', asyncHandler(async (request, response) => {

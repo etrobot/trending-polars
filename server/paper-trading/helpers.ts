@@ -348,3 +348,43 @@ export function withExecutionTiming(
     ? `${base}；${executionWindowLabel(executionWindow)}卖出`
     : `${base} ${executionWindowLabel(executionWindow)}`;
 }
+
+/** 仅「已提交但回查失败」视为结果不确定；AppleScript/界面错误通常委托未发出。 */
+export function isAmbiguousSubmissionFailure(message: string): boolean {
+  return message.includes('委托已提交但回查失败');
+}
+
+/** 旧版本误标为 uncertain 的界面/脚本错误，应恢复为 pending 以便重试。 */
+export function isRetryableUncertainInstruction(
+  instruction: Pick<PaperStrategyInstruction, 'status' | 'broker_status'>,
+): boolean {
+  if (instruction.status !== 'uncertain') return false;
+  return !isAmbiguousSubmissionFailure(instruction.broker_status ?? '');
+}
+
+export function normalizeInstructionOnLoad(instruction: PaperStrategyInstruction): PaperStrategyInstruction {
+  if (instruction.status === 'submitting') {
+    return {
+      ...instruction,
+      status: 'pending',
+      submitted_at: undefined,
+      broker_status: '服务重启时委托未提交完成，已恢复待执行',
+    };
+  }
+  if (!isRetryableUncertainInstruction(instruction)) return instruction;
+  const raw = instruction.broker_status ?? '';
+  const detail = raw.startsWith('提交结果不确定：')
+    ? raw.slice('提交结果不确定：'.length)
+    : raw;
+  return {
+    ...instruction,
+    status: 'pending',
+    submitted_at: undefined,
+    broker_status: detail ? `上次提交失败：${detail}` : '历史不确定状态已恢复待执行',
+  };
+}
+
+export function summarizeSubmissionError(message: string, maxLength = 240): string {
+  const singleLine = message.split('\n').map((line) => line.trim()).find(Boolean) ?? message.trim();
+  return singleLine.length > maxLength ? `${singleLine.slice(0, maxLength)}…` : singleLine;
+}

@@ -277,7 +277,7 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
 
             my refreshSimulationConnection(simulationWindow)
             my navigateTo(simulationWindow, orderSide)
-            delay 0.5
+            if not my simulationPageReady(simulationWindow, orderSide) then error "未能切换到模拟交易" & sideLabel & "页面（可能仍停留在买入/卖出另一页）"
 
             tell simulationWindow
                 set orderFields to my allTextFields(simulationWindow)
@@ -389,6 +389,9 @@ on navigateTo(simulationWindow, destination)
     set targetControl to my findNamedControl(simulationWindow, labels)
     if targetControl is not missing value then
         my pressControl(targetControl)
+        if destination is in {"buy", "sell", "funds", "positions", "orders"} then
+            my waitForSimulationPage(simulationWindow, destination)
+        end if
         return
     end if
 
@@ -414,9 +417,10 @@ on simulationPageReady(simulationWindow, destination)
         if my shallowTextContains(simulationWindow, {"委托状态", "当日委托"}) then return true
         return my hasOrderTable(simulationWindow)
     else if destination is "buy" then
-        return my shallowTextContains(simulationWindow, {"确定买入", "买入"})
+        -- 买入/卖出 Tab 标签在另一页也可见，不能用「买入」「卖出」判断；以提交按钮为准。
+        return my shallowTextContains(simulationWindow, {"确定买入"})
     else if destination is "sell" then
-        return my shallowTextContains(simulationWindow, {"确定卖出", "卖出"})
+        return my shallowTextContains(simulationWindow, {"确定卖出"})
     end if
     return false
 end simulationPageReady

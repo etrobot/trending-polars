@@ -292,6 +292,9 @@ export interface PaperOrder {
   signal_date?: string;
   rank?: number;
   cancelable?: boolean;
+  broker_status?: string;
+  created_at?: string;
+  submitted_at?: string;
 }
 
 export interface PaperPlanHistoryItem extends PaperOrder {

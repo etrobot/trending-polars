@@ -121,11 +121,11 @@ export function SimulatedTradingPage() {
     setWindowTaskId(null);
     if (task.status !== 'completed') {
       setNotice('');
-      setError(task.message || '收盘决策未完成');
+      setError(task.message || '交易窗口执行未完成');
       return;
     }
     setError('');
-    setNotice(task.message || '收盘决策已完成');
+    setNotice(task.message || '交易窗口执行完成');
     void loadBootstrap();
   }, [loadBootstrap]);
   useTaskResult(windowTaskId, onWindowTaskDone);
@@ -316,19 +316,16 @@ export function SimulatedTradingPage() {
 
   const execute = async () => {
     setBusy(true);
+    setError('');
     try {
-      const result = await api<{ task_id?: string; message?: string }>('/api/simulated-trading/automation/run-window', {
+      const result = await api<{ task_id: string; message?: string }>('/api/simulated-trading/automation/run-window', {
         method: 'POST',
         body: JSON.stringify({ window: selectedWindow }),
       });
       setExecuteOpen(false);
-      if (result.task_id) {
-        setWindowTaskId(result.task_id);
-        setNotice(result.message ?? '收盘决策已转入后台执行');
-        setPanelOpen(true);
-        return;
-      }
-      await loadBootstrap();
+      setWindowTaskId(result.task_id);
+      setNotice(result.message ?? '交易窗口已转入后台执行');
+      setPanelOpen(true);
     } catch (executeError) {
       setError(executeError instanceof Error ? executeError.message : String(executeError));
     } finally { setBusy(false); }
@@ -416,8 +413,8 @@ export function SimulatedTradingPage() {
             {planTab === 'pending' ? (
               <div className="overflow-auto">
                 <table className="data-table min-w-[1040px]">
-                  <thead><tr><th>方向</th><th>状态</th><th>信号日</th><th className="text-right">排名</th><th>窗口</th><th>代码</th><th>名称</th><th className="text-right">数量</th><th className="text-right">参考价</th><th className="text-right">预计金额</th><th>原因</th></tr></thead>
-                  <tbody>{plan.orders.length === 0 ? <tr><td colSpan={11}><EmptyState title="暂无待执行指令" description="当前没有活动指令；交易日收盘后会按排行榜、持仓上限和退出条件生成下一交易日计划。" /></td></tr> : plan.orders.map((order) => <tr key={order.id}><td className={order.side === 'buy' ? 'font-semibold text-trading-up' : 'font-semibold text-trading-down'}>{order.side === 'buy' ? '买入' : '卖出'}</td><td className="font-mono text-xs text-muted">{order.status}</td><td className="font-mono text-xs text-muted">{order.signal_date ?? '—'}</td><td className="text-right font-mono text-xs">{order.rank ?? '—'}</td><td className="text-xs text-muted">{order.window}</td><td className="font-mono text-xs text-muted">{order.stock_code}</td><td className="font-semibold text-ink">{order.stock_name}</td><td className="text-right font-mono text-xs">{order.quantity.toLocaleString()}</td><td className="text-right font-mono text-xs">{order.price.toFixed(2)}</td><td className="text-right font-mono text-xs">{formatMoney(order.amount)}</td><td className="max-w-xs whitespace-normal text-xs text-muted">{order.reason}</td></tr>)}</tbody>
+                  <thead><tr><th>方向</th><th>状态</th><th>信号日</th><th className="text-right">排名</th><th>窗口</th><th>代码</th><th>名称</th><th className="text-right">数量</th><th className="text-right">参考价</th><th className="text-right">预计金额</th><th>原因</th><th>回查/异常</th></tr></thead>
+                  <tbody>{plan.orders.length === 0 ? <tr><td colSpan={12}><EmptyState title="暂无待执行指令" description="当前没有活动指令；交易日收盘后会按排行榜、持仓上限和退出条件生成下一交易日计划。" /></td></tr> : plan.orders.map((order) => <tr key={order.id}><td className={order.side === 'buy' ? 'font-semibold text-trading-up' : 'font-semibold text-trading-down'}>{order.side === 'buy' ? '买入' : '卖出'}</td><td className={`font-mono text-xs ${historyStatusTone(order.status)}`}>{order.status}</td><td className="font-mono text-xs text-muted">{order.signal_date ?? '—'}</td><td className="text-right font-mono text-xs">{order.rank ?? '—'}</td><td className="text-xs text-muted">{order.window}</td><td className="font-mono text-xs text-muted">{order.stock_code}</td><td className="font-semibold text-ink">{order.stock_name}</td><td className="text-right font-mono text-xs">{order.quantity.toLocaleString()}</td><td className="text-right font-mono text-xs">{order.price.toFixed(2)}</td><td className="text-right font-mono text-xs">{formatMoney(order.amount)}</td><td className="max-w-xs whitespace-normal text-xs text-muted">{order.reason}</td><td className="max-w-sm whitespace-normal text-xs text-trading-up">{order.broker_status ?? '—'}</td></tr>)}</tbody>
                 </table>
                 {plan.skipped.length > 0 && <div className="border-t border-primary/30 bg-primary/5 px-3 py-2 text-[11px] leading-4 text-primary-active">{plan.skipped.join(' ')}</div>}
               </div>

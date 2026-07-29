@@ -66,4 +66,56 @@ describe('simulated-trading background tasks', () => {
     expect(loadPaperContext).toHaveBeenCalledWith(true, started.body.task_id);
     expect(runWindowConfirmed).toHaveBeenCalledWith('close', context, started.body.task_id);
   });
+
+  it('registers the open window before running it', async () => {
+    const tasks = new TaskRegistry(NOOP_AUDIT_LOGGER);
+    const context = { rankingDate: '20260728' };
+    const loadPaperContext = vi.fn(async () => context);
+    const runWindowConfirmed = vi.fn(async () => ({
+      ok: true,
+      window: 'open',
+      trading_date: '20260729',
+      status: 'completed',
+      results: [],
+      message: '2026-07-29 立即执行完成，处理 1 笔策略指令',
+    }));
+    const app = express();
+
+    registerRoutes(app, {
+      store: {} as never,
+      tasks,
+      paper: { runWindowConfirmed } as never,
+      audit: NOOP_AUDIT_LOGGER,
+    }, { loadPaperContext } as never, process.cwd());
+
+    const client = request(app);
+    const started = await client
+      .post('/api/simulated-trading/automation/run-window')
+      .send({ window: 'open' })
+      .expect(202);
+
+    expect(started.body).toMatchObject({
+      task_id: expect.any(String),
+      status: 'started',
+      message: '开盘执行任务已启动',
+    });
+
+    const listed = await client.get('/api/tasks').expect(200);
+    expect(listed.body.tasks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: started.body.task_id,
+        type: 'paper_open_window',
+        name: '开盘执行：读取账户并提交策略委托',
+      }),
+    ]));
+
+    const task = await waitForTask(client, started.body.task_id);
+    expect(task).toMatchObject({
+      status: 'completed',
+      message: '2026-07-29 立即执行完成，处理 1 笔策略指令',
+      result: { window: 'open', status: 'completed' },
+    });
+    expect(loadPaperContext).toHaveBeenCalledWith(false, started.body.task_id);
+    expect(runWindowConfirmed).toHaveBeenCalledWith('open', context, started.body.task_id);
+  });
 });

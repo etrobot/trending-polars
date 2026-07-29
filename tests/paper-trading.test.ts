@@ -631,7 +631,7 @@ describe('Node T+1 paper-trading core', () => {
     expect(audit.records.filter((record) => record.event === 'previous_close_plan_backfilled')).toHaveLength(1);
   });
 
-  it('persists an uncertain instruction and never retries it automatically after an execution error', async () => {
+  it('restores pending after a retryable submission error and retries on the next window run', async () => {
     let now = new Date('2026-07-23T15:06:00+08:00');
     const store = new TestStateStore();
     const broker = new FailingBroker({ availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] });
@@ -640,13 +640,136 @@ describe('Node T+1 paper-trading core', () => {
     await service.runWindow('close', market);
 
     now = new Date('2026-07-24T09:31:00+08:00');
-    await expect(service.runWindow('open', market)).rejects.toThrow('AppleScript 回查超时');
+    const firstRun = await service.runWindow('open', market);
+    expect(firstRun.status).toBe('completed');
     expect(broker.attempts).toBe(1);
-    expect((await service.getRuntimeState()).instructions[0]).toMatchObject({ status: 'uncertain' });
+    const instruction = (await service.getRuntimeState()).instructions[0];
+    expect(instruction).toMatchObject({
+      status: 'pending',
+      broker_status: expect.stringContaining('上次提交失败'),
+    });
 
     const restarted = new PaperTradingService(broker, { stateStore: store, now: () => now });
-    await expect(restarted.runWindow('open', market)).rejects.toThrow('提交结果不确定');
-    expect(broker.attempts).toBe(1);
+    await expect(restarted.runWindow('open', market)).resolves.toMatchObject({ status: 'completed' });
+    expect(broker.attempts).toBe(2);
+  });
+
+  it('normalizes legacy retryable uncertain instructions when state is loaded', async () => {
+    const store = new TestStateStore();
+    store.state = {
+      ...defaultState('2026-07-29 09:00:00'),
+      instructions: [{
+        id: 'legacy-uncertain',
+        side: 'sell',
+        stock_code: '600722',
+        stock_name: '金牛化工',
+        signal_date: '20260728',
+        signal_price: 9.26,
+        quantity: 1200,
+        reason: '止损信号 -19.34%；次日开盘卖出',
+        execution_window: 'open',
+        status: 'uncertain',
+        created_at: '2026-07-28 23:35:59',
+        submitted_at: '2026-07-29 10:42:22',
+        broker_status: '提交结果不确定：未识别到“确定卖出”按钮，界面结构可能已变化 (-2700)',
+      }],
+    };
+    const broker = new FlowBroker({ availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] });
+    const service = new PaperTradingService(broker, {
+      stateStore: store,
+      now: () => new Date('2026-07-29T10:00:00+08:00'),
+    });
+    expect((await service.getRuntimeState()).instructions[0]).toMatchObject({
+      status: 'pending',
+      submitted_at: undefined,
+      broker_status: expect.stringContaining('上次提交失败'),
+    });
+  });
+
+  it('reconciles stale uncertain sells back to pending when Tonghuashun has no matching order', async () => {
+    const now = new Date('2026-07-24T09:31:00+08:00');
+    const store = new TestStateStore();
+    const broker = new FlowBroker({
+      availableCash: 100_000,
+      totalAssets: 110_000,
+      positions: [{
+        stock_code: '600722',
+        stock_name: '金牛化工',
+        shares: 1200,
+        available_shares: 1200,
+        cost_price: 11.48,
+        current_price: 10.19,
+        market_value: 12228,
+        pnl_amount: -1500,
+        pnl_pct: -11,
+      }],
+      orders: [],
+    });
+    const service = new PaperTradingService(broker, { stateStore: store, now: () => now, enforceTradingWindows: false });
+    store.state = {
+      ...defaultState('2026-07-24 09:00:00'),
+      instructions: [{
+        id: 'sell-600722',
+        side: 'sell',
+        stock_code: '600722',
+        stock_name: '金牛化工',
+        signal_date: '20260723',
+        signal_price: 9.26,
+        quantity: 1200,
+        reason: '止损信号 -19.34%；次日开盘卖出',
+        execution_window: 'open',
+        status: 'uncertain',
+        created_at: '2026-07-23 15:05:00',
+        broker_status: '提交结果不确定：委托已提交但回查失败：600722',
+      }],
+      tracked_positions: [{
+        stock_code: '600722',
+        stock_name: '金牛化工',
+        entry_date: '20260720',
+        entry_price: 11.48,
+        shares: 1200,
+        source: 'strategy',
+      }],
+    };
+    await service.monitorAccount('trace-reconcile', 'test_reconcile');
+    expect((await service.getRuntimeState()).instructions[0]).toMatchObject({
+      status: 'pending',
+      broker_status: '同花顺无对应委托，已恢复待执行',
+    });
+  });
+
+  it('does not duplicate close signals when the close window is run twice on the same day', async () => {
+    const now = new Date('2026-07-23T15:06:00+08:00');
+    const store = new TestStateStore();
+    const broker = new FlowBroker({
+      availableCash: 100_000,
+      totalAssets: 100_000,
+      positions: [{
+        stock_code: '600101',
+        stock_name: '测试乙',
+        shares: 1000,
+        available_shares: 1000,
+        cost_price: 10,
+        current_price: 9,
+        market_value: 9000,
+        pnl_amount: -1000,
+        pnl_pct: -10,
+      }],
+      orders: [],
+    });
+    const service = new PaperTradingService(broker, { stateStore: store, now: () => now, enforceTradingWindows: false });
+    const market = context('20260723', [ranking('600001', '测试甲', 80)], ['20260723', '20260724']);
+
+    await service.runWindow('close', market);
+    const firstCount = (await service.getRuntimeState()).instructions.length;
+    const state = await service.getRuntimeState();
+    state.completed_windows = {};
+    await store.save(state);
+    await service.runWindow('close', market);
+    const secondCount = (await service.getRuntimeState()).instructions.length;
+
+    expect(firstCount).toBeGreaterThan(0);
+    expect(secondCount).toBe(firstCount);
   });
 
   it('fails closed before AppleScript execution when the pre-order audit record cannot be persisted', async () => {
@@ -661,7 +784,7 @@ describe('Node T+1 paper-trading core', () => {
     now = new Date('2026-07-24T09:31:00+08:00');
     await expect(service.runWindow('open', market)).rejects.toThrow('审计日志目录不可写');
     expect(broker.placed).toHaveLength(0);
-    expect((await service.getRuntimeState()).instructions[0]).toMatchObject({ status: 'submitting' });
+    expect((await service.getRuntimeState()).instructions[0]).toMatchObject({ status: 'pending' });
   });
 
   it('records semantic Tonghuashun account changes for monitoring and diagnosis', async () => {
