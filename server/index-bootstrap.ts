@@ -27,30 +27,64 @@ export function shanghaiIndexHistoryStartThreshold(now = new Date()): string {
   return `${year}${get('month')}${get('day')}`;
 }
 
+// ── 模块级日历缓存 ──────────────────────────────────────
+// 节假日数据硬编码且年内不变，一次生成即可覆盖全年；
+// 仅在跨年或首次调用时重新计算，日常运行直接复用缓存。
+let cachedCalendar: string[] | null = null;
+/** 缓存覆盖到的最后日期（YYYYMMDD），用于判断缓存是否仍有效。 */
+let cachedValidUntil = '';
+
 /**
- * 基于硬编码的节假日数据，生成覆盖过去 3 年到当前日期（含未来约 30 天）的交易日序列。
- * 不再依赖上证指数 K 线数据。
+ * 获取或构建交易日历（带缓存）。
+ * 首次调用生成从 3 年前到当年末 + 30 天的完整日历并缓存；
+ * 后续调用若当天仍在缓存覆盖范围内，直接返回缓存，不再重算。
  */
-export function loadTradingCalendar(_store?: DataStore): Promise<string[]> {
-  const now = shanghaiClock(new Date());
+function getOrBuildCalendar(): string[] {
+  const today = compactDate(new Date()).slice(0, 8);
+
+  // 缓存命中：今天仍在覆盖范围内
+  if (cachedCalendar && cachedCalendar.length > 0 && today <= cachedValidUntil) {
+    return cachedCalendar;
+  }
+
+  // 缓存未命中：重新生成到当年末 + 30 天
   const earliest = shanghaiIndexHistoryStartThreshold();
-  // 往后多生成 30 天，避免跨年/月底时日历不够用
+  const shanghaiNow = shanghaiClock(new Date());
+  const currentYear = Number(shanghaiNow.date.slice(0, 4));
+  // 当年末 + 30 天缓冲，确保跨年/月底时日历够用
+  const bufferEnd = new Date(currentYear + 1, 0, 30); // 次年 1 月 30 日
   const endParts = new Intl.DateTimeFormat('zh-CN', {
     timeZone: 'Asia/Shanghai',
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
-  }).formatToParts(new Date(Date.now() + 30 * 86_400_000));
+  }).formatToParts(bufferEnd);
   const get = (type: Intl.DateTimeFormatPartTypes) => endParts.find((item) => item.type === type)?.value ?? '';
   const endDate = `${get('year')}${get('month')}${get('day')}`;
 
-  const calendar = buildTradingCalendar(earliest, endDate);
-  return Promise.resolve(calendar);
+  cachedCalendar = buildTradingCalendar(earliest, endDate);
+  cachedValidUntil = endDate;
+  return cachedCalendar;
+}
+
+/** 清除日历缓存（仅用于测试）。 */
+export function clearCalendarCache(): void {
+  cachedCalendar = null;
+  cachedValidUntil = '';
+}
+
+/**
+ * 基于硬编码的节假日数据，生成覆盖过去 3 年到当年末的交易日序列。
+ * 结果已缓存，年内多次调用不会重复计算。
+ */
+export function loadTradingCalendar(_store?: DataStore): Promise<string[]> {
+  return Promise.resolve(getOrBuildCalendar());
 }
 
 /**
  * 基于节假日数据刷新交易日历（不再依赖上证指数 K 线）。
  * 自动化交易运行期间定期调用，与旧版 refreshShanghaiIndexTradingCalendar 签名兼容。
+ * 结果已缓存，年内多次调用直接复用，仅首次或跨年时打印日志。
  */
 export function refreshTradingCalendar(_store?: DataStore): Promise<{
   calendar: string[];
@@ -59,13 +93,14 @@ export function refreshTradingCalendar(_store?: DataStore): Promise<{
   todayIncluded: boolean;
 }> {
   const today = compactDate(new Date()).slice(0, 8);
-  const calendar = buildTradingCalendar(
-    shanghaiIndexHistoryStartThreshold(),
-    today,
-  );
+  const wasCached = cachedCalendar !== null && today <= cachedValidUntil;
+  const calendar = getOrBuildCalendar();
   const latestDay = calendar.at(-1) ?? '';
   const todayIncluded = calendar.includes(today);
-  console.log(`[market-date] 交易日历已刷新至 ${latestDay}（共 ${calendar.length} 个交易日，节假日数据源）`);
+  // 仅在首次生成或跨年重新计算时打印，避免日常刷新刷屏
+  if (!wasCached) {
+    console.log(`[market-date] 交易日历已生成至 ${cachedValidUntil}（共 ${calendar.length} 个交易日，节假日数据源，年内缓存）`);
+  }
   return Promise.resolve({ calendar, inserted: 0, latestDay, todayIncluded });
 }
 

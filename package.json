@@ -10,6 +10,7 @@
     "dev:web": "vite",
     "build": "tsc -b && vite build",
     "start": "NODE_ENV=production tsx server/index.ts",
+    "ths-lifecycle": "tsx scripts/ths-lifecycle.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },

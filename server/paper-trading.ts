@@ -1225,13 +1225,33 @@ export class PaperTradingService extends EventEmitter {
       if (!missedExecutionDay) continue;
       instruction.status = 'expired';
       instruction.completed_at = clock.timestamp;
-      instruction.reason = `${instruction.reason}；${displayDate(executionDate)} ${executionWindowLabel(instruction.execution_window ?? 'open')}计划当日未执行，已过期`;
+      const windowLabel = executionWindowLabel(instruction.execution_window ?? 'open');
+      const failureReason = this.findWindowFailureReason(state, executionDate, instruction.execution_window ?? 'open');
+      instruction.reason = failureReason
+        ? `${instruction.reason}；${displayDate(executionDate)} ${windowLabel}计划当日未执行，已过期（${failureReason}）`
+        : `${instruction.reason}；${displayDate(executionDate)} ${windowLabel}计划当日未执行，已过期`;
       expired += 1;
     }
     if (expired > 0) {
       this.recordEvent(state, 'system', 'plans_expired', `${expired} 个当日未执行计划已置为过期`);
     }
     return expired;
+  }
+
+  private findWindowFailureReason(
+    state: PaperTradingRuntimeState,
+    executionDate: string,
+    executionWindow: PlanExecutionWindow,
+  ): string | null {
+    const failures = state.events.filter(
+      (event) => event.type === 'window_failed'
+        && event.trading_date === executionDate
+        && event.window === executionWindow,
+    );
+    if (failures.length === 0) return null;
+    // Take the last failure message and summarize it
+    const lastFailure = failures.at(-1)!;
+    return summarizeSubmissionError(lastFailure.message, 120);
   }
 
   private initializeCapital(state: PaperTradingRuntimeState, snapshot: SimulatedAccountSnapshot) {

@@ -1,5 +1,6 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  clearCalendarCache,
   ensureShanghaiIndexHistory,
   isShanghaiIndexHistorySufficient,
   latestTradingDayOnOrBefore,
@@ -7,6 +8,10 @@ import {
   SHANGHAI_INDEX_MIN_TRADING_DAYS,
   shanghaiIndexHistoryStartThreshold,
 } from '../server/index-bootstrap.js';
+
+afterEach(() => {
+  clearCalendarCache();
+});
 
 describe('market dates and Shanghai index bootstrap', () => {
   it('picks the latest trading day on or before the ceiling date', () => {

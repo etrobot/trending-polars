@@ -14,7 +14,7 @@ import { api, pctColor } from '../lib/api';
 import type { AnalysisData, SectorStock, SectorStocksResponse } from '../types';
 import { useTasks } from '../context/TasksContext';
 
-type StockSort = 'name' | 'continue_num' | 'change_rate';
+type StockSort = 'name' | 'continue_num' | 'change_rate' | 'kline_latest';
 
 export function DetailsPage() {
   const navigate = useNavigate();
@@ -192,14 +192,15 @@ export function DetailsPage() {
         </div>} />
         <div className="table-scroll">
           <table className="data-table min-w-[760px]">
-            <thead><tr><th className="w-16 text-center">#</th><th><SortButton field="name">股票名称</SortButton></th><th className="text-center"><SortButton field="continue_num">连板</SortButton></th><th className="text-right"><SortButton field="change_rate">涨幅</SortButton></th><th>涨停原因</th></tr></thead>
+            <thead><tr><th className="w-16 text-center">#</th><th><SortButton field="name">股票名称</SortButton></th><th className="text-center"><SortButton field="continue_num">连板</SortButton></th><th className="text-right"><SortButton field="kline_latest">最新价</SortButton></th><th className="text-right"><SortButton field="change_rate">涨幅</SortButton></th><th>涨停原因</th></tr></thead>
             <tbody>
-              {sectorStocksLoading && stocks.length === 0 ? <tr><td colSpan={5}><EmptyState title="正在载入板块个股…" description="从数据库累积记录中读取。" /></td></tr>
-                : stocks.length === 0 ? <tr><td colSpan={5}><EmptyState title="没有匹配个股" description="换一个关键词试试。" /></td></tr> : stocks.map((stock, index) => (
+              {sectorStocksLoading && stocks.length === 0 ? <tr><td colSpan={6}><EmptyState title="正在载入板块个股…" description="从数据库累积记录中读取。" /></td></tr>
+                : stocks.length === 0 ? <tr><td colSpan={6}><EmptyState title="没有匹配个股" description="换一个关键词试试。" /></td></tr> : stocks.map((stock, index) => (
                 <tr key={`${stock.code}-${index}`}>
                   <td className="text-center font-mono text-xs text-muted">{String(index + 1).padStart(2, '0')}</td>
                   <td><div className="font-semibold text-ink">{stock.name}</div><div className="mt-0.5 font-mono text-[11px] text-muted">{stock.code}</div></td>
                   <td className="text-center"><span className="bg-primary/10 px-2 py-0.5 font-mono text-[11px] text-primary-deep" style={{ borderRadius: 2 }}>{stock.continue_num ?? 1} 板</span></td>
+                  <td className="text-right font-mono text-xs text-ink">{stock.price_fresh && stock.kline_latest != null ? Number(stock.kline_latest).toFixed(2) : '—'}</td>
                   <td className="text-right">{renderPriceCell(stock)}</td>
                   <td className="max-w-md whitespace-normal"><span className="line-clamp-2 text-xs leading-5 text-body">{stock.reason_type ?? '—'}</span></td>
                 </tr>
