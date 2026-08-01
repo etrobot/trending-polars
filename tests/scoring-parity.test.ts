@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { benchmarkReturns, computeBacktestScores } from '../server/backtest-scoring.js';
 import {
+  analyzeBlockTrend,
   computeADX,
   classifyMarketState,
   compareByScore,
@@ -72,6 +73,9 @@ describe('实盘 scoreStock 与向量化 computeBacktestScores 口径一致', ()
         expect(`${label} rs=${vector.relative_strength_score}`).toBe(`${label} rs=${live.relative_strength_score}`);
         expect(`${label} rsLabel=${vector.relative_strength_label}`).toBe(`${label} rsLabel=${live.relative_strength_label}`);
         expect(`${label} rsPct=${vector.relative_strength_pct}`).toBe(`${label} rsPct=${live.relative_strength_pct}`);
+        expect(`${label} context=${vector.sector_strategy_score}`).toBe(`${label} context=${live.sector_strategy_score}`);
+        expect(`${label} contextLabel=${vector.sector_strategy_label}`).toBe(`${label} contextLabel=${live.sector_strategy_label}`);
+        expect(`${label} contextReason=${vector.sector_strategy_reason}`).toBe(`${label} contextReason=${live.sector_strategy_reason}`);
         expect(`${label} total=${vector.total_score}`).toBe(`${label} total=${live.total_score}`);
       }
     }
@@ -97,6 +101,52 @@ describe('实盘 scoreStock 与向量化 computeBacktestScores 口径一致', ()
     const vector = (computeBacktestScores(scoped, [date], new Map()).get(date) ?? [])[0];
     expect(live.trend_strength).toBe(0);
     expect(vector.trend_score).toBe(live.trend_score);
+  });
+
+  it('keeps contextual sector-strategy adjustments identical when a sector state is available', () => {
+    const history = historicalFixture();
+    const targetDate = history.calendar.at(-1)!;
+    const sectorBars = history.stocks.find((stock) => stock.stock_code === '600004')!.bars;
+    const sectorCode = '881145';
+    const sectorDate = history.calendar[20];
+    const scoped = {
+      ...history,
+      blocks: [{ block_code: sectorCode, block_name: '下跌样本板块', bars: sectorBars }],
+      limit_up_records: [{
+        date: sectorDate,
+        stock_code: '600001',
+        stock_name: '历史样本甲',
+        sector_code: sectorCode,
+        sector_name: '下跌样本板块',
+      }],
+    };
+    const exactLimitUps = new Map([['600001', new Set([sectorDate])]]);
+    const vector = (computeBacktestScores(scoped, [targetDate], exactLimitUps).get(targetDate) ?? [])
+      .find((row) => row.stock_code === '600001')!;
+    const blockBars: Bar[] = sectorBars.map((bar) => ({
+      date: bar[0], open: bar[1], close: bar[2], high: bar[3], low: bar[4],
+      volume: bar[5], amount: bar[6], changePct: bar[7],
+    }));
+    const state = analyzeBlockTrend(blockBars);
+    expect(state.state_id).toBe(6);
+    const live = scoreStock(
+      prepareSeries(scoped.stocks.find((stock) => stock.stock_code === '600001')!),
+      targetDate,
+      {
+        stateId: state.state_id,
+        trend: 'down',
+        trendName: state.state_name,
+        code: sectorCode,
+        name: '下跌样本板块',
+        limitUpDates: exactLimitUps.get('600001'),
+        benchmarkReturnPct: benchmarkReturns(scoped, DEFAULT_SCORE_STOCK_CONFIG.relativeStrength.lookback).get(targetDate),
+      },
+    )!;
+    expect(vector.sector_strategy_score).toBe(8);
+    expect(vector.sector_strategy_score).toBe(live.sector_strategy_score);
+    expect(vector.sector_strategy_label).toBe(live.sector_strategy_label);
+    expect(vector.sector_strategy_reason).toBe(live.sector_strategy_reason);
+    expect(vector.total_score).toBe(live.total_score);
   });
 });
 

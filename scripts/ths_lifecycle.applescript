@@ -15,14 +15,34 @@ on run argv
 		return my launchFlow()
 	else if commandName is "quit" then
 		return my quitThs()
+	else if commandName is "probe" then
+		return my probeThs()
 	else
 		error my usageText()
 	end if
 end run
 
 on usageText()
-	return "用法：launch-flow | quit"
+	return "用法：launch-flow | quit | probe"
 end usageText
+
+-- ---------------------------------------------------------------------------
+-- probe：只读探测，不碰任何控件
+-- ---------------------------------------------------------------------------
+-- 光看进程不够：同花顺进程活着但窗口数为 0 时（最小化到 Dock、在其它 Space、
+-- 屏幕锁定）下单脚本一样会失败，所以窗口数才是"可用"的判据。
+
+on probeThs()
+	tell application "System Events"
+		if not (exists process "同花顺") then return "THS_PROBE|running=false|windows=0"
+		try
+			set windowCount to count of windows of process "同花顺"
+		on error
+			return "THS_PROBE|running=true|windows=0"
+		end try
+		return "THS_PROBE|running=true|windows=" & windowCount
+	end tell
+end probeThs
 
 -- ---------------------------------------------------------------------------
 -- launch-flow

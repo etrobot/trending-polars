@@ -6,6 +6,7 @@ import type {
   RankingSummary,
 } from '../src/types.js';
 import { formatDateTime, round } from './format.js';
+import { DEFAULT_SCORE_STOCK_CONFIG, totalScoreFromRaw } from './scoring-engine.js';
 
 const SORTABLE_FIELDS = new Set([
   'rank',
@@ -22,6 +23,7 @@ const SORTABLE_FIELDS = new Set([
   'volume_score',
   'position_score',
   'volatility_trend_score',
+  'sector_strategy_score',
 ]);
 
 function rankingFrame(rows: RankingRow[]) {
@@ -37,6 +39,7 @@ function rankingFrame(rows: RankingRow[]) {
     volume_score: Number(row.volume_score ?? row.volume_price_score ?? 0),
     position_score: Number(row.position_score ?? 0),
     volatility_trend_score: Number(row.volatility_trend_score ?? row.momentum_score ?? 0),
+    sector_strategy_score: Number(row.sector_strategy_score ?? 0),
     continue_num: Number(row.continue_num ?? 0),
     latest_price: row.latest_price == null ? null : Number(row.latest_price),
     latest_change_rate: row.latest_change_rate == null ? null : Number(row.latest_change_rate),
@@ -123,7 +126,13 @@ export function recomputeRanking(source: { timestamp: string; date: string; tota
     const volumePrice = Number(row.volume_price_score ?? row.volume_score ?? 0);
     const position = Number(row.position_score ?? 0);
     const volatilityTrend = Number(row.volatility_trend_score ?? 0);
-    const totalScore = round(trend + volumePrice + position + volatilityTrend, 1);
+    const relativeStrength = Number(
+      row.relative_strength_score ?? DEFAULT_SCORE_STOCK_CONFIG.relativeStrength.maxScore / 2,
+    );
+    const totalScore = totalScoreFromRaw(
+      trend + volumePrice + position + volatilityTrend + relativeStrength,
+      Number(row.sector_strategy_score ?? 0),
+    );
     return { ...row, total_score: totalScore };
   });
   const ranked = rankingFrame(rescored)

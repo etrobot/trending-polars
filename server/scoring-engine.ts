@@ -359,6 +359,66 @@ export interface RelativeStrengthConfig {
   maxScore: number;
 }
 
+/**
+ * 板块趋势 × 个股形态的情境修正。
+ *
+ * 这不是第六个基础因子：五维基础分仍先归一化到 100 分，随后再应用该修正。
+ * 因此这里的分值就是最终总分上的“百分点”，风险扣分也不会被因子权重稀释。
+ */
+export interface SectorStrategyConfig {
+  scores: {
+    /** 下跌板块中形成稳定独立上行趋势。 */
+    crossingTrendBonus: number;
+    /** 前期强势股进入多日超跌/恐慌极点。 */
+    formerStrongPanicBonus: number;
+    /** 无前强证据但已到恐慌极点。 */
+    panicExtremeBonus: number;
+    /** 筑底成功阶段放量创前高。 */
+    bottomingBreakoutBonus: number;
+    /** 上升板块内稳定顺势、但没有追高风险。 */
+    followTrendBonus: number;
+    /** 下跌板块中的暴力反弹。必须为负数。 */
+    violentReboundPenalty: number;
+    /** 强势/高位板块中放量创前高。必须为负数。 */
+    strongMarketBreakoutPenalty: number;
+    /** 下跌板块中没有稳定结构的一般逆势反弹。必须为负数。 */
+    ordinaryCountertrendPenalty: number;
+  };
+  stableTrend: {
+    minStrength: number;
+    minReturn20Pct: number;
+    maxReturn20Pct: number;
+    minReturn5Pct: number;
+    maxReturn5Pct: number;
+    minPositiveDays10: number;
+    maxVolatility10Pct: number;
+  };
+  breakout: {
+    lookback: number;
+    minVolumeRatio20: number;
+  };
+  panic: {
+    maxReturn5Pct: number;
+    maxReturn10Pct: number;
+    maxDayReturnPct: number;
+    minVolumeRatio20: number;
+    formerStrongMinLimitUps60d: number;
+  };
+  rebound: {
+    minDayReturnPct: number;
+    minReturn3Pct: number;
+    minReturn5Pct: number;
+    /** 急拉后仍低于前高至少该幅度，才视为“反弹”而非趋势突破。 */
+    maxDistanceFromHighPct: number;
+    ordinaryMinReturn5Pct: number;
+  };
+  caps: {
+    maxBonus: number;
+    minPenalty: number;
+  };
+  enabled: boolean;
+}
+
 /** 八态分类的阈值参数；供参数优化与测试覆盖。 */
 export interface MarketStateThresholds {
   /** trendStrength（线性回归斜率/均价）超过此值视为上升。 */
@@ -422,6 +482,7 @@ export interface ScoreStockConfig {
   trend: TrendScoreConfig;
   volatilityTrend: VolatilityTrendConfig;
   relativeStrength: RelativeStrengthConfig;
+  sectorStrategy: SectorStrategyConfig;
   /**
    * 八态分类阈值。挂在 ScoreStockConfig 上是为了复用既有的
    * 配置 → SQLite → 回测/实盘两条打分路径的传递链路，而不是再造一套。
@@ -471,6 +532,50 @@ export const DEFAULT_SCORE_STOCK_CONFIG: Readonly<ScoreStockConfig> = Object.fre
     capPct: 25,
     maxScore: 20,
   },
+  sectorStrategy: {
+    enabled: true,
+    scores: {
+      crossingTrendBonus: 8,
+      formerStrongPanicBonus: 8,
+      panicExtremeBonus: 5,
+      bottomingBreakoutBonus: 8,
+      followTrendBonus: 2,
+      violentReboundPenalty: -10,
+      strongMarketBreakoutPenalty: -10,
+      ordinaryCountertrendPenalty: -4,
+    },
+    stableTrend: {
+      minStrength: 0.0015,
+      minReturn20Pct: 3,
+      maxReturn20Pct: 24,
+      minReturn5Pct: -1,
+      maxReturn5Pct: 8,
+      minPositiveDays10: 6,
+      maxVolatility10Pct: 3.5,
+    },
+    breakout: {
+      lookback: 60,
+      minVolumeRatio20: 1.5,
+    },
+    panic: {
+      maxReturn5Pct: -10,
+      maxReturn10Pct: -15,
+      maxDayReturnPct: -7,
+      minVolumeRatio20: 1.3,
+      formerStrongMinLimitUps60d: 1,
+    },
+    rebound: {
+      minDayReturnPct: 6,
+      minReturn3Pct: 12,
+      minReturn5Pct: 16,
+      maxDistanceFromHighPct: -8,
+      ordinaryMinReturn5Pct: 2,
+    },
+    caps: {
+      maxBonus: 10,
+      minPenalty: -12,
+    },
+  },
   marketState: DEFAULT_MARKET_STATE_THRESHOLDS,
 });
 
@@ -500,6 +605,16 @@ export function normalizeScoreStockConfig(overrides?: DeepPartial<ScoreStockConf
       },
     },
     relativeStrength: { ...base.relativeStrength, ...overrides?.relativeStrength },
+    sectorStrategy: {
+      ...base.sectorStrategy,
+      ...overrides?.sectorStrategy,
+      scores: { ...base.sectorStrategy.scores, ...overrides?.sectorStrategy?.scores },
+      stableTrend: { ...base.sectorStrategy.stableTrend, ...overrides?.sectorStrategy?.stableTrend },
+      breakout: { ...base.sectorStrategy.breakout, ...overrides?.sectorStrategy?.breakout },
+      panic: { ...base.sectorStrategy.panic, ...overrides?.sectorStrategy?.panic },
+      rebound: { ...base.sectorStrategy.rebound, ...overrides?.sectorStrategy?.rebound },
+      caps: { ...base.sectorStrategy.caps, ...overrides?.sectorStrategy?.caps },
+    },
     marketState: { ...base.marketState, ...overrides?.marketState },
   };
 }
@@ -668,6 +783,238 @@ export function relativeStrengthScore(
   return { score: round(ratio * maxScore, 1), label, excessPct: round(excess, 2) };
 }
 
+// ---- 板块趋势 × 个股形态情境修正（最终总分 ±）------------------------------
+
+export interface SectorStrategyFeatures {
+  dayReturnPct: number | null;
+  return3Pct: number | null;
+  return5Pct: number | null;
+  return10Pct: number | null;
+  return20Pct: number | null;
+  volumeRatio20: number;
+  distanceFromHighPct: number;
+  breakout: boolean;
+  positiveDays10: number;
+  volatility10Pct: number;
+  ma5: number | null;
+  ma10: number | null;
+  ma20: number | null;
+  trendStrength: number;
+  limitUpCount60d: number;
+}
+
+export interface SectorStrategyAdjustment {
+  /** 应用到归一化后总分的最终修正。 */
+  score: number;
+  /** 风险扣分；没有风险信号时为 0。 */
+  riskPenalty: number;
+  /** 机会加分；风险信号触发时强制为 0。 */
+  opportunityBonus: number;
+  label: string;
+  reason: string;
+}
+
+function priceReturns(bars: Bar[], endIndex: number, lookback: number): number[] {
+  const start = Math.max(1, endIndex - lookback + 1);
+  const values: number[] = [];
+  for (let index = start; index <= endIndex; index += 1) {
+    const previous = bars[index - 1].close;
+    if (previous > 0) values.push((bars[index].close - previous) / previous * 100);
+  }
+  return values;
+}
+
+/**
+ * 提取情境修正所需的全部形态特征。只读取 endIndex 及之前的 K 线。
+ *
+ * 放量新高使用“当日量 / 前 20 日均量”与“收盘突破此前 N 日最高价”，
+ * 避免把包含当日的 5 日均量拿来判断单日突破而稀释信号。
+ */
+export function sectorStrategyFeatures(
+  bars: Bar[],
+  endIndex: number,
+  limitUpDates: ReadonlySet<string> = new Set(),
+  config: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
+): SectorStrategyFeatures {
+  const latest = bars[endIndex];
+  const priorVolumeStart = Math.max(0, endIndex - 20);
+  const priorVolumes = bars.slice(priorVolumeStart, endIndex).map((bar) => bar.volume).filter((value) => value > 0);
+  const priorAverageVolume = average(priorVolumes);
+  const volumeRatio20 = priorAverageVolume > 0 && latest?.volume > 0 ? latest.volume / priorAverageVolume : 1;
+  const breakoutLookback = Math.max(1, Math.trunc(config.sectorStrategy.breakout.lookback));
+  const priorHighs = bars.slice(Math.max(0, endIndex - breakoutLookback), endIndex).map((bar) => bar.high);
+  const priorHigh = priorHighs.length ? Math.max(...priorHighs) : latest?.high ?? 0;
+  const distanceFromHighPct = priorHigh > 0 && latest
+    ? (latest.close - priorHigh) / priorHigh * 100
+    : 0;
+  const returns10 = priceReturns(bars, endIndex, 10);
+  return {
+    dayReturnPct: returnOverWindow(bars, endIndex, 1),
+    return3Pct: returnOverWindow(bars, endIndex, 3),
+    return5Pct: returnOverWindow(bars, endIndex, 5),
+    return10Pct: returnOverWindow(bars, endIndex, 10),
+    return20Pct: returnOverWindow(bars, endIndex, 20),
+    volumeRatio20: round(volumeRatio20, 3),
+    distanceFromHighPct: round(distanceFromHighPct, 2),
+    breakout: Boolean(latest && priorHighs.length && latest.close > priorHigh),
+    positiveDays10: returns10.filter((value) => value > 0).length,
+    volatility10Pct: round(standardDeviation(returns10), 3),
+    ma5: movingAverage(bars, endIndex, 5),
+    ma10: movingAverage(bars, endIndex, 10),
+    ma20: movingAverage(bars, endIndex, 20),
+    trendStrength: trendStrength(bars, endIndex),
+    limitUpCount60d: limitUpCount(bars, endIndex, limitUpDates, 60),
+  };
+}
+
+function signedPct(value: number | null): string {
+  if (value == null || !Number.isFinite(value)) return '样本不足';
+  return `${value >= 0 ? '+' : ''}${round(value, 1)}%`;
+}
+
+function neutralSectorStrategy(): SectorStrategyAdjustment {
+  return {
+    score: 0,
+    riskPenalty: 0,
+    opportunityBonus: 0,
+    label: '无情境修正',
+    reason: '',
+  };
+}
+
+/**
+ * 板块趋势 × 个股形态策略矩阵。
+ *
+ * 关键约束：风险信号先判定并直接返回，机会分不得抵消追高或暴力反弹风险。
+ * 这样“风险减分优先”是代码结构保证，而不是仅靠扣分绝对值碰巧更大。
+ */
+export function sectorStrategyAdjustment(
+  features: SectorStrategyFeatures,
+  context: { stateId?: number; trend?: TrendAxis } = {},
+  config: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
+): SectorStrategyAdjustment {
+  const strategy = config.sectorStrategy;
+  if (!strategy.enabled) return neutralSectorStrategy();
+  const stateId = context.stateId;
+  const hasExactState = stateId != null && stateId >= 1 && stateId <= 8;
+  const downMarket = stateId === 6 || stateId === 7 || (!hasExactState && context.trend === 'down');
+  const strongMarket = stateId === 1 || stateId === 2 || (!hasExactState && context.trend === 'up');
+  const followMarket = stateId === 1 || stateId === 3 || (!hasExactState && context.trend === 'up');
+  const bottomingMarket = stateId === 8;
+  const stateName = marketStateName(stateId);
+  const marketLabel = stateName ?? (context.trend === 'down' ? '下跌板块' : context.trend === 'up' ? '上升板块' : '板块趋势缺失');
+
+  const { stableTrend, breakout, panic, rebound, scores, caps } = strategy;
+  const bullishStructure = features.ma5 != null && features.ma10 != null && features.ma20 != null
+    && features.ma5 > features.ma10 && features.ma10 > features.ma20;
+  const stableIndependentTrend = bullishStructure
+    && features.trendStrength >= stableTrend.minStrength
+    && features.return20Pct != null
+    && features.return20Pct >= stableTrend.minReturn20Pct
+    && features.return20Pct <= stableTrend.maxReturn20Pct
+    && features.return5Pct != null
+    && features.return5Pct >= stableTrend.minReturn5Pct
+    && features.return5Pct <= stableTrend.maxReturn5Pct
+    && features.positiveDays10 >= stableTrend.minPositiveDays10
+    && features.volatility10Pct <= stableTrend.maxVolatility10Pct;
+  const volumeBreakout = features.breakout && features.volumeRatio20 >= breakout.minVolumeRatio20;
+  const panicExtreme = (features.return5Pct != null && features.return5Pct <= panic.maxReturn5Pct)
+    || (features.return10Pct != null && features.return10Pct <= panic.maxReturn10Pct)
+    || (features.dayReturnPct != null
+      && features.dayReturnPct <= panic.maxDayReturnPct
+      && features.volumeRatio20 >= panic.minVolumeRatio20);
+  const formerStrong = features.limitUpCount60d >= panic.formerStrongMinLimitUps60d;
+  const violentRebound = features.distanceFromHighPct <= rebound.maxDistanceFromHighPct
+    && ((features.dayReturnPct != null && features.dayReturnPct >= rebound.minDayReturnPct)
+      || (features.return3Pct != null && features.return3Pct >= rebound.minReturn3Pct)
+      || (features.return5Pct != null && features.return5Pct >= rebound.minReturn5Pct));
+  const ordinaryCountertrend = !stableIndependentTrend
+    && !panicExtreme
+    && features.return5Pct != null
+    && features.return5Pct >= rebound.ordinaryMinReturn5Pct;
+
+  const risk = (penalty: number, label: string, reason: string): SectorStrategyAdjustment => {
+    const score = Math.max(Math.min(0, caps.minPenalty), Math.min(0, penalty));
+    return { score, riskPenalty: score, opportunityBonus: 0, label, reason };
+  };
+  const opportunity = (bonus: number, label: string, reason: string): SectorStrategyAdjustment => {
+    const score = Math.min(Math.max(0, caps.maxBonus), Math.max(0, bonus));
+    return { score, riskPenalty: 0, opportunityBonus: score, label, reason };
+  };
+
+  // 风险优先：一旦命中，下面的穿越趋势/恐慌极点机会分不再参与抵消。
+  if (strongMarket && volumeBreakout) {
+    return risk(
+      scores.strongMarketBreakoutPenalty,
+      '强势行情放量新高',
+      `${marketLabel}中收盘创${breakout.lookback}日新高，单日量比${round(features.volumeRatio20, 2)}，追高风险优先`,
+    );
+  }
+  if (downMarket && violentRebound) {
+    return risk(
+      scores.violentReboundPenalty,
+      '下跌市暴力反弹',
+      `${marketLabel}中单日${signedPct(features.dayReturnPct)}、3日${signedPct(features.return3Pct)}，距前高${signedPct(features.distanceFromHighPct)}`,
+    );
+  }
+  if (downMarket && ordinaryCountertrend) {
+    return risk(
+      scores.ordinaryCountertrendPenalty,
+      '普通逆势反弹',
+      `${marketLabel}中5日${signedPct(features.return5Pct)}，但均线与持续性未形成稳定独立趋势`,
+    );
+  }
+
+  if (downMarket && stableIndependentTrend) {
+    return opportunity(
+      scores.crossingTrendBonus,
+      '穿越板块稳定上行',
+      `${marketLabel}中MA5>MA10>MA20，20日${signedPct(features.return20Pct)}、5日${signedPct(features.return5Pct)}，形成稳定独立趋势`,
+    );
+  }
+  if (downMarket && formerStrong && panicExtreme) {
+    return opportunity(
+      scores.formerStrongPanicBonus,
+      '前强股恐慌极点',
+      `前60日有${features.limitUpCount60d}次涨停事实，当前5日${signedPct(features.return5Pct)}、10日${signedPct(features.return10Pct)}`,
+    );
+  }
+  if (downMarket && panicExtreme) {
+    return opportunity(
+      scores.panicExtremeBonus,
+      '恐慌极点',
+      `${marketLabel}中5日${signedPct(features.return5Pct)}、10日${signedPct(features.return10Pct)}，进入多日超跌区`,
+    );
+  }
+  if (bottomingMarket && volumeBreakout) {
+    return opportunity(
+      scores.bottomingBreakoutBonus,
+      '筑底放量新高',
+      `筑底成功阶段收盘创${breakout.lookback}日新高，单日量比${round(features.volumeRatio20, 2)}，视为底部确认`,
+    );
+  }
+  if (followMarket && stableIndependentTrend) {
+    return opportunity(
+      scores.followTrendBonus,
+      '顺势稳定上行',
+      `${marketLabel}中20日${signedPct(features.return20Pct)}、5日${signedPct(features.return5Pct)}，趋势稳定且未出现追高信号`,
+    );
+  }
+  return neutralSectorStrategy();
+}
+
+/** 将板块情境分应用到任意已归一化的基础分，并限制在 0~100。 */
+export function applySectorStrategyScore(baseScore: number, adjustment: number | null | undefined): number {
+  const safeBase = Number.isFinite(baseScore) ? baseScore : 0;
+  const safeAdjustment = adjustment != null && Number.isFinite(adjustment) ? adjustment : 0;
+  return round(Math.max(0, Math.min(SCORE_SCALE, safeBase + safeAdjustment)), 1);
+}
+
+/** 五维原始分 → 100 分制基础分 → 板块情境修正。 */
+export function totalScoreFromRaw(rawScore: number, sectorStrategyScore = 0): number {
+  return applySectorStrategyScore(rawScore * SCORE_SCALE / RAW_SCORE_MAX, sectorStrategyScore);
+}
+
 
 // ---- 维度 3：距60日低点评分（0-20）----------------------------------------
 
@@ -699,7 +1046,7 @@ export function distanceTierForPct(distanceFromLowPct: number, config: ScoreStoc
   return distanceFromLowScore(distanceFromLowPct, config);
 }
 
-/** 打分时可传入板块趋势上下文，用于维度 1 板块加分与维度 4 的趋势轴。 */
+/** 打分时可传入板块趋势上下文，用于维度 1、维度 4 与最终板块情境修正。 */
 export interface SectorContext {
   trend?: TrendAxis;
   trendName?: string;
@@ -713,8 +1060,8 @@ export interface SectorContext {
 }
 
 /**
- * 个股五维评分：K线趋势(40) + 价量配合(25) + 距60日低点(20) + 波动率-趋势适配(15) + 相对强度(20)。
- * 原始满分 120，对外折算到 100 分制（见 SCORE_SCALE）。
+ * 个股五维基础评分：K线趋势(40) + 价量配合(25) + 距60日低点(20) + 波动率-趋势适配(15) + 相对强度(20)。
+ * 原始满分 120，先折算到 100 分制，再叠加“板块趋势 × 个股形态”情境修正。
  * 仅使用 date 当日及之前的 K 线，无未来数据。
  */
 export function scoreStock(
@@ -741,14 +1088,20 @@ export function scoreStock(
   const trendScore = trendScoreFromParts(alignment, strength, sector?.trend, config);
   const volumePrice = volumePriceScore(series.bars, endIndex);
   const fromLow = distanceFromLowScore(distanceFromLowPct, config);
-  const limitUps = limitUpCount(series.bars, endIndex, sector?.limitUpDates ?? new Set());
+  const exactLimitUpDates = sector?.limitUpDates ?? new Set<string>();
+  const limitUps = limitUpCount(series.bars, endIndex, exactLimitUpDates);
   const volatility = volatilityClassOf(limitUps, config);
   const volatilityTrend = volatilityTrendScore(volatility, trendAxis, config);
   const stockReturn = returnOverWindow(series.bars, endIndex, config.relativeStrength.lookback);
   const relativeStrength = relativeStrengthScore(stockReturn, sector?.benchmarkReturnPct, config);
+  const strategyFeatures = sectorStrategyFeatures(series.bars, endIndex, exactLimitUpDates, config);
+  const sectorStrategy = sectorStrategyAdjustment(strategyFeatures, {
+    stateId: sector?.stateId,
+    trend: sector?.trend,
+  }, config);
 
   const rawScore = trendScore + volumePrice.score + fromLow.score + volatilityTrend + relativeStrength.score;
-  const totalScore = round(rawScore * SCORE_SCALE / RAW_SCORE_MAX, 1);
+  const totalScore = totalScoreFromRaw(rawScore, sectorStrategy.score);
 
   return {
     rank: 0,
@@ -768,6 +1121,11 @@ export function scoreStock(
     relative_strength_score: relativeStrength.score,
     relative_strength_label: relativeStrength.label,
     relative_strength_pct: relativeStrength.excessPct,
+    sector_strategy_score: sectorStrategy.score,
+    sector_risk_penalty: sectorStrategy.riskPenalty,
+    sector_opportunity_bonus: sectorStrategy.opportunityBonus,
+    sector_strategy_label: sectorStrategy.label,
+    sector_strategy_reason: sectorStrategy.reason,
     limit_up_count_20d: limitUps,
     alignment,
     trend_strength: round(strength, 4),
@@ -877,6 +1235,10 @@ const STATE_TABLE: Record<number, StateTemplate> = {
   7: { state_id: 7, state_name: '恐慌暴跌', trend: '下跌', position: '0-1成', signal: 'empty' },
   8: { state_id: 8, state_name: '筑底成功', trend: '横盘', position: '1成', signal: 'buy' },
 };
+
+export function marketStateName(stateId: number | null | undefined): string | undefined {
+  return stateId == null ? undefined : STATE_TABLE[stateId]?.state_name;
+}
 
 function standardDeviation(values: number[]): number {
   if (values.length < 2) return 0;

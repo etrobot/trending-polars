@@ -56,6 +56,41 @@ describe('historical scoring and backtest timing', () => {
     expect(Math.max(...boosted.map((row) => row.total_score))).toBeLessThanOrEqual(100);
   });
 
+  it('applies the contextual adjustment after factor normalization without diluting it', () => {
+    const fixture = historicalFixture();
+    const date = fixture.calendar.at(-1)!;
+    const previousRows = fixture.stocks.map((stock, index) => ({
+      rank: index + 1,
+      stock_code: stock.stock_code,
+      stock_name: stock.stock_name,
+      total_score: 0,
+      trend_score: 0,
+      alignment: 'tangled',
+      sector_code: '881145',
+      sector_name: '下跌样本板块',
+    }));
+    const sectorTrends = sectorTrendLookupMap([{
+      sector_code: '881145',
+      sector_name: '下跌样本板块',
+      state_id: 6,
+      state_name: '阴跌不止',
+    }]);
+    const baseline = historicalCrossSectionRankings(fixture, date, previousRows, sectorTrends);
+    const boosted = historicalCrossSectionRankings(fixture, date, previousRows, sectorTrends, {
+      factorWeights: {
+        trendWeightPct: 150,
+        volumePriceWeightPct: 150,
+        distanceFromLowWeightPct: 150,
+        volatilityTrendWeightPct: 150,
+        relativeStrengthWeightPct: 150,
+      },
+    });
+    const crossing = baseline.find((row) => row.stock_code === '600001')!;
+    expect(crossing.sector_strategy_score).toBe(8);
+    expect(boosted.map((row) => ({ code: row.stock_code, score: row.total_score })))
+      .toEqual(baseline.map((row) => ({ code: row.stock_code, score: row.total_score })));
+  });
+
   it('parses real daily bars without inventing fields', () => {
     const bars = parseEastmoneyKlines([
       '2026-07-22,10.81,10.98,10.98,10.77,1029484,1120150607.17,1.94,1.29,0.14,0.53',

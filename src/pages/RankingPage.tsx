@@ -15,7 +15,7 @@ import { useTaskResult, useTasks } from '../context/TasksContext';
 import { api, pctColor } from '../lib/api';
 import type { RankingResponse, RankingRow, TaskSnapshot } from '../types';
 
-type SortKey = 'stock_name' | 'sector_name' | 'continue_num' | 'latest_price' | 'latest_change_rate' | 'distance_from_low_pct' | 'total_score' | 'trend_score' | 'momentum_score' | 'volume_score' | 'position_score' | 'volatility_trend_score';
+type SortKey = 'stock_name' | 'sector_name' | 'continue_num' | 'latest_price' | 'latest_change_rate' | 'distance_from_low_pct' | 'total_score' | 'sector_strategy_score' | 'trend_score' | 'momentum_score' | 'volume_score' | 'position_score' | 'volatility_trend_score';
 
 function ScoreBar({ value, max, tone = 'coral' }: { value: number; max: number; tone?: 'coral' | 'green' | 'amber' }) {
   const width = Math.min(100, Math.max(0, value / max * 100));
@@ -142,10 +142,11 @@ export function RankingPage() {
           {loading ? <LoadingPanel label="正在筛选与排序…" /> : error ? <EmptyState title="排行加载失败" description={error} /> : !data?.rankings.length ? <EmptyState title="没有匹配结果" description="调整搜索词或策略筛选条件。" /> : (
             <>
               <div className="overflow-auto bg-canvas">
-                <table className="data-table min-w-[1180px]">
-                  <thead><tr><SortHeader field="stock_name">股票名称</SortHeader><SortHeader field="sector_name">所属板块</SortHeader><th className="text-center">板块趋势</th><SortHeader field="continue_num" align="center">连板</SortHeader><SortHeader field="latest_price" align="right">现价</SortHeader><SortHeader field="latest_change_rate" align="right">涨跌</SortHeader><SortHeader field="distance_from_low_pct" align="right">距60日低点</SortHeader><SortHeader field="total_score" align="right">综合分</SortHeader><SortHeader field="trend_score" align="right">趋势</SortHeader><SortHeader field="position_score" align="right">低点</SortHeader><SortHeader field="volatility_trend_score" align="right">波动</SortHeader><SortHeader field="volume_score" align="right">价量</SortHeader><th className="text-center">均线</th></tr></thead>
+                <table className="data-table min-w-[1320px]">
+                  <thead><tr><SortHeader field="stock_name">股票名称</SortHeader><SortHeader field="sector_name">所属板块</SortHeader><th className="text-center">板块趋势</th><SortHeader field="continue_num" align="center">连板</SortHeader><SortHeader field="latest_price" align="right">现价</SortHeader><SortHeader field="latest_change_rate" align="right">涨跌</SortHeader><SortHeader field="distance_from_low_pct" align="right">距60日低点</SortHeader><SortHeader field="total_score" align="right">综合分</SortHeader><SortHeader field="sector_strategy_score" align="right">情境修正</SortHeader><SortHeader field="trend_score" align="right">趋势</SortHeader><SortHeader field="position_score" align="right">低点</SortHeader><SortHeader field="volatility_trend_score" align="right">波动</SortHeader><SortHeader field="volume_score" align="right">价量</SortHeader><th className="text-center">均线</th></tr></thead>
                   <tbody>{data.rankings.map((row: RankingRow) => {
                     const change = Number(row.latest_change_rate ?? 0);
+                    const strategyScore = Number(row.sector_strategy_score ?? 0);
                     const top = Number(row.rank) <= 3;
                     return (
                       <tr key={row.stock_code} className={top ? 'bg-surface' : ''}>
@@ -157,6 +158,7 @@ export function RankingPage() {
                         <td className={`text-right font-mono text-xs ${pctColor(change)}`}>{change > 0 ? '+' : ''}{change.toFixed(2)}%</td>
                         <td className={`text-right font-mono text-xs ${pctColor(Number(row.distance_from_low_pct ?? 0))}`}>{Number(row.distance_from_low_pct ?? 0) > 0 ? '+' : ''}{Number(row.distance_from_low_pct ?? 0).toFixed(2)}%</td>
                         <td className="text-right"><span className="font-mono text-sm text-primary-active">{Number(row.total_score).toFixed(1)}</span></td>
+                        <td className="text-right" title={row.sector_strategy_reason || row.sector_strategy_label || ''}><div className={`font-mono text-xs ${strategyScore === 0 ? 'text-muted' : pctColor(strategyScore)}`}>{strategyScore > 0 ? '+' : ''}{strategyScore.toFixed(1)}</div><div className="mt-0.5 max-w-28 truncate text-[10px] text-muted">{row.sector_strategy_label || '—'}</div></td>
                         <td className="text-right"><span className="mr-2 font-mono text-xs">{Number(row.trend_score).toFixed(1)}</span><ScoreBar value={Number(row.trend_score)} max={40} /></td>
                         <td className="text-right"><span className="mr-2 font-mono text-xs">{Number(row.position_score ?? 0).toFixed(1)}</span><ScoreBar value={Number(row.position_score ?? 0)} max={20} /></td>
                         <td className="text-right"><span className="mr-2 font-mono text-xs">{Number(row.volatility_trend_score ?? row.momentum_score ?? 0).toFixed(1)}</span><ScoreBar value={Number(row.volatility_trend_score ?? row.momentum_score ?? 0)} max={15} tone="amber" /></td>

@@ -13,19 +13,41 @@ import {
   nextTradingDateAfter,
   resolveAutoTradingWindow,
   shanghaiClock,
+  thsReadyTimeoutMs,
+  thsWarmupSlot,
+  windowRetryDelayMs,
 } from '../server/paper-trading/helpers.js';
 import type { SimulatedAccountSnapshot, SimulatedBroker } from '../server/ths-simulated-broker.js';
 import type { AnalysisData, PaperOrder, PaperTradingRuntimeState, RankingRow } from '../src/types.js';
 
 class TestStateStore implements PaperTradingStateStore {
   state: PaperTradingRuntimeState | null = null;
+  saves = 0;
 
   async load() {
     return this.state ? structuredClone(this.state) : null;
   }
 
   async save(state: PaperTradingRuntimeState) {
+    this.saves += 1;
     this.state = structuredClone(state);
+  }
+}
+
+/** 同花顺完全不可用：任何一次调用都抛错。 */
+class OfflineBroker implements SimulatedBroker {
+  async snapshot(): Promise<never> { throw new Error('同花顺尚未运行 (-2700)'); }
+  async snapshotAccountOnly(): Promise<never> { throw new Error('同花顺尚未运行 (-2700)'); }
+  async quote(): Promise<never> { throw new Error('同花顺尚未运行 (-2700)'); }
+  async placeOrder(): Promise<never> { throw new Error('同花顺尚未运行 (-2700)'); }
+  async cancelOrder(): Promise<never> { throw new Error('同花顺尚未运行 (-2700)'); }
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('等待条件超时');
+    await new Promise((resolve) => { setTimeout(resolve, 5); });
   }
 }
 
@@ -428,6 +450,250 @@ describe('Node T+1 paper-trading core', () => {
     const laterOpen = await service.runWindow('open', context('20260724', [], calendar));
     expect(laterOpen.results).toHaveLength(0);
     expect(broker.placed).toHaveLength(0);
+  });
+
+  describe('过期清算不依赖同花顺、交易日和自动化开关', () => {
+    const stalePlanState = (enabled: boolean): PaperTradingRuntimeState => ({
+      ...defaultState('2026-07-23 15:05:00'),
+      reference_capital: 100_000,
+      last_signal_date: '20260723',
+      automation: { ...defaultState('2026-07-23 15:05:00').automation, enabled },
+      instructions: [{
+        id: 'stale-sell',
+        side: 'sell',
+        stock_code: '000815',
+        stock_name: '待卖出',
+        signal_date: '20260723',
+        signal_price: 10,
+        quantity: 1_000,
+        reason: '止损信号 -15.42%；次日开盘卖出',
+        execution_window: 'open',
+        status: 'pending',
+        created_at: '2026-07-23 15:05:00',
+      }],
+    });
+
+    it('同花顺离线、已过收盘时仍把当日未执行计划置为过期', async () => {
+      const store = new TestStateStore();
+      store.state = stalePlanState(true);
+      const service = new PaperTradingService(new OfflineBroker(), {
+        stateStore: store,
+        // 执行日 20260724 的 20:00：早已过收盘，且过了 15:20 监控时段
+        now: () => new Date('2026-07-24T20:00:00+08:00'),
+      });
+
+      expect(await service.expireStalePlans()).toBe(1);
+      expect(store.state?.instructions[0]).toMatchObject({
+        id: 'stale-sell',
+        status: 'expired',
+        reason: expect.stringContaining('当日未执行'),
+      });
+    });
+
+    it('周末也清算上一交易日遗留的计划', async () => {
+      const store = new TestStateStore();
+      store.state = stalePlanState(true);
+      const service = new PaperTradingService(new OfflineBroker(), {
+        stateStore: store,
+        now: () => new Date('2026-07-25T11:00:00+08:00'),
+      });
+
+      expect(await service.expireStalePlans()).toBe(1);
+      expect(store.state?.instructions[0]?.status).toBe('expired');
+    });
+
+    it('调度器越过自动化开关、交易日和监控时段三道闸门照常清算', async () => {
+      const store = new TestStateStore();
+      store.state = stalePlanState(false);
+      const service = new PaperTradingService(new OfflineBroker(), {
+        stateStore: store,
+        // 周六 20:00：自动化关闭 + 非交易日 + 已过 15:20 监控时段，三道闸门全踩中
+        now: () => new Date('2026-07-25T20:00:00+08:00'),
+      });
+
+      service.startScheduler();
+      try {
+        await waitFor(() => store.state?.instructions[0]?.status === 'expired');
+      } finally {
+        service.stopScheduler();
+      }
+      expect(store.state?.instructions[0]?.status).toBe('expired');
+    });
+
+    it('没有到期计划时不写盘', async () => {
+      const store = new TestStateStore();
+      store.state = stalePlanState(true);
+      const service = new PaperTradingService(new OfflineBroker(), {
+        stateStore: store,
+        // 执行日当天 09:40，窗口还没关，不该过期
+        now: () => new Date('2026-07-24T09:40:00+08:00'),
+      });
+      const before = store.saves;
+
+      expect(await service.expireStalePlans()).toBe(0);
+      expect(store.saves).toBe(before);
+      expect(store.state?.instructions[0]?.status).toBe('pending');
+    });
+
+    it('重复清算是幂等的，只记一条过期事件', async () => {
+      const store = new TestStateStore();
+      store.state = stalePlanState(true);
+      const service = new PaperTradingService(new OfflineBroker(), {
+        stateStore: store,
+        now: () => new Date('2026-07-24T20:00:00+08:00'),
+      });
+
+      expect(await service.expireStalePlans()).toBe(1);
+      expect(await service.expireStalePlans()).toBe(0);
+      expect(store.state?.events.filter((event) => event.type === 'plans_expired')).toHaveLength(1);
+    });
+  });
+
+  describe('窗口失败退避', () => {
+    it('盘中窗口退避压到 2 分钟以内，盘后窗口拉到 15 分钟', () => {
+      expect([1, 2, 3, 4, 5].map((failures) => windowRetryDelayMs('near_close', failures)))
+        .toEqual([20_000, 40_000, 80_000, 120_000, 120_000]);
+      expect([1, 2, 3, 4, 5, 6, 7].map((failures) => windowRetryDelayMs('close', failures)))
+        .toEqual([20_000, 40_000, 80_000, 160_000, 320_000, 640_000, 900_000]);
+    });
+
+    it('临收盘 14:57-15:00 内可重试 3 次以上（原固定 5 分钟退避只有 1 次）', () => {
+      let elapsed = 0;
+      let attempts = 1;
+      while (elapsed + windowRetryDelayMs('near_close', attempts) < 3 * 60_000) {
+        elapsed += windowRetryDelayMs('near_close', attempts);
+        attempts += 1;
+      }
+      expect(attempts).toBeGreaterThanOrEqual(3);
+    });
+  });
+
+  describe('同花顺自动拉起', () => {
+    /** 记录 ensureReady 与券商调用的先后，用来断言"下单前已就绪"。 */
+    class ReadinessSpy {
+      readonly calls: Array<{ reason: string; timeoutMs?: number }> = [];
+      ready = true;
+      message?: string;
+
+      ensureReady = async (reason: string, options?: { timeoutMs?: number }) => {
+        this.calls.push({ reason, timeoutMs: options?.timeoutMs });
+        this.trace?.push(`ensureReady:${reason}`);
+        return { ready: this.ready, launched: false, message: this.message };
+      };
+
+      trace?: string[];
+    }
+
+    const account = () => ({
+      availableCash: 90_000,
+      totalAssets: 100_000,
+      positions: [],
+      orders: [],
+    });
+
+    it('runWindow 在读账户之前先保证同花顺就绪', async () => {
+      const trace: string[] = [];
+      const readiness = new ReadinessSpy();
+      readiness.trace = trace;
+      const broker = new FlowBroker(account());
+      const originalSnapshot = broker.snapshot.bind(broker);
+      broker.snapshot = async (...args) => {
+        trace.push('broker:snapshot');
+        return originalSnapshot(...args);
+      };
+      const service = new PaperTradingService(broker, {
+        stateStore: new TestStateStore(),
+        thsReadiness: readiness,
+        now: () => new Date('2026-07-24T09:35:00+08:00'),
+      });
+
+      await service.runWindow('open', context('20260723', [], ['20260723', '20260724']));
+
+      expect(trace[0]).toBe('ensureReady:window:open');
+      expect(trace).toContain('broker:snapshot');
+      expect(trace.indexOf('ensureReady:window:open')).toBeLessThan(trace.indexOf('broker:snapshot'));
+    });
+
+    it('临收盘窗口只给 45s 预算，其余窗口给 120s', async () => {
+      const readiness = new ReadinessSpy();
+      const service = new PaperTradingService(new FlowBroker(account()), {
+        stateStore: new TestStateStore(),
+        thsReadiness: readiness,
+        now: () => new Date('2026-07-24T14:58:00+08:00'),
+      });
+      await service.runWindow('near_close', context('20260723', [], ['20260723', '20260724']));
+      expect(readiness.calls.at(-1)).toMatchObject({ reason: 'window:near_close', timeoutMs: 45_000 });
+
+      expect(thsReadyTimeoutMs('open')).toBe(120_000);
+      expect(thsReadyTimeoutMs('close')).toBe(120_000);
+      expect(thsReadyTimeoutMs('post_close')).toBe(120_000);
+    });
+
+    it('monitorAccount 不拉起同花顺', async () => {
+      const readiness = new ReadinessSpy();
+      const service = new PaperTradingService(new FlowBroker(account()), {
+        stateStore: new TestStateStore(),
+        thsReadiness: readiness,
+        now: () => new Date('2026-07-24T10:30:00+08:00'),
+      });
+
+      await service.monitorAccount('trace-monitor', 'manual_monitor');
+
+      expect(readiness.calls).toHaveLength(0);
+    });
+
+    it('同花顺拉不起来时窗口照常尝试，失败原因保留券商原始报错', async () => {
+      const readiness = new ReadinessSpy();
+      readiness.ready = false;
+      readiness.message = 'LOGIN_PENDING|等待主交易界面超时';
+      const service = new PaperTradingService(new OfflineBroker(), {
+        stateStore: new TestStateStore(),
+        thsReadiness: readiness,
+        now: () => new Date('2026-07-24T09:35:00+08:00'),
+      });
+
+      await expect(service.runWindow('open', context('20260723', [], ['20260723', '20260724'])))
+        .rejects.toThrow('同花顺尚未运行');
+      expect(readiness.calls).toHaveLength(1);
+    });
+
+    it('预热区间 09:25-09:31 / 14:50-14:57 / 15:03-15:05 各覆盖一次', () => {
+      expect(thsWarmupSlot(9 * 60 + 24)).toBeNull();
+      expect(thsWarmupSlot(9 * 60 + 25)).toMatchObject({ slot: 'open', timeoutMs: 120_000 });
+      expect(thsWarmupSlot(9 * 60 + 30)).toMatchObject({ slot: 'open' });
+      expect(thsWarmupSlot(9 * 60 + 31)).toBeNull();
+      expect(thsWarmupSlot(14 * 60 + 50)).toMatchObject({ slot: 'near_close', timeoutMs: 120_000 });
+      expect(thsWarmupSlot(14 * 60 + 57)).toBeNull();
+      expect(thsWarmupSlot(15 * 60 + 3)).toMatchObject({ slot: 'close', timeoutMs: 90_000 });
+      expect(thsWarmupSlot(15 * 60 + 5)).toBeNull();
+    });
+
+    it('调度器在开盘前预热一次，同日重复 tick 不再预热', async () => {
+      const readiness = new ReadinessSpy();
+      const store = new TestStateStore();
+      store.state = {
+        ...defaultState('2026-07-23 15:05:00'),
+        automation: { ...defaultState('2026-07-23 15:05:00').automation, enabled: true },
+      };
+      const service = new PaperTradingService(new OfflineBroker(), {
+        stateStore: store,
+        thsReadiness: readiness,
+        // 09:26：在 open 预热区间内，且早于 09:31 的 due 窗口
+        now: () => new Date('2026-07-24T09:26:00+08:00'),
+      });
+      service.setTradingCalendar(['20260723', '20260724']);
+
+      service.startScheduler();
+      try {
+        await waitFor(() => readiness.calls.length > 0);
+        // 多跑几个 tick，确认不会重复预热
+        await new Promise((resolve) => { setTimeout(resolve, 60); });
+      } finally {
+        service.stopScheduler();
+      }
+
+      expect(readiness.calls).toEqual([{ reason: 'warmup:open', timeoutMs: 120_000 }]);
+    });
   });
 
   it('uses the five-trading-day exit rule and schedules strong-market buys at open and sells near close', async () => {

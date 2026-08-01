@@ -169,6 +169,12 @@
 | `volume_price_score` | 价量评分 | numeric | 0-25 |
 | `position_score` | 距60日低点评分 | numeric | 0-20 |
 | `volatility_trend_score` | 波动率适配评分 | numeric | 0-15 |
+| `relative_strength_score` | 相对大盘强度评分 | numeric | 0-20 |
+| `sector_strategy_score` | 板块趋势 × 个股形态修正 | numeric | 默认规则 -10~+8，配置硬上限 -12~+10 |
+| `sector_risk_penalty` | 情境风险扣分 | numeric | ≤0；触发时机会分为 0 |
+| `sector_opportunity_bonus` | 情境机会加分 | numeric | ≥0 |
+| `sector_strategy_label` | 情境修正标签 | text | 如“穿越板块稳定上行”“强势行情放量新高” |
+| `sector_strategy_reason` | 情境修正解释 | text | 板块状态与关键形态指标 |
 | `alignment` | 均线排列 | text | bullish/tangled/bearish |
 | `trend_strength` | 趋势强度 | numeric | 线性回归斜率/均价 |
 | `volume_price_label` | 价量配合标签 | text | 如"稳健放量" |

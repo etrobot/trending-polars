@@ -469,7 +469,8 @@ export class ThsSimulatedBroker implements SimulatedBroker {
 
   placeOrder(order: PaperOrder, context: BrokerCallContext = {}): Promise<BrokerActionResult> {
     const operation = this.exclusive(async () => {
-      const output = await this.loggedCommand(['order', order.side, order.stock_code, 'AUTO', String(order.quantity)], context);
+      const priceArg = order.price > 0 ? String(order.price) : 'AUTO';
+      const output = await this.loggedCommand(['order', order.side, order.stock_code, priceArg, String(order.quantity)], context);
       const verified = output.includes('ORDER_VERIFIED|') && output.includes(order.stock_code);
       if (!verified) throw new ThsSimulatedBrokerError(`委托已提交但回查失败：${order.stock_code}`);
       const submitted = output.match(new RegExp(`^ORDER_SUBMITTED\\|${order.side}\\|${order.stock_code}\\|([^|\\r\\n]+)\\|([^\\r\\n]+)$`, 'm'));

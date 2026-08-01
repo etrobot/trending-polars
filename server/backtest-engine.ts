@@ -4,6 +4,7 @@ import { computeBacktestScores } from './backtest-scoring.js';
 import { compactDate, formatDateTime, round } from './format.js';
 import { normalizeBacktestDays, type HistoricalMarketData } from './historical-market.js';
 import {
+  applySectorStrategyScore,
   compareByScore,
   prepareSeries,
   scoreStock,
@@ -158,6 +159,8 @@ export { normalizeFactorWeights, MIN_FACTOR_WEIGHT_PCT, MAX_FACTOR_WEIGHT_PCT };
  * 等效变成原口径的 48.8 分。于是参数优化器搜索权重时，同时改变了「因子相对权重」和
  * 「绝对入场门槛」两件事，两个效应完全纠缠，搜出来的最优权重无法解释。
  *
+ * 板块情境修正不参与五维权重归一化，而是在加权基础分之后原值应用；
+ * 否则追高/暴力反弹的风险扣分会被某组因子权重意外稀释。
  * 全 100（默认值）时结果与未加权的 scoreStock 完全一致。
  */
 function applyFactorWeights(rows: RankingRow[], weights: FactorWeights): RankingRow[] {
@@ -178,7 +181,10 @@ function applyFactorWeights(rows: RankingRow[], weights: FactorWeights): Ranking
       + Number(row.position_score ?? 0) * fromLowMul
       + Number(row.volatility_trend_score ?? 0) * volatilityMul
       + Number(row.relative_strength_score ?? 0) * strengthMul;
-    return { ...row, total_score: round(weighted * normalizer, 1) };
+    return {
+      ...row,
+      total_score: applySectorStrategyScore(weighted * normalizer, Number(row.sector_strategy_score ?? 0)),
+    };
   });
   rescored.sort(compareByScore);
   for (let index = 0; index < rescored.length; index += 1) rescored[index].rank = index + 1;

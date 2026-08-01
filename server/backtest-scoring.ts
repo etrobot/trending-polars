@@ -2,7 +2,25 @@ import pl from 'nodejs-polars';
 import type { RankingRow } from '../src/types.js';
 import { round } from './format.js';
 import type { HistoricalBlockSeries, HistoricalMarketData } from './historical-market.js';
-import { analyzeBlockTrend, compareByScore, type MarketStateThresholds, HIGHER_TIMEFRAME_WINDOW_BARS, MIN_HIGHER_TIMEFRAME_BARS, RAW_SCORE_MAX, SCORE_SCALE, SECTOR_STATE_WINDOW_BARS, volatilityTrendScore, type Bar, type ScoreStockConfig, type TrendAxis, type VolatilityClass, DEFAULT_SCORE_STOCK_CONFIG } from './scoring-engine.js';
+import {
+  analyzeBlockTrend,
+  compareByScore,
+  DEFAULT_SCORE_STOCK_CONFIG,
+  HIGHER_TIMEFRAME_WINDOW_BARS,
+  marketStateName,
+  MIN_HIGHER_TIMEFRAME_BARS,
+  RAW_SCORE_MAX,
+  SCORE_SCALE,
+  SECTOR_STATE_WINDOW_BARS,
+  sectorStrategyAdjustment,
+  sectorStrategyFeatures,
+  totalScoreFromRaw,
+  type Bar,
+  type MarketStateThresholds,
+  type ScoreStockConfig,
+  type TrendAxis,
+  type VolatilityClass,
+} from './scoring-engine.js';
 
 // ---------------------------------------------------------------------------
 // Vectorized backtest scoring: computes the full (stock × date) score matrix
@@ -176,7 +194,7 @@ export function computeBacktestScores(
   for (const record of history.limit_up_records ?? []) {
     if (!record.sector_code || !/^\d{6}$/.test(record.sector_code)) continue;
     const list = stockSectorHistory.get(record.stock_code) ?? [];
-    list.push({ date: record.date, sector: record.sector_code });
+    list.push({ date: record.date.replaceAll('-', '').slice(0, 8), sector: record.sector_code });
     stockSectorHistory.set(record.stock_code, list);
   }
   for (const list of stockSectorHistory.values()) {
@@ -197,22 +215,42 @@ export function computeBacktestScores(
   const trendStrengths: number[] = [];
   const limitUpFlags: number[] = [];
   const sectorStateIds: number[] = [];
+  const sectorCodes: string[] = [];
+  const sectorNames: string[] = [];
+  const sectorStrategyScores: number[] = [];
+  const sectorRiskPenalties: number[] = [];
+  const sectorOpportunityBonuses: number[] = [];
+  const sectorStrategyLabels: string[] = [];
+  const sectorStrategyReasons: string[] = [];
   const benchmarkReturnPcts: number[] = [];
   const benchmarkKnownFlags: number[] = [];
+  const blockNameByCode = new Map((history.blocks ?? []).map((block) => [block.block_code, block.block_name]));
 
   for (const stock of history.stocks) {
     const bars = [...stock.bars].sort((a, b) => String(a[0]).localeCompare(String(b[0])));
     const n = bars.length;
+    const normalizedBars: Bar[] = bars.map((bar) => ({
+      date: String(bar[0]).replaceAll('-', '').slice(0, 8),
+      open: Number(bar[1]),
+      close: Number(bar[2]),
+      high: Number(bar[3]),
+      low: Number(bar[4]),
+      volume: Number(bar[5]),
+      amount: Number(bar[6]),
+      changePct: Number(bar[7]),
+    }));
     const closeArr = new Float64Array(n);
     const dateArr: string[] = new Array(n);
     for (let i = 0; i < n; i += 1) {
       closeArr[i] = Number(bars[i][2]);
       dateArr[i] = String(bars[i][0]).replaceAll('-', '').slice(0, 8);
     }
+    const exactLimitUpDates = limitUpDatesByCode.get(stock.stock_code);
+    const strategyLimitUpDates = exactLimitUpDates ?? new Set<string>();
     const { strength, limitUp } = computeStockArrays(
       closeArr,
       dateArr,
-      limitUpDatesByCode.get(stock.stock_code),
+      exactLimitUpDates,
     );
     // Sector state for this stock on each date: walk forward through sector history
     // to find the most recent block_top record on or before the current bar date.
@@ -238,7 +276,24 @@ export function computeBacktestScores(
         sectorCursor += 1;
       }
       const stateMap = currentSector ? sectorStateByDate.get(currentSector) : undefined;
-      sectorStateIds.push(stateMap?.get(dateArr[i]) ?? 0);
+      const stateId = stateMap?.get(dateArr[i]) ?? 0;
+      sectorStateIds.push(stateId);
+      sectorCodes.push(currentSector ?? '');
+      sectorNames.push(currentSector ? blockNameByCode.get(currentSector) ?? currentSector : '');
+      // sectorStateByDate 只包含请求的回测日期；没有板块状态时情境分必为 0，
+      // 不必为全部预热 K 线重复计算 60 日形态窗口。
+      const strategy = stateId
+        ? sectorStrategyAdjustment(
+            sectorStrategyFeatures(normalizedBars, i, strategyLimitUpDates, scoringConfig),
+            { stateId },
+            scoringConfig,
+          )
+        : { score: 0, riskPenalty: 0, opportunityBonus: 0, label: '无情境修正', reason: '' };
+      sectorStrategyScores.push(strategy.score);
+      sectorRiskPenalties.push(strategy.riskPenalty);
+      sectorOpportunityBonuses.push(strategy.opportunityBonus);
+      sectorStrategyLabels.push(strategy.label);
+      sectorStrategyReasons.push(strategy.reason);
       const benchmark = benchmarkReturnByDate.get(dateArr[i]);
       benchmarkReturnPcts.push(benchmark ?? 0);
       benchmarkKnownFlags.push(benchmark == null ? 0 : 1);
@@ -262,6 +317,13 @@ export function computeBacktestScores(
     trend_strength: trendStrengths,
     limit_up_flag: limitUpFlags,
     sector_state_id: sectorStateIds,
+    sector_code: sectorCodes,
+    sector_name: sectorNames,
+    sector_strategy_score: sectorStrategyScores,
+    sector_risk_penalty: sectorRiskPenalties,
+    sector_opportunity_bonus: sectorOpportunityBonuses,
+    sector_strategy_label: sectorStrategyLabels,
+    sector_strategy_reason: sectorStrategyReasons,
     benchmark_return_pct: benchmarkReturnPcts,
     benchmark_known: benchmarkKnownFlags,
   }).sort(['stock_code', 'date']);
@@ -469,7 +531,7 @@ export function computeBacktestScores(
       .alias('relative_strength_label'),
   );
 
-  // ---- 10. Total score（原始满分 RAW_SCORE_MAX，折算到 SCORE_SCALE 的 100 分制）----
+  // ---- 10. Total score（五维先折算到 100，再叠加板块情境修正）----
   frame = frame.withColumns(
     pl.col('trend_score')
       .add(pl.col('volume_price_score'))
@@ -477,6 +539,8 @@ export function computeBacktestScores(
       .add(pl.col('volatility_trend_score'))
       .add(pl.col('relative_strength_score'))
       .mul(SCORE_SCALE / RAW_SCORE_MAX)
+      .add(pl.col('sector_strategy_score'))
+      .clip(0, SCORE_SCALE)
       .alias('total_score'),
   );
 
@@ -500,11 +564,16 @@ export function computeBacktestScores(
     const positionScore = Number(row.position_score);
     const volatilityTrendScore = Number(row.volatility_trend_score);
     const relativeStrengthScore = round(Number(row.relative_strength_score), 1);
+    const sectorStrategyScore = Number(row.sector_strategy_score ?? 0);
+    const sectorStateId = Number(row.sector_state_id ?? 0);
     list.push({
       rank: 0,
       stock_code: String(row.stock_code),
       stock_name: String(row.stock_name),
-      total_score: round((Number(row.trend_score) + volumePriceScore + positionScore + volatilityTrendScore + relativeStrengthScore) * SCORE_SCALE / RAW_SCORE_MAX, 1),
+      total_score: totalScoreFromRaw(
+        Number(row.trend_score) + volumePriceScore + positionScore + volatilityTrendScore + relativeStrengthScore,
+        sectorStrategyScore,
+      ),
       trend_score: trendScore,
       volume_price_score: volumePriceScore,
       volume_score: volumePriceScore,
@@ -518,10 +587,19 @@ export function computeBacktestScores(
       relative_strength_score: relativeStrengthScore,
       relative_strength_label: String(row.relative_strength_label),
       relative_strength_pct: row.relative_strength_pct == null ? null : round(Number(row.relative_strength_pct), 2),
+      sector_strategy_score: sectorStrategyScore,
+      sector_risk_penalty: Number(row.sector_risk_penalty ?? 0),
+      sector_opportunity_bonus: Number(row.sector_opportunity_bonus ?? 0),
+      sector_strategy_label: String(row.sector_strategy_label ?? '无情境修正'),
+      sector_strategy_reason: String(row.sector_strategy_reason ?? ''),
       limit_up_count_20d: Number(row.limit_up_count_20d),
       alignment: String(row.alignment),
       trend_strength: round(Number(row.trend_strength), 4),
       distance_from_low_pct: round(Number(row.distance_from_low_pct), 2),
+      sector_code: String(row.sector_code ?? '') || undefined,
+      sector_name: String(row.sector_name ?? '') || undefined,
+      sector_trend_name: marketStateName(sectorStateId),
+      sector_trend_state_id: sectorStateId || undefined,
       latest_price: Number(row.close),
       latest_change_rate: Number(row.change_pct),
     });

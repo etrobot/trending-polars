@@ -15,6 +15,7 @@ describe('normalizeRankingRuntimeConfig', () => {
     const config = normalizeRankingRuntimeConfig();
     expect(config.factor_weights).toEqual({ ...DEFAULT_FACTOR_WEIGHTS });
     expect(config.scoring_config.relativeStrength.lookback).toBe(20);
+    expect(config.scoring_config.sectorStrategy).toEqual(DEFAULT_SCORE_STOCK_CONFIG.sectorStrategy);
     expect(config.scoring_config.marketState).toEqual(DEFAULT_SCORE_STOCK_CONFIG.marketState);
   });
 
@@ -24,7 +25,7 @@ describe('normalizeRankingRuntimeConfig', () => {
     expect(normalized.scoring_config).toEqual(defaulted.scoring_config);
   });
 
-  it('fills in the missing relativeStrength / marketState / relativeStrengthWeightPct fields from a stale config', () => {
+  it('fills in missing relativeStrength / sectorStrategy / marketState fields from a stale config', () => {
     // 模拟早期版本写入的 ranking-config.json：scoring_config 缺 relativeStrength/marketState，
     // factor_weights 缺 relativeStrengthWeightPct。直接打分会在 relativeStrength.lookback 处崩溃。
     const stale = {
@@ -55,6 +56,7 @@ describe('normalizeRankingRuntimeConfig', () => {
     expect(normalized.factor_weights.relativeStrengthWeightPct).toBe(100);
     expect(normalized.scoring_config.relativeStrength).toEqual(DEFAULT_SCORE_STOCK_CONFIG.relativeStrength);
     expect(normalized.scoring_config.relativeStrength.lookback).toBe(20);
+    expect(normalized.scoring_config.sectorStrategy).toEqual(DEFAULT_SCORE_STOCK_CONFIG.sectorStrategy);
     expect(normalized.scoring_config.marketState).toEqual(DEFAULT_SCORE_STOCK_CONFIG.marketState);
   });
 
@@ -69,6 +71,21 @@ describe('normalizeRankingRuntimeConfig', () => {
     expect(normalized.scoring_config.relativeStrength.maxScore).toBe(15);
     // 未覆盖的整段字段回退到默认值（marketState 未提供）。
     expect(normalized.scoring_config.marketState).toEqual(DEFAULT_SCORE_STOCK_CONFIG.marketState);
+  });
+
+  it('deep-merges a partial sector-strategy override without dropping its thresholds', () => {
+    const normalized = normalizeRankingRuntimeConfig({
+      scoring_config: {
+        sectorStrategy: {
+          scores: { violentReboundPenalty: -12 },
+        },
+      } as never,
+    });
+    expect(normalized.scoring_config.sectorStrategy.scores.violentReboundPenalty).toBe(-12);
+    expect(normalized.scoring_config.sectorStrategy.scores.crossingTrendBonus)
+      .toBe(DEFAULT_SCORE_STOCK_CONFIG.sectorStrategy.scores.crossingTrendBonus);
+    expect(normalized.scoring_config.sectorStrategy.stableTrend)
+      .toEqual(DEFAULT_SCORE_STOCK_CONFIG.sectorStrategy.stableTrend);
   });
 
   it('accepts factor boosts above 100% and clamps only at the shared limits', () => {

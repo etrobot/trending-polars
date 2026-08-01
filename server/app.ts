@@ -5,6 +5,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { AuditLogger } from './audit-log.js';
 import { DataStore } from './data-store.js';
 import { ThsSimulatedBroker, ThsSimulatedBrokerError } from './ths-simulated-broker.js';
+import { ThsLifecycle } from './ths-lifecycle.js';
 import { PaperTradingService } from './paper-trading.js';
 import { refreshTradingCalendar } from './index-bootstrap.js';
 import { TaskRegistry } from './tasks.js';
@@ -34,6 +35,7 @@ export function createApp(services: Partial<AppServices> = {}) {
       const refreshed = await refreshTradingCalendar(store);
       return refreshed.calendar;
     },
+    thsReadiness: new ThsLifecycle({ audit }),
     audit,
   });
 

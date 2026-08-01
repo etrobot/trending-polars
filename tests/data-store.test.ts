@@ -34,6 +34,11 @@ function rankingRow(code: string, name: string, score: number): RankingRow {
     relative_strength_score: 12,
     relative_strength_label: '跑赢大盘',
     relative_strength_pct: 7,
+    sector_strategy_score: -10,
+    sector_risk_penalty: -10,
+    sector_opportunity_bonus: 0,
+    sector_strategy_label: '强势行情放量新高',
+    sector_strategy_reason: '主线主升中放量创60日新高，追高风险优先',
     alignment: 'bullish',
     trend_strength: 0.01,
     volume_price_label: '稳健放量',
@@ -184,6 +189,8 @@ describe('node:sqlite data store', () => {
       expect.objectContaining({ stock_code: '000001', factor_name: 'limit_up_count_20d', val_numeric: 0 }),
       expect.objectContaining({ stock_code: '000001', factor_name: 'volume_price_label', val_text: '稳健放量' }),
       expect.objectContaining({ stock_code: '000001', factor_name: 'relative_strength_score', val_numeric: 12 }),
+      expect.objectContaining({ stock_code: '000001', factor_name: 'sector_strategy_score', val_numeric: -10 }),
+      expect.objectContaining({ stock_code: '000001', factor_name: 'sector_strategy_label', val_text: '强势行情放量新高' }),
     ]));
     await expect(access(path.join(root, 'runtime', 'ranking.json'))).resolves.toBeUndefined();
 
@@ -292,6 +299,11 @@ describe('node:sqlite data store', () => {
     delete legacyRow.relative_strength_score;
     delete legacyRow.relative_strength_label;
     delete legacyRow.relative_strength_pct;
+    delete legacyRow.sector_strategy_score;
+    delete legacyRow.sector_risk_penalty;
+    delete legacyRow.sector_opportunity_bonus;
+    delete legacyRow.sector_strategy_label;
+    delete legacyRow.sector_strategy_reason;
     await writeFile(path.join(root, 'analysis.json'), JSON.stringify(blockTopAnalysis()), 'utf8');
     await writeFile(path.join(root, 'ranking.json'), JSON.stringify({
       timestamp: '2026-07-23 15:05:00',
@@ -303,7 +315,7 @@ describe('node:sqlite data store', () => {
 
     await expect(store.getAnalysis()).resolves.toMatchObject({ blocks: [expect.any(Object)] });
     await expect(store.getRanking()).resolves.toMatchObject({
-      rankings: [expect.objectContaining({ stock_code: '600000', relative_strength_score: 10 })],
+      rankings: [expect.objectContaining({ stock_code: '600000', relative_strength_score: 10, sector_strategy_score: 0 })],
     });
     await expect(store.getHistoricalMarket()).resolves.toMatchObject({ as_of_date: '20260723' });
 

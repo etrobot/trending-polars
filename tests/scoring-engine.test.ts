@@ -179,6 +179,88 @@ describe('scoreStock — 五维评分与标签', () => {
   });
 });
 
+describe('板块趋势 × 个股形态情境修正', () => {
+  const scoreInState = (
+    bars: Bar[],
+    stateId: number,
+    trend: 'up' | 'range' | 'down',
+    limitUpDates: ReadonlySet<string> = new Set(),
+  ) => scoreStock(prepared(bars), bars.at(-1)!.date, {
+    stateId,
+    trend,
+    trendName: ({ 1: '主线主升', 2: '高位滞涨', 6: '阴跌不止', 7: '恐慌暴跌', 8: '筑底成功' } as Record<number, string>)[stateId],
+    limitUpDates,
+  })!;
+
+  it('rewards a slow, stable stock trend that crosses a falling sector', () => {
+    const row = scoreInState(steadyUp(80, 0.4), 6, 'down');
+    expect(row.sector_strategy_score).toBe(8);
+    expect(row.sector_opportunity_bonus).toBe(8);
+    expect(row.sector_risk_penalty).toBe(0);
+    expect(row.sector_strategy_label).toBe('穿越板块稳定上行');
+  });
+
+  it('rewards a formerly strong stock at a multi-day panic extreme', () => {
+    const bars = barsFromReturns(20, [
+      ...Array.from({ length: 60 }, () => 0.3),
+      ...Array.from({ length: 10 }, () => -2),
+    ]);
+    const row = scoreInState(bars, 7, 'down', new Set([bars[45].date]));
+    expect(row.sector_strategy_score).toBe(8);
+    expect(row.sector_strategy_label).toBe('前强股恐慌极点');
+    expect(row.sector_strategy_reason).toContain('1次涨停事实');
+  });
+
+  it('penalizes a violent rebound in a falling sector before considering opportunity bonuses', () => {
+    const bars = barsFromReturns(30, [
+      ...Array.from({ length: 69 }, () => -0.6),
+      8,
+    ], [
+      ...Array.from({ length: 69 }, () => 1_000_000),
+      2_000_000,
+    ]);
+    const row = scoreInState(bars, 7, 'down', new Set([bars[40].date]));
+    expect(row.sector_strategy_score).toBe(-10);
+    expect(row.sector_risk_penalty).toBe(-10);
+    expect(row.sector_opportunity_bonus).toBe(0);
+    expect(row.sector_strategy_label).toBe('下跌市暴力反弹');
+  });
+
+  it('penalizes an ordinary countertrend bounce without stable structure', () => {
+    const bars = barsFromReturns(30, [
+      ...Array.from({ length: 65 }, () => -0.5),
+      ...Array.from({ length: 5 }, () => 0.7),
+    ]);
+    const row = scoreInState(bars, 6, 'down');
+    expect(row.sector_strategy_score).toBe(-4);
+    expect(row.sector_strategy_label).toBe('普通逆势反弹');
+  });
+
+  it('treats the same volume breakout as chase risk in strength and confirmation at a bottom', () => {
+    const returns = [...Array.from({ length: 69 }, () => 0.25), 3.5];
+    const volumes = [...Array.from({ length: 69 }, () => 1_000_000), 2_000_000];
+    const bars = barsFromReturns(10, returns, volumes);
+    const strong = scoreInState(bars, 1, 'up');
+    const bottoming = scoreInState(bars, 8, 'up');
+    expect(strong.sector_strategy_score).toBe(-10);
+    expect(strong.sector_strategy_label).toBe('强势行情放量新高');
+    expect(bottoming.sector_strategy_score).toBe(8);
+    expect(bottoming.sector_strategy_label).toBe('筑底放量新高');
+    expect(Number(bottoming.total_score)).toBeGreaterThan(Number(strong.total_score));
+  });
+
+  it('keeps the contextual result free of future bars', () => {
+    const bars = steadyUp(80, 0.4);
+    const signalDate = bars[59].date;
+    const first = scoreStock(prepared(bars), signalDate, { stateId: 6, trend: 'down' })!;
+    const mutated = bars.map((bar) => ({ ...bar }));
+    mutated[70] = { ...mutated[70], close: mutated[70].close * 4, high: mutated[70].high * 4, volume: 99_000_000 };
+    const afterFuture = scoreStock(prepared(mutated), signalDate, { stateId: 6, trend: 'down' })!;
+    expect(afterFuture).toEqual(first);
+    expect(first.sector_strategy_label).toBe('穿越板块稳定上行');
+  });
+});
+
 describe('classifyMarketState — 八种市场状态', () => {
   it('returns 数据不足 with fewer than 20 bars', () => {
     expect(classifyMarketState(steadyUp(10).slice(0, 10)).state_id).toBe(0);

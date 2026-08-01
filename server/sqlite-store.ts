@@ -30,9 +30,8 @@ import {
   klinesToBars,
   type MarketStateThresholds,
   MIN_HIGHER_TIMEFRAME_BARS,
-  RAW_SCORE_MAX,
-  SCORE_SCALE,
   SECTOR_STATE_WINDOW_BARS,
+  totalScoreFromRaw,
   volatilityClassOf,
   volatilityTrendScore,
   type TrendAxis,
@@ -595,7 +594,7 @@ export class SqliteStore {
 
   private rankingTrendAxis(row: RankingRow): TrendAxis {
     const stateId = numberValue(row.sector_trend_state_id);
-    if ([1, 2, 3].includes(stateId)) return 'up';
+    if ([1, 2, 3, 8].includes(stateId)) return 'up';
     if ([6, 7].includes(stateId)) return 'down';
     if (stateId === 4 || stateId === 5) return 'range';
     return row.alignment === 'bullish' ? 'up' : row.alignment === 'bearish' ? 'down' : 'range';
@@ -611,9 +610,10 @@ export class SqliteStore {
     // 维度 5 由打分引擎给出；旧快照没有这一列时取中性分，避免整批塌陷。
     const relativeStrengthScore = finiteNumber(row.relative_strength_score)
       ?? DEFAULT_SCORE_STOCK_CONFIG.relativeStrength.maxScore / 2;
-    // 与 scoreStock 同一口径：原始满分 RAW_SCORE_MAX，折算到 100 分制。
+    const sectorStrategyScore = finiteNumber(row.sector_strategy_score) ?? 0;
+    // 与 scoreStock 同一口径：五维先折算到 100，再应用板块情境修正。
     const rawScore = trendScore + volumePriceScore + positionScore + volatilityScore + relativeStrengthScore;
-    const totalScore = round(rawScore * SCORE_SCALE / RAW_SCORE_MAX, 1);
+    const totalScore = totalScoreFromRaw(rawScore, sectorStrategyScore);
     return {
       ...row,
       total_score: totalScore,
@@ -623,6 +623,9 @@ export class SqliteStore {
       volatility_class: volatilityClass,
       volatility_label: ({ high: '高波动', medium: '中波动', low: '低波动' } as const)[volatilityClass],
       relative_strength_score: relativeStrengthScore,
+      sector_strategy_score: sectorStrategyScore,
+      sector_risk_penalty: finiteNumber(row.sector_risk_penalty) ?? Math.min(0, sectorStrategyScore),
+      sector_opportunity_bonus: finiteNumber(row.sector_opportunity_bonus) ?? Math.max(0, sectorStrategyScore),
       limit_up_count_20d: exactLimitUpCount,
     };
   }

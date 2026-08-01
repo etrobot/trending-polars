@@ -5,9 +5,9 @@
 //   - 次日开盘前半小时（09:00–09:25 上海时间）打开同花顺、点登录、
 //     切交易页、切模拟 tab，等 server 的 09:31 open 窗口接管。
 //
-// 设计为独立进程，不嵌入 server：通过 HTTP 轮询 server 的自动化 API 拿状态，
-// 避免与 server 进程耦合。每 30s 一个 tick，按上海时间判断当天是否已完成
-// 退出/启动，用日期 key 去重（参考 server 的 completed_windows 思路）。
+// 进程动作本身由 server/ths-lifecycle.ts 提供，与 server 内置的窗口预热/兜底
+// 共用同一份实现和同一把文件锁 —— 两边同时跑 launch-flow 会同时点同一个界面。
+// 本脚本只保留"何时动手"的策略：轮询 server 状态 + 按上海时间判断时机。
 //
 // 运行：npm run ths-lifecycle
 // 环境变量：
@@ -18,19 +18,19 @@
 //
 // 仅依赖 Node 标准库 + 项目已有 tsx（可 import server 的 .ts 模块）。
 
-import { execFile, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, appendFileSync } from 'node:fs';
+import { mkdirSync, appendFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { shanghaiClock, isTradingDay } from '../server/paper-trading/helpers.ts';
 import { loadTradingCalendar } from '../server/index-bootstrap.ts';
+import { ThsLifecycle, DEFAULT_THS_APP_NAME } from '../server/ths-lifecycle.ts';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const LIFECYCLE_SCRIPT = path.resolve(MODULE_DIR, 'ths_lifecycle.applescript');
 const LOG_DIR = path.resolve(MODULE_DIR, '..', 'logs');
 
-const APP_NAME = process.env.THS_APP_NAME ?? '同花顺';
+const APP_NAME = DEFAULT_THS_APP_NAME;
 const SERVER_BASE_URL = (process.env.SERVER_BASE_URL ?? 'http://127.0.0.1:8787').replace(/\/$/, '');
 const TICK_MS = Number(process.env.THS_LIFECYCLE_TICK_MS ?? 30_000);
 const TEST_MODE = process.env.THS_LIFECYCLE_TEST === '1';
@@ -51,89 +51,34 @@ const log = (stage, message, extra) => {
   try { appendFileSync(LOG_FILE, line + '\n', 'utf8'); } catch {}
 };
 
-// ── 进程动作 ─────────────────────────────────────────────
+// ── 进程动作（共享模块） ─────────────────────────────────
 
-function procExists(name) {
-  return new Promise((resolve) => {
-    execFile('osascript', ['-e', `tell application "System Events" to exists process "${name}"`], (err, stdout) => {
-      if (err) return resolve(false);
-      resolve(String(stdout).trim().toLowerCase() === 'true');
-    });
-  });
-}
+const lifecycle = new ThsLifecycle({
+  appName: APP_NAME,
+  scriptPath: LIFECYCLE_SCRIPT,
+  audit: {
+    debug: async () => {},
+    info: async (component, event, details) => log(event, component, details?.data),
+    warn: async (component, event, details) => log(event, component, details?.data),
+    error: async (component, event, details) => log(event, component, details?.data),
+    query: async () => [],
+    files: async () => [],
+  },
+});
 
-// 先 osascript quit，超时未退则 pkill 兜底。幂等：已退出直接成功。
 async function quitThs() {
-  if (!(await procExists(APP_NAME))) {
-    log('quit', '同花顺未在运行，跳过', { app: APP_NAME });
-    return;
-  }
-  // 走 AppleScript 的 quit 子命令：内部已做前台置顶 + tell quit + 等待轮询。
-  await runAppleScript('quit', 20_000).catch((err) => {
-    log('quit', 'AppleScript quit 失败，将用 pkill 兜底', { error: String(err.message || err).slice(0, 200) });
-  });
-  if (!(await procExists(APP_NAME))) {
-    log('quit', '同花顺已退出（osascript quit）');
-    return;
-  }
-  // 兜底：pkill 强杀。
-  await new Promise((resolve) => {
-    execFile('pkill', ['-x', APP_NAME], (err) => {
-      resolve(err);
-    });
-  });
-  // 等待进程消失，最多 ~10s。
-  for (let i = 0; i < 50; i++) {
-    if (!(await procExists(APP_NAME))) break;
-    await sleep(0.2);
-  }
-  if (await procExists(APP_NAME)) {
-    log('quit', 'pkill 后同花顺仍存在', { app: APP_NAME });
-  } else {
-    log('quit', '同花顺已退出（pkill 兜底）');
-  }
+  await lifecycle.quit();
+  log('quit', '退出流程结束');
 }
 
 async function launchThs() {
-  if (await procExists(APP_NAME)) {
-    log('launch', '同花顺已在运行，仅做登录+切模拟流程', { app: APP_NAME });
-  } else {
-    await new Promise((resolve, reject) => {
-      execFile('open', ['-a', APP_NAME], (err) => (err ? reject(err) : resolve()));
-    });
-    // 等进程出现，最多 ~30s。
-    for (let i = 0; i < 150; i++) {
-      if (await procExists(APP_NAME)) break;
-      await sleep(0.2);
-    }
-    if (!(await procExists(APP_NAME))) {
-      log('launch', 'open 启动后同花顺进程未出现', { app: APP_NAME });
-      return;
-    }
-    log('launch', '同花顺已启动，开始登录+切模拟流程');
-  }
-  // AppleScript 登录 + 切交易页 + 切模拟 tab。失败仅记日志，不视为硬失败。
-  const result = await runAppleScript('launch-flow', 120_000);
-  log('launch', result || 'launch-flow 完成');
-}
-
-function runAppleScript(subcommand, timeoutMs) {
-  if (!existsSync(LIFECYCLE_SCRIPT)) {
-    return Promise.reject(new Error(`同花顺 lifecycle AppleScript 不存在：${LIFECYCLE_SCRIPT}`));
-  }
-  return new Promise((resolve, reject) => {
-    execFile('osascript', [LIFECYCLE_SCRIPT, subcommand], { encoding: 'utf8', timeout: timeoutMs }, (error, stdout, stderr) => {
-      if (error) {
-        const killed = error.killed || error.signal === 'SIGTERM' || error.code === 'ETIMEDOUT';
-        const message = killed
-          ? `AppleScript 执行超时（${Math.round(timeoutMs / 1000)}s）：${subcommand}`
-          : String(stderr || stdout || error.message).trim();
-        reject(new Error(message));
-        return;
-      }
-      resolve(String(stdout).trim());
-    });
+  const result = await lifecycle.ensureReady('daemon:pre-open', { timeoutMs: 150_000 });
+  log('launch', result.ready ? '同花顺已就绪' : '同花顺未能就绪', {
+    launched: result.launched,
+    windows: result.probe.windows,
+    message: result.message,
   });
+  return result.ready;
 }
 
 // ── 状态获取（HTTP 轮询 server） ─────────────────────────
@@ -248,10 +193,6 @@ async function tick() {
 }
 
 // ── 调度 ─────────────────────────────────────────────────
-
-function sleep(seconds) {
-  return new Promise((resolve) => setTimeout(resolve, seconds * 1000));
-}
 
 log('start', '同花顺生命周期守护启动', {
   app: APP_NAME,

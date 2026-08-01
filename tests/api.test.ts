@@ -241,6 +241,8 @@ describe('Trending Polars API', () => {
     expect(ranking.body.rankings[0]).toMatchObject({
       relative_strength_score: expect.any(Number),
       relative_strength_label: expect.any(String),
+      sector_strategy_score: expect.any(Number),
+      sector_strategy_label: expect.any(String),
     });
   });
 

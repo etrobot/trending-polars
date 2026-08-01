@@ -38,11 +38,44 @@ export interface PaperTradingStateStore {
   save(state: PaperTradingRuntimeState): Promise<void>;
 }
 
+export interface ThsReadinessProvider {
+  ensureReady(
+    reason: string,
+    options?: { timeoutMs?: number },
+  ): Promise<{ ready: boolean; launched: boolean; message?: string }>;
+}
+
+/**
+ * 各窗口的同花顺就绪预算。临收盘窗口总共只有 14:57–15:00 三分钟，
+ * 塞不下整套 launch-flow（最长 120s），所以只给 45s ——
+ * 正常情况 14:50 的预热已经拉好，这里只是一次 300ms 的探测。
+ */
+export function thsReadyTimeoutMs(window: TradingWindow): number {
+  return window === 'near_close' ? 45_000 : 120_000;
+}
+
+/**
+ * 窗口前的同花顺预热区间：提前把 open -a + 登录 + 切模拟 tab 跑完，
+ * 不占用真正的成交窗口。用区间而非单点，服务在区间中途重启也能补上预热。
+ * 每个槽位当天只跑一次（由调用方按 `${日期}:${槽位}` 去重）。
+ */
+export function thsWarmupSlot(minute: number): { slot: string; timeoutMs: number } | null {
+  if (minute >= 9 * 60 + 25 && minute < 9 * 60 + 31) return { slot: 'open', timeoutMs: 120_000 };
+  if (minute >= 14 * 60 + 50 && minute < NEAR_CLOSE_WINDOW_START_MINUTE) return { slot: 'near_close', timeoutMs: 120_000 };
+  if (minute >= 15 * 60 + 3 && minute < 15 * 60 + 5) return { slot: 'close', timeoutMs: 90_000 };
+  return null;
+}
+
 export interface PaperTradingServiceOptions {
   stateStore?: PaperTradingStateStore;
   marketDataProvider?: (window: TradingWindow, traceId: string) => Promise<PaperMarketContext>;
   /** 自动化开启时定期调用，刷新并返回最新交易日历（上证 sh000001）。 */
   calendarRefresher?: () => Promise<string[]>;
+  /**
+   * 交易窗口执行前保证同花顺可用（进程在跑且有可交互窗口）。
+   * 注入而非直接依赖 AppleScript，便于测试；见 server/ths-lifecycle.ts。
+   */
+  thsReadiness?: ThsReadinessProvider;
   strategy?: Partial<T1StrategyConfig>;
   now?: () => Date;
   schedulerIntervalMs?: number;
@@ -141,8 +174,23 @@ export const IMMEDIATE_AUTO_SESSION_START_MINUTE = 9 * 60 + 25;
 /** 临收盘委托窗口：14:57 起至 15:00 收盘。 */
 export const NEAR_CLOSE_WINDOW_START_MINUTE = 14 * 60 + 57;
 export const MARKET_CLOSE_MINUTE = 15 * 60;
+/**
+ * 收盘决策/盘后核对的最晚重试时刻。这两个窗口只读本地排行并回写次日计划，
+ * 不涉及成交价，所以同花顺晚间才恢复也应补跑；早收工会让次日无计划可执行。
+ */
+export const LATE_WINDOW_END_MINUTE = 23 * 60 + 30;
 export const TRADING_CALENDAR_REFRESH_INTERVAL_MS = 5 * 60_000;
 export const TRADING_CALENDAR_STALE_REFRESH_INTERVAL_MS = 60_000;
+
+/**
+ * 窗口连续失败后的退避时长。盘中窗口只有几十分钟甚至 3 分钟，退避必须压得很短
+ * 才能在窗口关闭前多试几次；盘后窗口可以跑一整晚，退避拉开以免反复弹同花顺窗口。
+ */
+export function windowRetryDelayMs(window: TradingWindow, failures: number): number {
+  const attempts = Math.max(1, Math.trunc(failures));
+  const capMs = window === 'close' || window === 'post_close' ? 900_000 : 120_000;
+  return Math.min(capMs, 20_000 * 2 ** (attempts - 1));
+}
 
 /**
  * 非交易日期/时段只需同步账户与持仓，跳过策略补算、行情补采和同花顺委托查询。

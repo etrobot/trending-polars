@@ -36,7 +36,6 @@ import {
 } from './ths-simulated-broker.js';
 import {
   assessMarketTiming,
-  ACCOUNT_SYNC_SESSION_END_MINUTE,
   buildTradingSession,
   compactDate,
   defaultAutomation,
@@ -53,6 +52,7 @@ import {
   isAccountSyncOnlyPeriod,
   isTradingDay,
   isWeakMarket,
+  LATE_WINDOW_END_MINUTE,
   MARKET_CLOSE_MINUTE,
   nextTradingDateAfter,
   type MarketTimingAssessment,
@@ -65,8 +65,12 @@ import {
   type RunWindowOptions,
   TRADING_CALENDAR_REFRESH_INTERVAL_MS,
   TRADING_CALENDAR_STALE_REFRESH_INTERVAL_MS,
+  type ThsReadinessProvider,
+  thsReadyTimeoutMs,
+  thsWarmupSlot,
   type WindowRunResult,
   shanghaiClock,
+  windowRetryDelayMs,
   withExecutionTiming,
 } from './paper-trading/helpers.js';
 
@@ -80,7 +84,8 @@ export class PaperTradingService extends EventEmitter {
   private statePromise: Promise<PaperTradingRuntimeState> | null = null;
   private scheduler: ReturnType<typeof setInterval> | null = null;
   private schedulerTickInFlight: Promise<void> | null = null;
-  private schedulerRetryAfter = 0;
+  /** 按 `${交易日}:${窗口}` 记录连续失败次数与下次可重试时刻，窗口之间互不拖累。 */
+  private readonly windowRetry = new Map<string, { failures: number; retryAfter: number }>();
   private monitorRetryAfter = 0;
   private lastMonitorAt = 0;
   private cachedTradingCalendar: string[] = [];
@@ -97,6 +102,9 @@ export class PaperTradingService extends EventEmitter {
   private readonly audit: AuditLoggerLike;
   private readonly calendarRefresher?: () => Promise<string[]>;
   private readonly calendarRefreshIntervalMs: number;
+  private readonly thsReadiness?: ThsReadinessProvider;
+  /** 当天已跑过的同花顺预热槽位，`${日期}:${槽位}`。仅进程内，重启后补跑一次无害。 */
+  private readonly warmedUpSlots = new Set<string>();
   private readonly marketDataProvider?: (window: TradingWindow, traceId: string) => Promise<PaperMarketContext>;
 
   constructor(
@@ -128,6 +136,7 @@ export class PaperTradingService extends EventEmitter {
     this.calendarRefresher = options.calendarRefresher;
     this.calendarRefreshIntervalMs = Math.max(60_000, options.calendarRefreshIntervalMs ?? TRADING_CALENDAR_REFRESH_INTERVAL_MS);
     this.marketDataProvider = options.marketDataProvider;
+    this.thsReadiness = options.thsReadiness;
   }
 
   async getAutomation() {
@@ -341,7 +350,14 @@ export class PaperTradingService extends EventEmitter {
       this.validateWindowTime(window, clock, options.trigger ?? 'scheduled');
 
       const market = context ?? await this.requireMarketContext(window, traceId);
-      this.expirePendingPlans(state, clock, market.calendar ?? []);
+      // 过期是既成事实，先落盘：后面读账户/下单失败时整个块会抛出，
+      // 不落盘的话内存标了 expired 而磁盘还是 pending。
+      if (this.expirePendingPlans(state, clock, market.calendar ?? []) > 0) {
+        await this.persist(state);
+      }
+      // 同花顺就绪兜底：必须在任何券商调用之前，所以不存在"下单失败后重拉重试
+      // 导致重复报单"的风险。已就绪时只花一次探测。
+      await this.ensureThsReady(state, `window:${window}`, thsReadyTimeoutMs(window), traceId);
       let snapshot = await this.readAndObserveAccount(state, traceId, `window:${window}:initial`);
       this.initializeCapital(state, snapshot);
       this.reconcileUncertainInstructions(state, snapshot, traceId);
@@ -1209,6 +1225,50 @@ export class PaperTradingService extends EventEmitter {
       .sort();
   }
 
+  /**
+   * 计划是否已错过执行日。纯判定，不改状态，供只读预检和清算共用。
+   */
+  private planExpired(
+    instruction: PaperStrategyInstruction,
+    clock: ReturnType<typeof shanghaiClock>,
+    executionCalendar: readonly string[],
+  ): boolean {
+    if (instruction.status !== 'pending') return false;
+    const executionDate = nextTradingDateAfter(instruction.signal_date, executionCalendar);
+    if (!executionDate) return false;
+    return executionDate < clock.date
+      || (executionDate === clock.date && clock.minute >= MARKET_CLOSE_MINUTE);
+  }
+
+  /**
+   * 过期清算的唯一入口：不读同花顺、不看交易日、不看自动化开关，
+   * 只按"执行日是否已过"这一事实判定，所以同花顺离线、周末、夜间都能正确清算。
+   * 无到期项时直接返回，不进互斥队列也不落盘。
+   */
+  async expireStalePlans(): Promise<number> {
+    // 配了日历源却还没拿到日历时先不清算：此时 nextTradingDateAfter 会退化成
+    // 纯工作日推算，跨节假日会把执行日算早一天，导致计划提前过期。
+    if (this.calendarRefresher && this.cachedTradingCalendar.length === 0) return 0;
+    const preview = await this.getState();
+    const previewClock = shanghaiClock(this.now());
+    const previewCalendar = this.effectiveTradingCalendar();
+    if (!preview.instructions.some((instruction) => this.planExpired(instruction, previewClock, previewCalendar))) {
+      return 0;
+    }
+    return this.exclusive(async () => {
+      const state = await this.getState();
+      const clock = shanghaiClock(this.now());
+      const expired = this.expirePendingPlans(state, clock, this.cachedTradingCalendar);
+      if (expired === 0) return 0;
+      await this.persist(state);
+      await this.audit.info('paper_trading', 'plans_expired', {
+        data: { expired, trading_date: clock.date, observed_at: clock.timestamp },
+      });
+      this.broadcast('plans_expired', { expired, trading_date: clock.date });
+      return expired;
+    });
+  }
+
   private expirePendingPlans(
     state: PaperTradingRuntimeState,
     clock: ReturnType<typeof shanghaiClock>,
@@ -1217,12 +1277,8 @@ export class PaperTradingService extends EventEmitter {
     const executionCalendar = this.effectiveTradingCalendar(calendar);
     let expired = 0;
     for (const instruction of state.instructions) {
-      if (instruction.status !== 'pending') continue;
-      const executionDate = nextTradingDateAfter(instruction.signal_date, executionCalendar);
-      if (!executionDate) continue;
-      const missedExecutionDay = executionDate < clock.date
-        || (executionDate === clock.date && clock.minute >= MARKET_CLOSE_MINUTE);
-      if (!missedExecutionDay) continue;
+      if (!this.planExpired(instruction, clock, executionCalendar)) continue;
+      const executionDate = nextTradingDateAfter(instruction.signal_date, executionCalendar)!;
       instruction.status = 'expired';
       instruction.completed_at = clock.timestamp;
       const windowLabel = executionWindowLabel(instruction.execution_window ?? 'open');
@@ -1552,6 +1608,14 @@ export class PaperTradingService extends EventEmitter {
   private async tickScheduler() {
     if (this.schedulerTickInFlight) return this.schedulerTickInFlight;
     this.schedulerTickInFlight = (async () => {
+      // 过期清算独立于自动化开关、交易日判定和同花顺可用性：执行日已过就是既成事实。
+      // 挂在 monitorAccount 上时，同花顺一离线当天计划就永远停在"待执行"。
+      try {
+        await this.expireStalePlans();
+      } catch (error) {
+        await this.audit.error('paper_trading', 'expire_stale_plans_failed', { error });
+      }
+
       const state = await this.getState();
       const clock = shanghaiClock(this.now());
       if (!state.automation.enabled || state.automation.paused_today) return;
@@ -1563,6 +1627,10 @@ export class PaperTradingService extends EventEmitter {
       const calendar = this.cachedTradingCalendar;
       if (!isTradingDay(clock, calendar, { calendarRefreshed: this.calendarRefreshedThisTick })) return;
 
+      // 预热要在 due 计算之前：09:25/14:50/15:03 都早于各自服务的窗口，
+      // 此时没有 due，拉起的 120s 不会挤占成交时间。
+      await this.warmUpThs(clock, randomUUID());
+
       const nowMs = this.now().getTime();
 
       let due: TradingWindow | null = null;
@@ -1570,18 +1638,24 @@ export class PaperTradingService extends EventEmitter {
         due = 'open';
       } else if (clock.minute >= NEAR_CLOSE_WINDOW_START_MINUTE && clock.minute < MARKET_CLOSE_MINUTE && !this.isWindowCompleted(state, clock.date, 'near_close')) {
         due = 'near_close';
-      } else if (clock.minute >= 15 * 60 + 5 && clock.minute <= ACCOUNT_SYNC_SESSION_END_MINUTE && !this.isWindowCompleted(state, clock.date, 'close')) {
+      } else if (clock.minute >= 15 * 60 + 5 && clock.minute <= LATE_WINDOW_END_MINUTE && !this.isWindowCompleted(state, clock.date, 'close')) {
         due = 'close';
-      } else if (clock.minute >= 15 * 60 + 10 && clock.minute <= ACCOUNT_SYNC_SESSION_END_MINUTE && !this.isWindowCompleted(state, clock.date, 'post_close')) {
+      } else if (clock.minute >= 15 * 60 + 10 && clock.minute <= LATE_WINDOW_END_MINUTE && !this.isWindowCompleted(state, clock.date, 'post_close')) {
         due = 'post_close';
       }
       if (due) {
-        if (nowMs < this.schedulerRetryAfter) return;
+        const retryKey = `${clock.date}:${due}`;
+        if (nowMs < (this.windowRetry.get(retryKey)?.retryAfter ?? 0)) return;
         try {
           await this.runWindow(due);
-          this.schedulerRetryAfter = 0;
+          this.windowRetry.delete(retryKey);
         } catch (error) {
-          this.schedulerRetryAfter = this.now().getTime() + 5 * 60_000;
+          const failures = (this.windowRetry.get(retryKey)?.failures ?? 0) + 1;
+          this.windowRetry.set(retryKey, {
+            failures,
+            retryAfter: this.now().getTime() + windowRetryDelayMs(due, failures),
+          });
+          this.pruneWindowRetry(clock.date);
           await this.exclusive(async () => {
             const current = await this.getState();
             const message = error instanceof Error ? error.message : String(error);
@@ -1606,6 +1680,62 @@ export class PaperTradingService extends EventEmitter {
       }
     })().finally(() => { this.schedulerTickInFlight = null; });
     return this.schedulerTickInFlight;
+  }
+
+  private pruneWindowRetry(tradingDate: string) {
+    for (const key of this.windowRetry.keys()) {
+      if (!key.startsWith(`${tradingDate}:`)) this.windowRetry.delete(key);
+    }
+  }
+
+  /**
+   * 保证同花顺可用。未注入 thsReadiness 时是 no-op（测试与非 macOS 环境）。
+   * 拉不起来不抛错：让窗口自己去撞券商调用并走既有的失败退避，
+   * 这样失败原因仍是券商的原始报错，不会被"拉起失败"掩盖。
+   */
+  private async ensureThsReady(
+    state: PaperTradingRuntimeState,
+    reason: string,
+    timeoutMs: number,
+    traceId: string,
+  ): Promise<void> {
+    if (!this.thsReadiness) return;
+    try {
+      const result = await this.thsReadiness.ensureReady(reason, { timeoutMs });
+      if (result.ready) {
+        if (result.launched) {
+          this.recordEvent(state, 'system', 'ths_launched', `同花顺已自动拉起并就绪（${reason}）`);
+        }
+        return;
+      }
+      const message = result.message ?? '同花顺仍不可用';
+      state.automation = { ...state.automation, last_error: summarizeSubmissionError(message) };
+      this.recordEvent(state, 'system', 'ths_not_ready', `同花顺就绪失败（${reason}）：${summarizeSubmissionError(message, 120)}`);
+      await this.audit.warn('paper_trading', 'ths_not_ready', {
+        traceId,
+        data: { reason, timeout_ms: timeoutMs, message },
+      });
+    } catch (error) {
+      await this.audit.error('paper_trading', 'ths_ensure_ready_failed', { traceId, data: { reason }, error });
+    }
+  }
+
+  /** 窗口前预热：把耗时的 open -a + 登录 + 切模拟 tab 挪到成交窗口之外。 */
+  private async warmUpThs(clock: ReturnType<typeof shanghaiClock>, traceId: string): Promise<void> {
+    if (!this.thsReadiness) return;
+    const warmup = thsWarmupSlot(clock.minute);
+    if (!warmup) return;
+    const key = `${clock.date}:${warmup.slot}`;
+    if (this.warmedUpSlots.has(key)) return;
+    this.warmedUpSlots.add(key);
+    for (const existing of this.warmedUpSlots) {
+      if (!existing.startsWith(`${clock.date}:`)) this.warmedUpSlots.delete(existing);
+    }
+    await this.exclusive(async () => {
+      const state = await this.getState();
+      await this.ensureThsReady(state, `warmup:${warmup.slot}`, warmup.timeoutMs, traceId);
+      await this.persist(state);
+    });
   }
 
   private requireMarketContext(window: TradingWindow, traceId: string): Promise<PaperMarketContext> {

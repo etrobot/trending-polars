@@ -144,6 +144,14 @@ export interface RankingRow {
   relative_strength_label?: string;
   /** 个股 N 日收益 − 基准 N 日收益（百分点）；基准缺失时为 null。 */
   relative_strength_pct?: number | null;
+  /** 板块趋势 × 个股形态修正，直接应用在归一化后的 100 分制总分上。 */
+  sector_strategy_score?: number;
+  /** 风险扣分（<=0）；风险信号触发时机会分强制为 0。 */
+  sector_risk_penalty?: number;
+  /** 机会加分（>=0）。 */
+  sector_opportunity_bonus?: number;
+  sector_strategy_label?: string;
+  sector_strategy_reason?: string;
   limit_up_count_20d?: number;
   alignment: string;
   trend_strength?: number;
