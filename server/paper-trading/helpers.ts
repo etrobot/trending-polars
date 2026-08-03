@@ -306,6 +306,7 @@ export function defaultState(timestamp: string): PaperTradingRuntimeState {
     instructions: [],
     tracked_positions: [],
     events: [],
+    asset_history: [],
     updated_at: timestamp,
   };
 }

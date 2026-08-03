@@ -321,6 +321,7 @@ export interface PaperOverview {
     source: 'tonghuashun-gui' | 'runtime-state';
     observed_at?: string;
   };
+  asset_history: PaperAssetPoint[];
   account: {
     total_assets: number;
     available_cash: number;
@@ -419,6 +420,12 @@ export interface PaperAccountObservation {
   orders: PaperOrder[];
 }
 
+/** 账户资产走势的一个采样点（账户快照时记录，去重后保留最近若干条）。 */
+export interface PaperAssetPoint {
+  observed_at: string;
+  total_assets: number;
+}
+
 export interface PaperStrategyConfigSnapshot {
   maxHoldDays: number;
   maxPositions: number;
@@ -438,6 +445,7 @@ export interface PaperTradingRuntimeState {
   instructions: PaperStrategyInstruction[];
   tracked_positions: PaperTrackedPosition[];
   last_account_observation?: PaperAccountObservation;
+  asset_history: PaperAssetPoint[];
   events: PaperTradingEvent[];
   last_signal_date?: string;
   strategy_config?: PaperStrategyConfigSnapshot;

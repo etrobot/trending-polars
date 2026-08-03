@@ -78,6 +78,9 @@ export { PAPER_ENGINE_VERSION } from './paper-trading/helpers.js';
 
 export type { PaperMarketContext, PaperTradingServiceOptions, PaperTradingStateStore };
 
+/** 账户资产走势最多保留的采样点数；只记录数值或日期变化，避免高频轮询产生冗余点。 */
+const ASSET_HISTORY_LIMIT = 240;
+
 export class PaperTradingService extends EventEmitter {
   private overviewInFlight: Promise<PaperOverview> | null = null;
   private operationQueue: Promise<void> = Promise.resolve();
@@ -610,6 +613,7 @@ export class PaperTradingService extends EventEmitter {
     return {
       ok: true,
       connection,
+      asset_history: state.asset_history ?? [],
       account: {
         total_assets: snapshot.totalAssets,
         available_cash: snapshot.availableCash,
@@ -1373,6 +1377,7 @@ export class PaperTradingService extends EventEmitter {
       positions: snapshot.positions.map((position) => ({ ...position })),
       orders: snapshot.orders.map((order) => ({ ...order })),
     };
+    this.recordAssetHistory(state, current.observed_at, current.total_assets);
 
     if (!previous) {
       await this.audit.info('account_monitor', 'initial_snapshot', {
@@ -1444,6 +1449,16 @@ export class PaperTradingService extends EventEmitter {
         },
       });
     }
+  }
+
+  /** 追加资产走势采样点：同一日数值未变化时不重复记录，超出上限后丢弃最旧的点。 */
+  private recordAssetHistory(state: PaperTradingRuntimeState, observedAt: string, totalAssets: number) {
+    const points = state.asset_history ?? [];
+    const last = points[points.length - 1];
+    const date = observedAt.slice(0, 10);
+    if (last && last.total_assets === totalAssets && last.observed_at.slice(0, 10) === date) return;
+    points.push({ observed_at: observedAt, total_assets: totalAssets });
+    state.asset_history = points.slice(-ASSET_HISTORY_LIMIT);
   }
 
   private async submitBrokerOrder(
@@ -1767,6 +1782,7 @@ export class PaperTradingService extends EventEmitter {
         instructions: (stored.instructions ?? []).map((instruction) => normalizeInstructionOnLoad(instruction)),
         tracked_positions: stored.tracked_positions ?? [],
         events: stored.events ?? [],
+        asset_history: stored.asset_history ?? [],
       };
       this.hydrateStrategyFromState(state);
       return state;

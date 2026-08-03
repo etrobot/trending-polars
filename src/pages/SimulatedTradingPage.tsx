@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { Modal } from '../components/Modal';
 import { PageHeaderActions } from '../components/HeaderActions';
+import { MiniEquityChart } from '../components/Charts';
 import { Button, EmptyState, LoadingPanel, Pagination, SectionHeading } from '../components/Ui';
 import { useTaskResult, useTasks } from '../context/TasksContext';
 import { api, formatMoney, pctColor } from '../lib/api';
@@ -436,14 +437,11 @@ export function SimulatedTradingPage() {
         </div>
 
         <aside className="space-y-3">
-          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base text-ink">账户</h2><span className="font-mono text-[11px] text-muted">{plan.ranking_date}</span></div><div className="divide-y divide-line-soft">{[
-            ['总资产', hasAccountSnapshot ? formatMoney(account.total_assets) : '—', 'text-ink'],
+          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base text-ink">账户</h2><span className={`font-mono text-sm font-semibold ${hasAccountSnapshot ? 'text-ink' : 'text-muted'}`}>{hasAccountSnapshot ? formatMoney(account.total_assets) : '—'}</span></div><div className="border-b border-line-soft px-3 pb-2.5 pt-3"><MiniEquityChart points={overview.asset_history ?? []} /></div><div className="divide-y divide-line-soft">{[
             ['可用资金', hasAccountSnapshot ? formatMoney(account.available_cash) : '—', 'text-ink'],
             ['持仓盈亏', hasAccountSnapshot ? formatMoney(account.pnl_summary.amount) : '—', hasAccountSnapshot ? pctColor(account.pnl_summary.amount) : 'text-muted'],
             ['盈亏率', hasAccountSnapshot ? `${account.pnl_summary.pct >= 0 ? '+' : ''}${account.pnl_summary.pct.toFixed(2)}%` : '—', hasAccountSnapshot ? pctColor(account.pnl_summary.pct) : 'text-muted'],
             ['当前仓位', hasAccountSnapshot ? `${account.current_position_pct.toFixed(1)}%` : '—', 'text-ink'],
-            ['资金上限', `${plan.target_position_pct}%`, 'text-primary-active'],
-            ['待执行指令', String(plan.orders.length), 'text-ink'],
           ].map(([label, value, valueClass]) => <div key={label} className="flex items-center justify-between gap-3 px-3 py-2.5"><span className="text-[11px] text-muted">{label}</span><span className={`font-mono text-[11px] ${valueClass}`}>{value}</span></div>)}</div></section>
 
           <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base text-ink">策略</h2></div><table className="data-table"><tbody>{[

@@ -154,3 +154,64 @@ export function Sparkline({ values, positive = true }: { values: number[]; posit
   const polyline = line.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ');
   return <svg viewBox={`0 0 ${width} ${height}`} className="h-9 w-28"><polyline points={polyline} fill="none" stroke={positive ? '#cd4239' : '#2c8c66'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>;
 }
+
+/** 账户卡片里的小型资产走势折线图，随容器宽度缩放。 */
+export function MiniEquityChart({ points }: { points: Array<{ observed_at: string; total_assets: number }> }) {
+  const values = points.map((point) => Number(point.total_assets)).filter(Number.isFinite);
+  if (values.length < 2) {
+    return <div className="flex h-24 items-center justify-center text-[11px] text-muted">暂无资产走势数据</div>;
+  }
+  const width = 300;
+  const height = 96;
+  const pad = { top: 12, right: 8, bottom: 18, left: 46 };
+  const innerW = width - pad.left - pad.right;
+  const innerH = height - pad.top - pad.bottom;
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+
+  const line = values.map((value, index) => ({
+    x: pad.left + (index / Math.max(1, values.length - 1)) * innerW,
+    y: pad.top + innerH - ((value - min) / range) * innerH,
+  }));
+  const polyline = line.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+  const positive = values.at(-1)! >= values[0];
+  const stroke = positive ? '#cd4239' : '#2c8c66';
+  const area = `M ${line[0].x} ${pad.top + innerH} L ${polyline.replaceAll(',', ' ')} L ${line.at(-1)!.x} ${pad.top + innerH} Z`;
+  const ticks = niceTicks(min, max, 4);
+  const first = points[0];
+  const last = points[points.length - 1];
+
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} className="w-full" style={{ aspectRatio: `${width}/${height}` }} role="img" aria-label="资产走势折线图">
+      <defs>
+        <linearGradient id="mini-equity-area" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stopColor={stroke} stopOpacity="0.2" />
+          <stop offset="100%" stopColor={stroke} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+
+      {ticks.map((tick) => {
+        const y = pad.top + innerH - ((tick - min) / range) * innerH;
+        return (
+          <g key={tick}>
+            <line x1={pad.left} x2={width - pad.right} y1={y} y2={y} stroke="#bfc1b7" strokeDasharray="3 5" />
+            <text x={pad.left - 6} y={y} textAnchor="end" dominantBaseline="middle" fill="#6c6e63" fontSize="9" fontFamily="JetBrains Mono, monospace">
+              {formatAxisValue(tick)}
+            </text>
+          </g>
+        );
+      })}
+
+      {[{ date: first.observed_at, x: line[0].x, anchor: 'start' as const }, { date: last.observed_at, x: line.at(-1)!.x, anchor: 'end' as const }].map(({ date, x, anchor }) => (
+        <text key={date} x={x} y={height - 4} textAnchor={anchor} fill="#6c6e63" fontSize="9" fontFamily="JetBrains Mono, monospace">
+          {formatDateLabel(date)}
+        </text>
+      ))}
+
+      <path d={area} fill="url(#mini-equity-area)" />
+      <polyline points={polyline} fill="none" stroke={stroke} strokeWidth="1.6" strokeLinejoin="round" />
+      <circle cx={line.at(-1)!.x} cy={line.at(-1)!.y} r="2.5" fill={stroke} stroke="#eeefe9" strokeWidth="1.5" />
+    </svg>
+  );
+}

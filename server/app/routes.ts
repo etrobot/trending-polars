@@ -531,14 +531,20 @@ export function registerRoutes(
 
   app.post('/api/backtest/optimize', asyncHandler(async (request, response) => {
     const days = numberParam(request.query.days, 20, MIN_BACKTEST_DAYS, MAX_BACKTEST_DAYS);
+    const simulationDays = numberParam(request.query.simulation_days, days + MIN_BACKTEST_DAYS, MIN_BACKTEST_DAYS, MAX_BACKTEST_DAYS);
+    const forwardDays = simulationDays - days;
+    if (forwardDays < MIN_BACKTEST_DAYS) {
+      response.status(400).json({ error: `优化天数必须至少比模拟天数少 ${MIN_BACKTEST_DAYS} 日，以保留 forward 验证窗口` });
+      return;
+    }
     const requestedDate = marketDateParam(request.query.date);
-    const taskLabel = `参数优化（近 ${days} 日远期收益验证）`;
+    const taskLabel = `参数优化（模拟前 ${days} 日训练，后续 ${forwardDays} 日验证）`;
     const task = tasks.start('backtest_optimize', taskLabel, async ({ progress, cancelled, traceId }) => {
       const source = await store.getRankingUniverse();
       if (!source.rankings.length) throw new Error('当前股票池为空，无法运行参数优化');
       const prepared = await marketService.ensureHistoricalCoverage({
         rankings: source.rankings,
-        days,
+        days: simulationDays,
         asOfDate: requestedDate,
         traceId,
         cancelled,
@@ -546,28 +552,37 @@ export function registerRoutes(
       });
       if (cancelled()) return null;
       const history = prepared.history;
+      const dates = history.calendar.filter((date) => date <= history.as_of_date).sort();
+      const trainingAsOfDate = dates.at(-forwardDays - 1);
+      if (!trainingAsOfDate) throw new Error(`历史行情不足，无法在 ${days} 日优化样本后保留 ${forwardDays} 日 forward 验证窗口`);
+      const trainingHistory = { ...history, as_of_date: trainingAsOfDate };
       console.log('[backtest] /api/backtest/optimize', {
         days,
+        simulation_days: simulationDays,
+        forward_days: forwardDays,
+        training_as_of_date: trainingAsOfDate,
         history_as_of_date: history.as_of_date,
         stocks: history.stocks.length,
       });
       await audit.info('backtest', 'optimize_started', {
         traceId,
-        data: { days, history_as_of_date: history.as_of_date, stocks: history.stocks.length },
+        data: { days, simulation_days: simulationDays, forward_days: forwardDays, training_as_of_date: trainingAsOfDate, history_as_of_date: history.as_of_date, stocks: history.stocks.length },
       });
       progress(58, '阶段1：优化 scoreStock 评分参数（距低点分档 + 趋势）');
-      const result = optimizeStrategyParams(history, { days });
+      const result = optimizeStrategyParams(trainingHistory, { days });
       progress(90, '阶段2：固定评分配置，网格搜索回测交易参数');
       await audit.info('backtest', 'optimize_completed', {
         traceId,
-        data: { days, scoring: result.scoring, optimized: result.optimized, validation: result.validation },
+        data: { days, simulation_days: simulationDays, forward_days: forwardDays, training_as_of_date: trainingAsOfDate, scoring: result.scoring, optimized: result.optimized, validation: result.validation },
       });
       // 持久化到文件，供前端随时读取
       await store.saveOptimizeResult(result);
       return {
         ...result,
+        training_as_of_date: trainingAsOfDate,
+        forward_days: forwardDays,
         collected: prepared.collected,
-        message: `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成参数优化（${history.as_of_date} 前 ${days} 日）`,
+        message: `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成参数优化（训练截至 ${trainingAsOfDate}，${forwardDays} 日后进入模拟窗口）`,
       };
     });
     response.status(202).json({ task_id: task.id, status: 'started', message: '参数优化任务已启动' });

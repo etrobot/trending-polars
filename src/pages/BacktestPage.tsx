@@ -124,6 +124,8 @@ function configNumberValue(config: Record<string, number | string | null>, key: 
 
 interface OptimizeResult {
   days: number;
+  training_as_of_date?: string;
+  forward_days?: number;
   scoring: {
     config: ScoreStockConfigView;
     scoreCorrelation: number;
@@ -185,6 +187,7 @@ export function BacktestPage() {
   const [optimizeResult, setOptimizeResult] = useState<OptimizeResult | null>(null);
   const [appliedScoringConfig, setAppliedScoringConfig] = useState<ScoreStockConfigView | null>(null);
   const [days, setDays] = useState(60);
+  const [optimizationDays, setOptimizationDays] = useState(40);
   const [strategyCount, setStrategyCount] = useState(3);
   const [positionSizePct, setPositionSizePct] = useState(20);
   const [maxPositions, setMaxPositions] = useState(5);
@@ -377,8 +380,8 @@ export function BacktestPage() {
     setOptimizing(true);
     setError('');
     setNotice('');
-    console.log('[backtest] start optimize', { days });
-    const response = await api<{ task_id: string }>(`/api/backtest/optimize?days=${days}`, { method: 'POST' });
+    console.log('[backtest] start optimize', { optimizationDays, simulationDays: days });
+    const response = await api<{ task_id: string }>(`/api/backtest/optimize?days=${optimizationDays}&simulation_days=${days}`, { method: 'POST' });
     setOptimizeTaskId(response.task_id);
     setPanelOpen(true);
   };
@@ -403,7 +406,6 @@ export function BacktestPage() {
     setDistanceFromLowWeightPct(params.distanceFromLowWeightPct);
     setVolatilityWeightPct(params.volatilityWeightPct);
     setRelativeStrengthWeightPct(params.relativeStrengthWeightPct ?? 100);
-    setDays(optimizeResult.days);
     setAppliedScoringConfig(optimizeResult.scoring.config);
     setOptimizeOpen(false);
     setSettingsOpen(true);
@@ -693,7 +695,8 @@ export function BacktestPage() {
           <section>
             <h3 className="mb-3 font-display text-sm text-ink">手动回测参数</h3>
       <div className="grid gap-3 sm:grid-cols-3">
-        <label className="sm:col-span-3 block"><span className="font-mono text-[11px] text-muted">回测天数（固定，优化共用）</span><input type="number" min="5" max="750" step="5" value={days} onChange={(event) => setDays(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+        <label className="block"><span className="font-mono text-[11px] text-muted">模拟天数（完整窗口）</span><input type="number" min="10" max="750" step="5" value={days} onChange={(event) => { const nextDays = Number(event.target.value); setDays(nextDays); setOptimizationDays((current) => Math.min(current, Math.max(5, nextDays - 5))); }} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
+        <label className="block"><span className="font-mono text-[11px] text-muted">优化天数（从模拟窗口起始日算起）</span><input type="number" min="5" max={Math.max(5, days - 5)} step="5" value={optimizationDays} onChange={(event) => setOptimizationDays(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
         <label className="sm:col-span-3 block"><span className="font-mono text-[11px] text-muted">策略组合个数（固定，仅随机组合使用）</span><input type="number" min="1" max="200" step="1" value={strategyCount} onChange={(event) => setStrategyCount(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
             <label className="block"><span className="font-mono text-[11px] text-muted">单票仓位（%）（上限）</span><input type="number" min="1" max="100" value={positionSizePct} onChange={(event) => setPositionSizePct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
             <label className="block"><span className="font-mono text-[11px] text-muted">持仓个数（上限）</span><input type="number" min="1" max="20" value={maxPositions} onChange={(event) => setMaxPositions(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
@@ -707,7 +710,7 @@ export function BacktestPage() {
             <label className="block"><span className="font-mono text-[11px] text-muted">相对强度权重（%）（上限）</span><input type="number" min="1" max={MAX_FACTOR_WEIGHT_PCT} value={relativeStrengthWeightPct} onChange={(event) => setRelativeStrengthWeightPct(Number(event.target.value))} className="mt-2 w-full border border-line bg-surface px-3 py-2 font-mono text-[12px] text-ink" /></label>
           </div>
           <div className="mt-3 bg-surface-elevated p-3 text-[11px] leading-4 text-muted">
-            回测当前方案：直接使用上方参数原值跑 1 组结果。回测随机组合：在上限内随机取参，分别跑 {strategyCount} 组独立回测，可在历史记录中逐条查看。
+            模拟窗口共 {days} 个交易日；优化使用其起始的 {optimizationDays} 日，后续 {Math.max(0, days - optimizationDays)} 日用于 forward 验证。优化天数必须小于模拟天数，至少预留 5 个交易日作为样本外窗口。回测当前方案：直接使用上方参数原值跑 1 组结果。回测随机组合：在上限内随机取参，分别跑 {strategyCount} 组独立回测，可在历史记录中逐条查看。
           </div>
           </section>
 

@@ -973,6 +973,7 @@ ThsLifecycle.ensureReady(reason, { timeoutMs })
   "tracked_positions": [],
   "events": [],
   "last_account_observation": {},
+  "asset_history": [],
   "last_signal_date": "20260722",
   "updated_at": "2026-07-23 09:31:05"
 }
