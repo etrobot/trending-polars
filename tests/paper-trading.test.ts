@@ -9,6 +9,7 @@ import {
   defaultState,
   immediateAutoWindowRejection,
   isAccountSyncOnlyPeriod,
+  isThsBrokerReadOnlyPeriod,
   isTradingDay,
   nextTradingDateAfter,
   resolveAutoTradingWindow,
@@ -557,7 +558,7 @@ describe('Node T+1 paper-trading core', () => {
         .toEqual([20_000, 40_000, 80_000, 160_000, 320_000, 640_000, 900_000]);
     });
 
-    it('临收盘 14:57-15:00 内可重试 3 次以上（原固定 5 分钟退避只有 1 次）', () => {
+    it('临收盘 14:55-15:00 内可重试 3 次以上（原固定 5 分钟退避只有 1 次）', () => {
       let elapsed = 0;
       let attempts = 1;
       while (elapsed + windowRetryDelayMs('near_close', attempts) < 3 * 60_000) {
@@ -657,15 +658,116 @@ describe('Node T+1 paper-trading core', () => {
       expect(readiness.calls).toHaveLength(1);
     });
 
-    it('预热区间 09:25-09:31 / 14:50-14:57 / 15:03-15:05 各覆盖一次', () => {
+    it('预热区间 09:25-09:31 / 14:50-14:55 各覆盖一次，收盘后不再 launch-flow', () => {
       expect(thsWarmupSlot(9 * 60 + 24)).toBeNull();
       expect(thsWarmupSlot(9 * 60 + 25)).toMatchObject({ slot: 'open', timeoutMs: 120_000 });
       expect(thsWarmupSlot(9 * 60 + 30)).toMatchObject({ slot: 'open' });
       expect(thsWarmupSlot(9 * 60 + 31)).toBeNull();
       expect(thsWarmupSlot(14 * 60 + 50)).toMatchObject({ slot: 'near_close', timeoutMs: 120_000 });
-      expect(thsWarmupSlot(14 * 60 + 57)).toBeNull();
-      expect(thsWarmupSlot(15 * 60 + 3)).toMatchObject({ slot: 'close', timeoutMs: 90_000 });
+      expect(thsWarmupSlot(14 * 60 + 54)).toMatchObject({ slot: 'near_close' });
+      expect(thsWarmupSlot(14 * 60 + 55)).toBeNull();
+      expect(thsWarmupSlot(15 * 60 + 3)).toBeNull();
       expect(thsWarmupSlot(15 * 60 + 5)).toBeNull();
+    });
+
+    it('收盘决策/盘后核对不拉起同花顺', async () => {
+      const readiness = new ReadinessSpy();
+      const service = new PaperTradingService(new FlowBroker(account()), {
+        stateStore: new TestStateStore(),
+        thsReadiness: readiness,
+        now: () => new Date('2026-07-24T15:10:00+08:00'),
+      });
+      await service.runWindow('close', context('20260724', [], ['20260723', '20260724']));
+      await service.runWindow('post_close', context('20260724', [], ['20260723', '20260724']));
+      expect(readiness.calls).toHaveLength(0);
+    });
+
+    it('15:00 后账户同步走 snapshotAccountOnly，但仍可补算收盘计划', async () => {
+      const now = new Date('2026-07-24T15:10:00+08:00');
+      const audit = new RecordingAudit();
+      let accountOnlyCalls = 0;
+      let fullSnapshotCalls = 0;
+      const broker: SimulatedBroker = {
+        async snapshot() {
+          fullSnapshotCalls += 1;
+          return { availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] };
+        },
+        async snapshotAccountOnly() {
+          accountOnlyCalls += 1;
+          return { availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] };
+        },
+        async quote() { return 10; },
+        async placeOrder(order: PaperOrder) {
+          return { verified: true, brokerOutput: `ORDER_VERIFIED|${order.stock_code}` };
+        },
+        async cancelOrder() {
+          return { verified: true, brokerOutput: 'CANCEL_VERIFIED' };
+        },
+      };
+      const service = new PaperTradingService(broker, { audit, now: () => now });
+      const ctx = context('20260724', [], ['20260723', '20260724']);
+      await service.overview(ctx.analysis, ctx.rankingDate, ctx.rankings, ctx.calendar, 'trace-broker-readonly', ctx.marketAverageChange, ctx.limitUpRecords);
+
+      expect(isThsBrokerReadOnlyPeriod(shanghaiClock(now), ctx.calendar ?? [])).toBe(true);
+      expect(isAccountSyncOnlyPeriod(shanghaiClock(now), ctx.calendar ?? [])).toBe(false);
+      expect(accountOnlyCalls).toBe(1);
+      expect(fullSnapshotCalls).toBe(0);
+      expect(audit.records.some((record) => record.event === 'account_only_sync')).toBe(true);
+    });
+
+    it('收盘后账户同步复用当日缓存观测，不再点击同花顺（零点击）', async () => {
+      let accountOnlyCalls = 0;
+      let fullSnapshotCalls = 0;
+      const broker: SimulatedBroker = {
+        async snapshot() {
+          fullSnapshotCalls += 1;
+          return { availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] };
+        },
+        async snapshotAccountOnly() {
+          accountOnlyCalls += 1;
+          return { availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] };
+        },
+        async quote() { return 10; },
+        async placeOrder(order: PaperOrder) {
+          return { verified: true, brokerOutput: `ORDER_VERIFIED|${order.stock_code}` };
+        },
+        async cancelOrder() {
+          return { verified: true, brokerOutput: 'CANCEL_VERIFIED' };
+        },
+      };
+      const store = new TestStateStore();
+      const morningService = new PaperTradingService(broker, {
+        stateStore: store,
+        now: () => new Date('2026-07-24T09:31:00+08:00'),
+      });
+      await morningService.runWindow('open', context('20260724', [], ['20260723', '20260724']));
+
+      fullSnapshotCalls = 0;
+      accountOnlyCalls = 0;
+      const audit = new RecordingAudit();
+      const eveningService = new PaperTradingService(broker, {
+        stateStore: store,
+        audit,
+        now: () => new Date('2026-07-24T15:10:00+08:00'),
+      });
+      const ctx = context('20260724', [], ['20260723', '20260724']);
+      await eveningService.runWindow('close', ctx);
+      await eveningService.runWindow('post_close', ctx);
+      await eveningService.monitorAccount('trace-zero-click', 'scheduled_monitor');
+
+      expect(fullSnapshotCalls).toBe(0);
+      expect(accountOnlyCalls).toBe(0);
+      expect(audit.records.some((record) => (
+        record.event === 'account_only_sync'
+        && (record.details?.data as { mode?: string } | undefined)?.mode === 'cached'
+      ))).toBe(true);
+    });
+
+    it('收盘后撤单被拒绝（只读时段不点同花顺）', async () => {
+      const service = new PaperTradingService(new FlowBroker(account()), {
+        now: () => new Date('2026-07-24T15:30:00+08:00'),
+      });
+      await expect(service.cancel('CANCEL', 'order-1')).rejects.toThrow('只读时段');
     });
 
     it('调度器在开盘前预热一次，同日重复 tick 不再预热', async () => {
@@ -1054,7 +1156,8 @@ describe('Node T+1 paper-trading core', () => {
   });
 
   it('records semantic Tonghuashun account changes for monitoring and diagnosis', async () => {
-    const now = new Date('2026-07-23T15:10:00+08:00');
+    // 盘中时段走全量快照，才能读到券商侧变化；收盘后只读缓存不查券商。
+    const now = new Date('2026-07-23T10:10:00+08:00');
     const audit = new RecordingAudit();
     const broker = new FlowBroker({ availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] });
     const service = new PaperTradingService(broker, { audit, now: () => now });
@@ -1188,7 +1291,8 @@ describe('Node T+1 paper-trading core', () => {
   it('resolves auto trading window from shanghai clock', () => {
     expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T09:30:00+08:00')))).toBe('open');
     expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T11:00:00+08:00')))).toBe('open');
-    expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T14:55:00+08:00')))).toBe('open');
+    expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T14:54:00+08:00')))).toBe('open');
+    expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T14:55:00+08:00')))).toBe('near_close');
     expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T14:57:00+08:00')))).toBe('near_close');
     expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T15:02:00+08:00')))).toBe('close');
     expect(resolveAutoTradingWindow(shanghaiClock(new Date('2026-07-24T15:10:00+08:00')))).toBe('post_close');

@@ -46,7 +46,7 @@ export interface ThsReadinessProvider {
 }
 
 /**
- * 各窗口的同花顺就绪预算。临收盘窗口总共只有 14:57–15:00 三分钟，
+ * 各窗口的同花顺就绪预算。临收盘窗口总共只有 14:55–15:00 五分钟，
  * 塞不下整套 launch-flow（最长 120s），所以只给 45s ——
  * 正常情况 14:50 的预热已经拉好，这里只是一次 300ms 的探测。
  */
@@ -62,7 +62,7 @@ export function thsReadyTimeoutMs(window: TradingWindow): number {
 export function thsWarmupSlot(minute: number): { slot: string; timeoutMs: number } | null {
   if (minute >= 9 * 60 + 25 && minute < 9 * 60 + 31) return { slot: 'open', timeoutMs: 120_000 };
   if (minute >= 14 * 60 + 50 && minute < NEAR_CLOSE_WINDOW_START_MINUTE) return { slot: 'near_close', timeoutMs: 120_000 };
-  if (minute >= 15 * 60 + 3 && minute < 15 * 60 + 5) return { slot: 'close', timeoutMs: 90_000 };
+  // 收盘决策/盘后核对不再预热 launch-flow：15:00 后同花顺界面点控件易弹 begin failed。
   return null;
 }
 
@@ -171,8 +171,8 @@ export const ACCOUNT_SYNC_SESSION_START_MINUTE = 9 * 60 + 25;
 export const ACCOUNT_SYNC_SESSION_END_MINUTE = 15 * 60 + 20;
 /** 立即执行（auto）最早可触发时间。 */
 export const IMMEDIATE_AUTO_SESSION_START_MINUTE = 9 * 60 + 25;
-/** 临收盘委托窗口：14:57 起至 15:00 收盘。 */
-export const NEAR_CLOSE_WINDOW_START_MINUTE = 14 * 60 + 57;
+/** 临收盘委托窗口：14:55 起至 15:00 收盘。 */
+export const NEAR_CLOSE_WINDOW_START_MINUTE = 14 * 60 + 55;
 export const MARKET_CLOSE_MINUTE = 15 * 60;
 /**
  * 收盘决策/盘后核对的最晚重试时刻。这两个窗口只读本地排行并回写次日计划，
@@ -221,6 +221,18 @@ export function isAccountSyncOnlyPeriod(
 ): boolean {
   if (!isTradingDay(clock, calendar)) return true;
   return clock.minute < ACCOUNT_SYNC_SESSION_START_MINUTE || clock.minute > ACCOUNT_SYNC_SESSION_END_MINUTE;
+}
+
+/**
+ * 同花顺 AppleScript 只读模式：只拉资金/持仓，不查委托、不 launch-flow。
+ * 15:00 收盘后切 tab / 点控件容易触发同花顺弹 "begin failed"。
+ */
+export function isThsBrokerReadOnlyPeriod(
+  clock: ReturnType<typeof shanghaiClock>,
+  calendar: readonly string[] = [],
+): boolean {
+  if (!isTradingDay(clock, calendar)) return true;
+  return clock.minute < ACCOUNT_SYNC_SESSION_START_MINUTE || clock.minute >= MARKET_CLOSE_MINUTE;
 }
 
 export function buildTradingSession(
@@ -396,6 +408,23 @@ export function withExecutionTiming(
   return side === 'sell'
     ? `${base}；${executionWindowLabel(executionWindow)}卖出`
     : `${base} ${executionWindowLabel(executionWindow)}`;
+}
+
+/**
+ * A 股最小价位 0.01 元，2 档 = 0.02 元。
+ * 买入加两档（提高成交概率），卖出减两档（提高成交概率）。
+ */
+export const A_SHARE_TICK = 0.01;
+export const AGGRESSIVE_TICKS = 2;
+
+export function adjustOrderPrice(
+  price: number,
+  side: 'buy' | 'sell',
+  window: TradingWindow,
+): number {
+  if (window !== 'near_close') return round(price, 2);
+  const offset = side === 'buy' ? AGGRESSIVE_TICKS * A_SHARE_TICK : -AGGRESSIVE_TICKS * A_SHARE_TICK;
+  return round(price + offset, 2);
 }
 
 /** 仅「已提交但回查失败」视为结果不确定；AppleScript/界面错误通常委托未发出。 */

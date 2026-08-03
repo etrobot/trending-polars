@@ -35,6 +35,7 @@ import {
   type SimulatedBroker,
 } from './ths-simulated-broker.js';
 import {
+  adjustOrderPrice,
   assessMarketTiming,
   buildTradingSession,
   compactDate,
@@ -50,6 +51,7 @@ import {
   normalizeInstructionOnLoad,
   summarizeSubmissionError,
   isAccountSyncOnlyPeriod,
+  isThsBrokerReadOnlyPeriod,
   isTradingDay,
   isWeakMarket,
   LATE_WINDOW_END_MINUTE,
@@ -150,7 +152,7 @@ export class PaperTradingService extends EventEmitter {
       automation: { ...state.automation, next_window: this.nextWindowLabel(state, clock) },
       schedule: [
         { window: 'open', label: '开盘执行', time: '09:31', status: this.windowStatus(state, clock.date, 'open') },
-        { window: 'near_close', label: '临收盘执行', time: '14:57', status: this.windowStatus(state, clock.date, 'near_close') },
+        { window: 'near_close', label: '临收盘执行', time: '14:55', status: this.windowStatus(state, clock.date, 'near_close') },
         { window: 'close', label: '收盘决策', time: '15:05', status: this.windowStatus(state, clock.date, 'close') },
         { window: 'post_close', label: '盘后核对', time: '15:10', status: this.windowStatus(state, clock.date, 'post_close') },
       ],
@@ -358,10 +360,14 @@ export class PaperTradingService extends EventEmitter {
       if (this.expirePendingPlans(state, clock, market.calendar ?? []) > 0) {
         await this.persist(state);
       }
-      // 同花顺就绪兜底：必须在任何券商调用之前，所以不存在"下单失败后重拉重试
-      // 导致重复报单"的风险。已就绪时只花一次探测。
-      await this.ensureThsReady(state, `window:${window}`, thsReadyTimeoutMs(window), traceId);
-      let snapshot = await this.readAndObserveAccount(state, traceId, `window:${window}:initial`);
+      // 收盘决策/盘后核对不 launch-flow：15:00 后点同花顺控件易弹 begin failed。
+      const thsReadOnlyWindow = window === 'close' || window === 'post_close';
+      if (!thsReadOnlyWindow) {
+        await this.ensureThsReady(state, `window:${window}`, thsReadyTimeoutMs(window), traceId);
+      }
+      let snapshot = thsReadOnlyWindow
+        ? await this.readAndObserveAccountOnly(state, traceId, `window:${window}:initial`)
+        : await this.readAndObserveAccount(state, traceId, `window:${window}:initial`);
       this.initializeCapital(state, snapshot);
       this.reconcileUncertainInstructions(state, snapshot, traceId);
       this.reconcileState(state, snapshot, clock.date);
@@ -435,6 +441,12 @@ export class PaperTradingService extends EventEmitter {
     if (confirmation !== 'CANCEL') throw new Error('请输入 CANCEL 确认撤销同花顺模拟委托');
     return this.exclusive(async () => {
       const state = await this.getState();
+      // 只读时段（09:25 前 / 15:00 后 / 非交易日）不允许点同花顺界面撤单，
+      // 避免收盘后点控件触发 begin failed 弹窗。
+      const clock = shanghaiClock(this.now());
+      if (isThsBrokerReadOnlyPeriod(clock, [])) {
+        throw new Error('当前为同花顺券商只读时段（09:25 前或 15:00 后），不能通过同花顺界面撤单');
+      }
       const snapshot = await this.readAndObserveAccount(state, traceId, 'cancel:lookup');
       const order = snapshot.orders.find((item) => item.id === orderId)
         ?? snapshot.orders.find((item) => (
@@ -472,8 +484,7 @@ export class PaperTradingService extends EventEmitter {
     return this.exclusive(async () => {
       const state = await this.getState();
       const clock = shanghaiClock(this.now());
-      const accountOnly = isAccountSyncOnlyPeriod(clock, []);
-      const snapshot = accountOnly
+      const snapshot = isThsBrokerReadOnlyPeriod(clock, [])
         ? await this.readAndObserveAccountOnly(state, traceId, source)
         : await this.readAndObserveAccount(state, traceId, source);
       this.initializeCapital(state, snapshot);
@@ -521,7 +532,8 @@ export class PaperTradingService extends EventEmitter {
     const state = await this.getState();
     const clock = shanghaiClock(this.now());
     const accountOnly = isAccountSyncOnlyPeriod(clock, context.calendar ?? []);
-    const snapshot = accountOnly
+    const brokerReadOnly = isThsBrokerReadOnlyPeriod(clock, context.calendar ?? []);
+    const snapshot = (accountOnly || brokerReadOnly)
       ? await this.readAndObserveAccountOnly(state, traceId, 'overview')
       : await this.readAndObserveAccount(state, traceId, 'overview');
     this.initializeCapital(state, snapshot);
@@ -1038,7 +1050,7 @@ export class PaperTradingService extends EventEmitter {
         continue;
       }
       instruction.quantity = quantity;
-      const order = this.instructionToOrder(instruction, position.current_price);
+      const order = this.instructionToOrder(instruction, adjustOrderPrice(position.current_price, 'sell', executionWindow));
       try {
         await this.submitBrokerOrder(state, instruction, order, traceId);
       } catch (error) {
@@ -1116,7 +1128,7 @@ export class PaperTradingService extends EventEmitter {
         continue;
       }
       instruction.quantity = sizing.shares;
-      const order = this.instructionToOrder(instruction, quote);
+      const order = this.instructionToOrder(instruction, adjustOrderPrice(quote, 'buy', executionWindow));
       try {
         await this.submitBrokerOrder(state, instruction, order, traceId);
       } catch (error) {
@@ -1337,6 +1349,29 @@ export class PaperTradingService extends EventEmitter {
     traceId: string,
     stage: string,
   ): Promise<SimulatedAccountSnapshot> {
+    // 收盘后/非交易时段优先复用当日最近一次观测，零点击同花顺（避免 begin failed）。
+    // 持仓只随本方委托变化，且每次委托后都会立即快照，因此当日缓存与真实账户一致；
+    // 仅当没有当日观测（如收盘后服务才启动）才回落为 account-only 快照。
+    const cached = state.last_account_observation;
+    if (cached && compactDate(cached.observed_at) === shanghaiClock(this.now()).date) {
+      const snapshot: SimulatedAccountSnapshot = {
+        availableCash: cached.available_cash,
+        totalAssets: cached.total_assets,
+        positions: cached.positions.map((position) => ({ ...position })),
+        orders: cached.orders.map((order) => ({ ...order })),
+      };
+      await this.audit.info('account_monitor', 'account_only_sync', {
+        traceId,
+        data: {
+          stage,
+          mode: 'cached',
+          cached_observed_at: cached.observed_at,
+          positions: snapshot.positions.length,
+          preserved_orders: snapshot.orders.length,
+        },
+      });
+      return snapshot;
+    }
     const context: BrokerCallContext = {
       traceId,
       stage,
@@ -1353,6 +1388,7 @@ export class PaperTradingService extends EventEmitter {
       traceId,
       data: {
         stage,
+        mode: 'broker',
         hint_stock_codes: context.hintStockCodes,
         positions: merged.positions.length,
         preserved_orders: merged.orders.length,
@@ -1845,7 +1881,7 @@ export class PaperTradingService extends EventEmitter {
     if (!state.automation.enabled) return '自动化已关闭';
     if (state.automation.paused_today) return '今日已暂停';
     if (clock.minute < 9 * 60 + 31 && !this.isWindowCompleted(state, clock.date, 'open')) return '下一窗口：09:31 开盘执行';
-    if (clock.minute < NEAR_CLOSE_WINDOW_START_MINUTE && !this.isWindowCompleted(state, clock.date, 'near_close')) return '下一窗口：14:57 临收盘执行';
+    if (clock.minute < NEAR_CLOSE_WINDOW_START_MINUTE && !this.isWindowCompleted(state, clock.date, 'near_close')) return '下一窗口：14:55 临收盘执行';
     if (clock.minute < 15 * 60 + 5 && !this.isWindowCompleted(state, clock.date, 'close')) return '下一窗口：15:05 收盘决策';
     if (clock.minute < 15 * 60 + 10 && !this.isWindowCompleted(state, clock.date, 'post_close')) return '下一窗口：15:10 盘后核对';
     return '下一窗口：下一交易日 09:31 开盘执行';
@@ -1865,7 +1901,7 @@ export class PaperTradingService extends EventEmitter {
       throw new Error('开盘执行窗口仅允许在交易日 09:25-10:00 运行');
     }
     if (window === 'near_close' && (clock.minute < NEAR_CLOSE_WINDOW_START_MINUTE || clock.minute >= MARKET_CLOSE_MINUTE)) {
-      throw new Error('临收盘执行窗口仅允许在交易日 14:57-15:00 运行');
+      throw new Error('临收盘执行窗口仅允许在交易日 14:55-15:00 运行');
     }
     if (window === 'close' && clock.minute < MARKET_CLOSE_MINUTE) {
       throw new Error('收盘决策窗口仅允许在交易日 15:00 后运行');

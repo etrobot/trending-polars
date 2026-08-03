@@ -387,6 +387,12 @@ on navigateTo(simulationWindow, destination)
     end if
 
     set targetControl to my findNamedControl(simulationWindow, labels)
+    if targetControl is missing value then
+        repeat with labelText in labels
+            set targetControl to my findClickableByText(simulationWindow, labelText as text)
+            if targetControl is not missing value then exit repeat
+        end repeat
+    end if
     if targetControl is not missing value then
         my pressControl(targetControl)
         if destination is in {"buy", "sell", "funds", "positions", "orders"} then
@@ -397,6 +403,26 @@ on navigateTo(simulationWindow, destination)
 
     error "无法切换到模拟交易页面：" & destination
 end navigateTo
+
+on findClickableByText(rootElement, wantedText)
+    tell application "System Events"
+        try
+            set allItems to {rootElement} & (entire contents of rootElement)
+        on error
+            set allItems to {rootElement}
+        end try
+        repeat with uiItem in allItems
+            try
+                set itemRole to role of uiItem as text
+                if itemRole is in {"AXButton", "AXRadioButton", "AXCheckBox", "AXLink", "AXTab"} then
+                    set itemName to my elementName(uiItem)
+                    if itemName contains wantedText then return contents of uiItem
+                end if
+            end try
+        end repeat
+    end tell
+    return missing value
+end findClickableByText
 
 -- 切页后用轮询代替固定 delay：页面就绪立即继续，最多等 100×50ms=5s。
 on waitForSimulationPage(simulationWindow, destination)
@@ -630,7 +656,7 @@ on findNamedControl(rootElement, wantedNames)
     tell application "System Events"
         try
             if (role of rootElement as text) is "AXWindow" then
-                set candidateItems to (buttons of rootElement) & (static texts of rootElement)
+                set candidateItems to (buttons of rootElement)
             else
                 set candidateItems to {rootElement} & (entire contents of rootElement)
             end if
@@ -638,13 +664,13 @@ on findNamedControl(rootElement, wantedNames)
             set candidateItems to {rootElement}
         end try
         repeat with uiItem in candidateItems
-            set itemName to my elementName(uiItem)
-            if itemName is in wantedNames then
-                try
-                    set itemRole to role of uiItem as text
-                    if itemRole is in {"AXButton", "AXRadioButton", "AXCheckBox", "AXLink", "AXStaticText", "AXMenuItem"} then return contents of uiItem
-                end try
-            end if
+            try
+                set itemRole to role of uiItem as text
+                if itemRole is in {"AXButton", "AXRadioButton", "AXCheckBox", "AXLink", "AXTab", "AXMenuItem"} then
+                    set itemName to my elementName(uiItem)
+                    if itemName is in wantedNames then return contents of uiItem
+                end if
+            end try
         end repeat
     end tell
     return missing value
@@ -687,6 +713,12 @@ end isCancelledOrderStatus
 on pressControl(uiControl)
     tell application "System Events"
         try
+            set isEnabled to true
+            try
+                set isEnabled to (enabled of uiControl)
+            end try
+            if not isEnabled then error "控件当前不可用 (enabled = false)"
+
             perform action "AXPress" of uiControl
             return
         end try
