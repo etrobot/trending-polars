@@ -106,6 +106,8 @@ export class ThsLifecycle {
   private readonly audit: AuditLoggerLike;
   private readonly now: () => Date;
   private lockHeld = false;
+  /** probe 只能确认有窗口；首次接管仍必须跑一次登录/交易页/模拟 tab 流程。 */
+  private flowReady = false;
 
   constructor(options: ThsLifecycleOptions = {}) {
     this.appName = options.appName ?? DEFAULT_THS_APP_NAME;
@@ -133,7 +135,7 @@ export class ThsLifecycle {
     const deadline = this.now().getTime() + budgetMs;
 
     const initial = await this.probe();
-    if (initial.ready) return { ready: true, launched: false, probe: initial };
+    if (initial.ready && this.flowReady) return { ready: true, launched: false, probe: initial };
 
     if (!(await this.acquireLock(reason))) {
       const observed = await this.probe();
@@ -148,7 +150,7 @@ export class ThsLifecycle {
     try {
       // 锁内复探：排队等锁期间对方可能已经拉好了。
       let current = await this.probe();
-      if (current.ready) return { ready: true, launched: false, probe: current };
+      if (current.ready && this.flowReady) return { ready: true, launched: false, probe: current };
 
       let launched = false;
       if (!current.running) {
@@ -168,18 +170,22 @@ export class ThsLifecycle {
 
       // 进程在但没有可用窗口（最小化 / 其它 Space / 刚启动）→ 登录 + 切交易页 + 切模拟 tab。
       let message: string | undefined;
+      let launchFlowSucceeded = false;
       try {
         message = await this.runner.runScript('launch-flow', remainingMs);
+        launchFlowSucceeded = true;
       } catch (error) {
         message = error instanceof Error ? error.message : String(error);
         await this.audit.warn('ths_lifecycle', 'launch_flow_failed', { data: { reason }, error });
       }
 
       const final = await this.probe();
+      const ready = launchFlowSucceeded && final.ready;
+      this.flowReady = ready;
       await this.audit.info('ths_lifecycle', 'ensure_ready_finished', {
-        data: { reason, ready: final.ready, launched, windows: final.windows, message },
+        data: { reason, ready, launched, windows: final.windows, message },
       });
-      return { ready: final.ready, launched, probe: final, message };
+      return { ready, launched, probe: final, message };
     } finally {
       await this.releaseLock();
     }
@@ -187,7 +193,10 @@ export class ThsLifecycle {
 
   /** 优雅退出，超时用 pkill 兜底。有人正在拉起时不去关。 */
   async quit(): Promise<void> {
-    if (!(await this.probe()).running) return;
+    if (!(await this.probe()).running) {
+      this.flowReady = false;
+      return;
+    }
     if (!(await this.acquireLock('quit'))) {
       await this.audit.info('ths_lifecycle', 'quit_skipped_locked', {});
       return;
@@ -198,7 +207,10 @@ export class ThsLifecycle {
       } catch (error) {
         await this.audit.warn('ths_lifecycle', 'quit_script_failed', { error });
       }
-      if (!(await this.probe()).running) return;
+      if (!(await this.probe()).running) {
+        this.flowReady = false;
+        return;
+      }
       await this.runner.killApp(this.appName);
       const deadline = this.now().getTime() + 10_000;
       while (this.now().getTime() < deadline) {

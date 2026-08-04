@@ -662,7 +662,8 @@ describe('Node T+1 paper-trading core', () => {
       expect(thsWarmupSlot(9 * 60 + 24)).toBeNull();
       expect(thsWarmupSlot(9 * 60 + 25)).toMatchObject({ slot: 'open', timeoutMs: 120_000 });
       expect(thsWarmupSlot(9 * 60 + 30)).toMatchObject({ slot: 'open' });
-      expect(thsWarmupSlot(9 * 60 + 31)).toBeNull();
+      expect(thsWarmupSlot(9 * 60 + 31)).toMatchObject({ slot: 'intraday', timeoutMs: 120_000 });
+      expect(thsWarmupSlot(13 * 60 + 49)).toMatchObject({ slot: 'intraday' });
       expect(thsWarmupSlot(14 * 60 + 50)).toMatchObject({ slot: 'near_close', timeoutMs: 120_000 });
       expect(thsWarmupSlot(14 * 60 + 54)).toMatchObject({ slot: 'near_close' });
       expect(thsWarmupSlot(14 * 60 + 55)).toBeNull();
@@ -795,6 +796,30 @@ describe('Node T+1 paper-trading core', () => {
       }
 
       expect(readiness.calls).toEqual([{ reason: 'warmup:open', timeoutMs: 120_000 }]);
+    });
+
+    it('服务在盘中重启时预热一次，主动恢复同花顺', async () => {
+      const readiness = new ReadinessSpy();
+      const store = new TestStateStore();
+      store.state = {
+        ...defaultState('2026-07-23 15:05:00'),
+        automation: { ...defaultState('2026-07-23 15:05:00').automation, enabled: true },
+      };
+      const service = new PaperTradingService(new OfflineBroker(), {
+        stateStore: store,
+        thsReadiness: readiness,
+        now: () => new Date('2026-07-24T13:49:00+08:00'),
+      });
+      service.setTradingCalendar(['20260723', '20260724']);
+
+      service.startScheduler();
+      try {
+        await waitFor(() => readiness.calls.length > 0);
+      } finally {
+        service.stopScheduler();
+      }
+
+      expect(readiness.calls).toEqual([{ reason: 'warmup:intraday', timeoutMs: 120_000 }]);
     });
   });
 

@@ -1268,20 +1268,29 @@ export class PaperTradingService extends EventEmitter {
     const preview = await this.getState();
     const previewClock = shanghaiClock(this.now());
     const previewCalendar = this.effectiveTradingCalendar();
-    if (!preview.instructions.some((instruction) => this.planExpired(instruction, previewClock, previewCalendar))) {
-      return 0;
-    }
+    const hasExpired = preview.instructions.some((instruction) => this.planExpired(instruction, previewClock, previewCalendar));
+    const hasStale = preview.instructions.some(
+      (instruction) => !isActiveInstruction(instruction)
+        && instruction.status !== 'expired'
+        && instruction.status !== 'filled'
+        && instruction.signal_date !== previewClock.date,
+    );
+    if (!hasExpired && !hasStale) return 0;
     return this.exclusive(async () => {
       const state = await this.getState();
       const clock = shanghaiClock(this.now());
       const expired = this.expirePendingPlans(state, clock, this.cachedTradingCalendar);
-      if (expired === 0) return 0;
+      const pruned = this.pruneStaleInstructions(state, clock);
+      const changed = expired + pruned;
+      if (changed === 0) return 0;
       await this.persist(state);
-      await this.audit.info('paper_trading', 'plans_expired', {
-        data: { expired, trading_date: clock.date, observed_at: clock.timestamp },
-      });
-      this.broadcast('plans_expired', { expired, trading_date: clock.date });
-      return expired;
+      if (expired > 0) {
+        await this.audit.info('paper_trading', 'plans_expired', {
+          data: { expired, trading_date: clock.date, observed_at: clock.timestamp },
+        });
+        this.broadcast('plans_expired', { expired, trading_date: clock.date });
+      }
+      return changed;
     });
   }
 
@@ -1308,6 +1317,31 @@ export class PaperTradingService extends EventEmitter {
       this.recordEvent(state, 'system', 'plans_expired', `${expired} 个当日未执行计划已置为过期`);
     }
     return expired;
+  }
+
+  /** 清理已过期的 terminal 状态指令（skipped/failed），避免陈旧消息一直显示。 */
+  private pruneStaleInstructions(
+    state: PaperTradingRuntimeState,
+    clock: ReturnType<typeof shanghaiClock>,
+  ): number {
+    const before = state.instructions.length;
+    state.instructions = state.instructions.filter((instruction) => {
+      // 保留活跃指令
+      if (isActiveInstruction(instruction)) return true;
+      // 保留当日 terminal 指令（供当日展示）
+      if (instruction.signal_date === clock.date) return true;
+      // 保留过期指令（expired 由 planExpired 产生，展示过期原因后由用户自行清除）
+      if (instruction.status === 'expired') return true;
+      // 保留已成交指令供历史回溯
+      if (instruction.status === 'filled') return true;
+      // 其余 terminal 状态（skipped/failed）且非当日 → 清理
+      return false;
+    });
+    const pruned = before - state.instructions.length;
+    if (pruned > 0) {
+      this.recordEvent(state, 'system', 'instructions_pruned', `已清理 ${pruned} 条历史指令`);
+    }
+    return pruned;
   }
 
   private findWindowFailureReason(
@@ -1749,15 +1783,15 @@ export class PaperTradingService extends EventEmitter {
     reason: string,
     timeoutMs: number,
     traceId: string,
-  ): Promise<void> {
-    if (!this.thsReadiness) return;
+  ): Promise<boolean> {
+    if (!this.thsReadiness) return true;
     try {
       const result = await this.thsReadiness.ensureReady(reason, { timeoutMs });
       if (result.ready) {
         if (result.launched) {
           this.recordEvent(state, 'system', 'ths_launched', `同花顺已自动拉起并就绪（${reason}）`);
         }
-        return;
+        return true;
       }
       const message = result.message ?? '同花顺仍不可用';
       state.automation = { ...state.automation, last_error: summarizeSubmissionError(message) };
@@ -1766,8 +1800,10 @@ export class PaperTradingService extends EventEmitter {
         traceId,
         data: { reason, timeout_ms: timeoutMs, message },
       });
+      return false;
     } catch (error) {
       await this.audit.error('paper_trading', 'ths_ensure_ready_failed', { traceId, data: { reason }, error });
+      return false;
     }
   }
 
@@ -1778,13 +1814,13 @@ export class PaperTradingService extends EventEmitter {
     if (!warmup) return;
     const key = `${clock.date}:${warmup.slot}`;
     if (this.warmedUpSlots.has(key)) return;
-    this.warmedUpSlots.add(key);
-    for (const existing of this.warmedUpSlots) {
-      if (!existing.startsWith(`${clock.date}:`)) this.warmedUpSlots.delete(existing);
-    }
     await this.exclusive(async () => {
       const state = await this.getState();
-      await this.ensureThsReady(state, `warmup:${warmup.slot}`, warmup.timeoutMs, traceId);
+      const ready = await this.ensureThsReady(state, `warmup:${warmup.slot}`, warmup.timeoutMs, traceId);
+      if (ready) this.warmedUpSlots.add(key);
+      for (const existing of this.warmedUpSlots) {
+        if (!existing.startsWith(`${clock.date}:`)) this.warmedUpSlots.delete(existing);
+      }
       await this.persist(state);
     });
   }

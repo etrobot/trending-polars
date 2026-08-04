@@ -61,6 +61,9 @@ export function thsReadyTimeoutMs(window: TradingWindow): number {
  */
 export function thsWarmupSlot(minute: number): { slot: string; timeoutMs: number } | null {
   if (minute >= 9 * 60 + 25 && minute < 9 * 60 + 31) return { slot: 'open', timeoutMs: 120_000 };
+  // 服务可能在盘中重启；只要仍在交易时段，就应主动恢复同花顺。
+  // 14:50 之后交给临收盘预热，15:00 后则完全不再 launch-flow。
+  if (minute >= 9 * 60 + 31 && minute < 14 * 60 + 50) return { slot: 'intraday', timeoutMs: 120_000 };
   if (minute >= 14 * 60 + 50 && minute < NEAR_CLOSE_WINDOW_START_MINUTE) return { slot: 'near_close', timeoutMs: 120_000 };
   // 收盘决策/盘后核对不再预热 launch-flow：15:00 后同花顺界面点控件易弹 begin failed。
   return null;

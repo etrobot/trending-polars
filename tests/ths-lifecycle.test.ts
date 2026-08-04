@@ -67,12 +67,12 @@ describe('同花顺生命周期', () => {
     expect(parseThsProbe('THS_PROBE|running=false|windows=0')).toEqual({ running: false, windows: 0, ready: false });
   });
 
-  it('已就绪时只探测一次，不启动也不点界面', async () => {
+  it('已有窗口但本实例尚未接管时仍执行一次 launch-flow', async () => {
     const runner = new FakeRunner();
     const result = await build(runner).ensureReady('window:open');
 
     expect(result).toMatchObject({ ready: true, launched: false });
-    expect(runner.calls).toEqual(['probe']);
+    expect(runner.calls).toEqual(['probe', 'probe', 'launch-flow', 'probe']);
   });
 
   it('进程不在时依次 open -a → launch-flow → 复探', async () => {
