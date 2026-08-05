@@ -32,6 +32,7 @@ on run argv
             set snapshotKind to item 2 of argv as text
             set hintCodes to {}
             if (count of argv) is 3 then set hintCodes to my parseHintCodes(item 3 of argv as text)
+            if snapshotKind is "account_passive" then return my takeAccountSnapshot(hintCodes, true)
             return my takeSnapshot(snapshotKind, hintCodes)
         else if commandName is "quote" then
             if (count of argv) is not 2 then error my usageText()
@@ -56,7 +57,7 @@ on run argv
 end run
 
 on usageText()
-    return "用法：snapshot funds|positions|orders|account [代码1,代码2]；quote 股票代码；order buy|sell 股票代码 价格|AUTO 数量；verify buy|sell 股票代码 价格|AUTO 数量；cancel buy|sell 股票代码 数量"
+    return "用法：snapshot funds|positions|orders|account|account_passive [代码1,代码2]；quote 股票代码；order buy|sell 股票代码 价格|AUTO 数量；verify buy|sell 股票代码 价格|AUTO 数量；cancel buy|sell 股票代码 数量"
 end usageText
 
 on parseHintCodes(rawHints)
@@ -177,7 +178,7 @@ on readSimulatedQuote(orderCode)
 end readSimulatedQuote
 
 on takeSnapshot(snapshotKind, hintCodes)
-    if snapshotKind is "account" then return my takeAccountSnapshot(hintCodes)
+    if snapshotKind is "account" then return my takeAccountSnapshot(hintCodes, false)
     set my snapshotHintCodes to hintCodes
     if snapshotKind is not in {"funds", "positions", "orders"} then error "未知查询类型：" & snapshotKind
     set previousApp to my saveForegroundApp()
@@ -204,7 +205,7 @@ on takeSnapshot(snapshotKind, hintCodes)
     end tell
 end takeSnapshot
 
-on takeAccountSnapshot(hintCodes)
+on takeAccountSnapshot(hintCodes, passive)
     set my snapshotHintCodes to hintCodes
     -- 单次会话读取资金+持仓，避免两次 osascript 冷启动和重复找窗口。
     -- 只读同步跳过 refreshSimulationConnection，省 1.5 秒且非交易时段无需重连。
@@ -214,14 +215,22 @@ on takeAccountSnapshot(hintCodes)
         tell process "同花顺"
             set simulationWindow to my findSimulationWindow(it)
             if simulationWindow is missing value then error (my windowUnavailableReason(it))
-            my navigateTo(simulationWindow, "positions")
-            my waitForSimulationPage(simulationWindow, "positions")
+            if not passive then
+                my navigateTo(simulationWindow, "positions")
+                my waitForSimulationPage(simulationWindow, "positions")
+            end if
             if not my elementContainsText(simulationWindow, "模拟练习") then error "查询前无法确认模拟交易状态，已停止"
             set positionsPart to my snapshotWindow(simulationWindow, "positions")
             set fundsPart to positionsPart
-            if not my snapshotContainsFunds(positionsPart) then
+            -- Passive reads intentionally never navigate.  The current page
+            -- normally contains the persistent funds summary; if it does not,
+            -- parsing the same page as funds is still safer than clicking a
+            -- tab after close and popping "begin failed".
+            if not passive and not my snapshotContainsFunds(positionsPart) then
                 my navigateTo(simulationWindow, "funds")
                 my waitForSimulationPage(simulationWindow, "funds")
+                set fundsPart to my snapshotWindow(simulationWindow, "funds")
+            else if passive then
                 set fundsPart to my snapshotWindow(simulationWindow, "funds")
             end if
             my restoreForegroundApp(previousApp)

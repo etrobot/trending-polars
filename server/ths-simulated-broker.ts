@@ -387,7 +387,10 @@ export class ThsSimulatedBroker implements SimulatedBroker {
   snapshotAccountOnly(context: BrokerCallContext = {}): Promise<SimulatedAccountSnapshot> {
     const operation = this.exclusive(async () => {
       const started = Date.now();
-      const args = ['snapshot', 'account'];
+      // account-only is used by the post-close/read-only paths.  The passive
+      // variant must not switch tabs: after the market closes THS may reject
+      // that UI action with a "begin failed" dialog.
+      const args = ['snapshot', 'account_passive'];
       const hints = (context.hintStockCodes ?? []).filter((code) => /^\d{6}$/.test(code));
       if (hints.length > 0) args.push(hints.join(','));
       const output = await this.loggedCommand(args, context);

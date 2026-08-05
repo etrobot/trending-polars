@@ -1784,7 +1784,9 @@ export class PaperTradingService extends EventEmitter {
         return;
       }
 
-      const monitoringHours = clock.minute >= 9 * 60 + 25 && clock.minute <= 15 * 60 + 20;
+      // 15:00 后不再轮询同花顺。收盘决策/盘后核对本身已经是只读流程，
+      // 盘后继续监控只会重复触发账户读取，某些 THS 版本会弹 begin failed。
+      const monitoringHours = clock.minute >= 9 * 60 + 25 && clock.minute < 15 * 60;
       if (!monitoringHours || nowMs < this.monitorRetryAfter || nowMs - this.lastMonitorAt < this.accountMonitorIntervalMs) return;
       this.lastMonitorAt = nowMs;
       try {

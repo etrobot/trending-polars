@@ -100,7 +100,7 @@ describe('Tonghuashun simulated broker', () => {
     const broker = new ThsSimulatedBroker({
       runner: async (args) => {
         commands.push(args);
-        if (args[1] === 'account') {
+        if (args[1] === 'account_passive') {
           return snapshot(
             'account',
             'TEXT|可用资金：90000',
@@ -116,7 +116,7 @@ describe('Tonghuashun simulated broker', () => {
     const account = await broker.snapshotAccountOnly({ hintStockCodes: ['000001', 'invalid', '600000'] });
 
     expect(commands).toEqual([
-      ['snapshot', 'account', '000001,600000'],
+      ['snapshot', 'account_passive', '000001,600000'],
     ]);
     expect(account.orders).toEqual([]);
     expect(account.positions[0].stock_code).toBe('000001');

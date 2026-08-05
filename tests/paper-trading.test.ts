@@ -841,6 +841,44 @@ describe('Node T+1 paper-trading core', () => {
 
       expect(readiness.calls).toEqual([{ reason: 'warmup:intraday', timeoutMs: 120_000 }]);
     });
+
+    it('收盘后调度器不再轮询同花顺账户', async () => {
+      let snapshotCalls = 0;
+      const broker: SimulatedBroker = {
+        async snapshot() {
+          snapshotCalls += 1;
+          return { availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] };
+        },
+        async snapshotAccountOnly() {
+          snapshotCalls += 1;
+          return { availableCash: 100_000, totalAssets: 100_000, positions: [], orders: [] };
+        },
+        async quote() { return 10; },
+        async placeOrder() { return { verified: true, brokerOutput: 'ORDER_VERIFIED' }; },
+        async cancelOrder() { return { verified: true, brokerOutput: 'CANCEL_VERIFIED' }; },
+      };
+      const store = new TestStateStore();
+      store.state = {
+        ...defaultState('2026-07-24 15:10:00'),
+        automation: { ...defaultState('2026-07-24 15:10:00').automation, enabled: true },
+        completed_windows: { '20260724': ['open', 'near_close', 'close', 'post_close'] },
+      };
+      const service = new PaperTradingService(broker, {
+        stateStore: store,
+        now: () => new Date('2026-07-24T15:10:00+08:00'),
+        schedulerIntervalMs: 5_000,
+      });
+      service.setTradingCalendar(['20260724']);
+
+      service.startScheduler();
+      try {
+        await new Promise((resolve) => { setTimeout(resolve, 60); });
+      } finally {
+        service.stopScheduler();
+      }
+
+      expect(snapshotCalls).toBe(0);
+    });
   });
 
   it('uses the five-trading-day exit rule and schedules strong-market buys at open and sells near close', async () => {
