@@ -739,8 +739,8 @@ export function registerRoutes(
       },
       close: {
         type: 'paper_close_decision',
-        name: '收盘决策：刷新行情并生成交易计划',
-        startedMessage: '收盘决策任务已启动',
+        name: '决策：刷新行情并生成交易计划',
+        startedMessage: '决策任务已启动',
         refreshMarket: true,
       },
       post_close: {
@@ -754,7 +754,9 @@ export function registerRoutes(
     const task = tasks.start(meta.type, meta.name, async ({ progress, cancelled, traceId }) => {
       try {
         progress(5, meta.refreshMarket ? '准备收盘行情与策略上下文' : '准备策略上下文');
-        const context = await marketService.loadPaperContext(meta.refreshMarket, traceId);
+        const context = meta.refreshMarket
+          ? await marketService.loadPaperContext(true, traceId, { enforceCloseTime: false })
+          : await marketService.loadPaperContext(false, traceId);
         if (cancelled()) return null;
         progress(meta.refreshMarket ? 82 : 35, meta.refreshMarket ? '行情与排行已准备，正在生成下一交易日计划' : '正在执行交易窗口');
         const result = await paper.runWindowConfirmed(window, context, traceId);

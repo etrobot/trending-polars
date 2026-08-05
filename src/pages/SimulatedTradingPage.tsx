@@ -41,7 +41,7 @@ function PlanHistoryTable({
   pageSize,
   onPage,
   emptyTitle = '尚无已执行计划',
-  emptyDescription = '收盘决策生成的计划执行后会显示在这里。历史记录会持久保存在 Node.js 交易状态中。',
+  emptyDescription = '决策生成的计划执行后会显示在这里。历史记录会持久保存在 Node.js 交易状态中。',
 }: {
   history: PaperPlanHistoryItem[];
   page: number;
@@ -387,7 +387,7 @@ export function SimulatedTradingPage() {
         <Button variant="secondary" className="shrink-0 whitespace-nowrap" disabled={connecting} onClick={() => void refreshAccount()}><RefreshCw className={`h-3.5 w-3.5 ${connecting ? 'animate-spin' : ''}`} />{connecting ? '同步中' : '刷新账户'}</Button>
         <Button variant="ghost" className="shrink-0 whitespace-nowrap" disabled={busy} onClick={openBacktestHistory}><SlidersHorizontal className="h-3.5 w-3.5" />加载回测参数</Button>
         <Button variant="ghost" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} onClick={() => confirmWindow('post_close')}>盘后核对</Button>
-        <Button variant="secondary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} onClick={() => confirmWindow('close')}><ClipboardCheck className="h-3.5 w-3.5" />收盘决策</Button>
+        <Button variant="secondary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} title="随时刷新行情并生成交易计划" onClick={() => confirmWindow('close')}><ClipboardCheck className="h-3.5 w-3.5" />决策</Button>
         <Button variant="primary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} title="根据当前时间自动判断并执行对应窗口" onClick={() => confirmWindow('auto')}><ClipboardCheck className="h-3.5 w-3.5" />立即执行</Button>
       </PageHeaderActions>
       <div className="terminal-page">
@@ -457,7 +457,7 @@ export function SimulatedTradingPage() {
       </section>
       )}
 
-      <Modal open={executeOpen} onClose={() => setExecuteOpen(false)} title={selectedWindow === 'auto' ? '确认立即执行' : selectedWindow === 'close' ? '确认运行收盘决策' : '确认运行盘后核对'} description={selectedWindow === 'auto' ? '系统将根据当前时间自动判断并执行对应窗口（开盘/临收盘/收盘决策/盘后核对）。' : 'Node.js 交易核心会运行所选策略窗口；AppleScript 仅查询和操作同花顺"模拟练习"。'}>
+      <Modal open={executeOpen} onClose={() => setExecuteOpen(false)} title={selectedWindow === 'auto' ? '确认立即执行' : selectedWindow === 'close' ? '确认运行决策' : '确认运行盘后核对'} description={selectedWindow === 'auto' ? '系统将根据当前时间自动判断并执行对应窗口（开盘/临收盘/收盘决策/盘后核对）。' : selectedWindow === 'close' ? '系统将刷新最新行情并生成交易计划，可随时运行；收盘后的自动决策机制仍会按原计划执行。' : 'Node.js 交易核心会运行所选策略窗口；AppleScript 仅查询和操作同花顺"模拟练习"。'}>
         <div className="space-y-3"><div className="flex justify-end gap-2"><Button variant="secondary" onClick={() => setExecuteOpen(false)}>取消</Button><Button variant="danger" disabled={busy} onClick={() => void execute()}>确认执行</Button></div></div>
       </Modal>
 

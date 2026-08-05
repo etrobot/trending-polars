@@ -1,5 +1,5 @@
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { execFile, execFileSync } from 'node:child_process';
+import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { PaperOrder, PaperPosition } from '../src/types.js';
@@ -9,6 +9,7 @@ import { fetchAdjustedKlines } from './historical-market.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 export const DEFAULT_THS_SCRIPT = path.resolve(MODULE_DIR, '..', 'scripts', 'ths_order_dry_run.applescript');
+const THS_DOUBLE_CLICK_BINARY = '/tmp/trending-polars-ths-double-click';
 
 const SIMULATOR_MARKER = 'THS_SIMULATOR_V1';
 const SIMULATION_CONFIRMED = 'SIMULATION|confirmed';
@@ -299,12 +300,35 @@ export function parseThsOrdersSnapshot(output: string): PaperOrder[] {
 
 function defaultRunner(scriptPath: string, timeoutMs: number): ThsCommandRunner {
   return (args) => new Promise((resolve, reject) => {
-    execFile('osascript', [scriptPath, ...args], { encoding: 'utf8', timeout: timeoutMs }, (error, stdout, stderr) => {
+    if (args[0] === 'order' && args[1] === 'sell') {
+      try {
+        const sourcePath = path.join(path.dirname(scriptPath), 'ths_double_click.c');
+        const needsCompile = !existsSync(THS_DOUBLE_CLICK_BINARY)
+          || statSync(sourcePath).mtimeMs > statSync(THS_DOUBLE_CLICK_BINARY).mtimeMs;
+        if (needsCompile) {
+          execFileSync('/usr/bin/clang', [
+            '-framework',
+            'ApplicationServices',
+            sourcePath,
+            '-o',
+            THS_DOUBLE_CLICK_BINARY,
+          ], { stdio: 'pipe' });
+        }
+      } catch (error) {
+        reject(new ThsSimulatedBrokerError(`无法准备同花顺系统级双击工具：${String(error)}`, { cause: error }));
+        return;
+      }
+    }
+    // 卖出要前台化 + 持仓页双击 + 填单 + 回查，30s 偏紧；下单/撤单单独放宽。
+    const commandTimeoutMs = (args[0] === 'order' || args[0] === 'cancel')
+      ? Math.max(timeoutMs, 60_000)
+      : timeoutMs;
+    execFile('osascript', [scriptPath, ...args], { encoding: 'utf8', timeout: commandTimeoutMs }, (error, stdout, stderr) => {
       if (error) {
         const processError = error as Error & { killed?: boolean; signal?: NodeJS.Signals | null; code?: string | number | null };
         const timedOut = processError.killed || processError.signal === 'SIGTERM' || processError.code === 'ETIMEDOUT';
         const message = timedOut
-          ? `同花顺 AppleScript 读取超时（${Math.round(timeoutMs / 1000)} 秒）：${args.join(' ')}。请确认同花顺模拟交易窗口位于当前桌面、未最小化且屏幕未锁定`
+          ? `同花顺 AppleScript 读取超时（${Math.round(commandTimeoutMs / 1000)} 秒）：${args.join(' ')}。请确认同花顺模拟交易窗口位于当前桌面、未最小化且屏幕未锁定`
           : String(stderr || stdout || error.message).trim();
         reject(new ThsSimulatedBrokerError(message || '同花顺 AppleScript 执行失败', { cause: error }));
         return;

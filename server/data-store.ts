@@ -437,6 +437,7 @@ export class DataStore {
         total_return_pct: result.summary?.total_return_pct ?? 0,
         total_trades: result.summary?.total_trades ?? result.trades?.length ?? 0,
         win_rate: result.summary?.win_rate ?? 0,
+        max_drawdown_pct: result.summary?.max_drawdown_pct ?? 0,
         max_holdings: result.summary?.max_holdings ?? 0,
         date_range: result.date_range ?? '',
         mode: String(result.config?.mode ?? 'current'),

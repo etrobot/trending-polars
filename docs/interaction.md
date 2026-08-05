@@ -26,7 +26,7 @@ osascript scripts/ths_order_dry_run.applescript quote 600519       # 实时价�
 
 # 交易
 osascript scripts/ths_order_dry_run.applescript order buy 600519 AUTO 100   # 买入
-osascript scripts/ths_order_dry_run.applescript order sell 600519 AUTO 100  # 卖出
+osascript scripts/ths_order_dry_run.applescript order sell 600519 AUTO 100  # 持仓页双击后卖出
 osascript scripts/ths_order_dry_run.applescript cancel buy 600519 100       # 撤单
 ```
 
@@ -44,6 +44,8 @@ ThsSimulatedBroker
   │     └─ 读取模拟交易界面中的实时价格
   │
   ├─ placeOrder(order)
+  │     ├─ 买入：进入买入页，填写代码/价格/数量
+  │     └─ 卖出：进入持仓页双击对应股票，调整数量/价格后点击卖出
   │     ├─ 提交委托（side + code + AUTO + quantity）
   │     └─ 回查确认委托成功（ORDER_VERIFIED|）
   │

@@ -449,7 +449,8 @@ export function normalizeInstructionOnLoad(instruction: PaperStrategyInstruction
       ...instruction,
       status: 'pending',
       submitted_at: undefined,
-      broker_status: '服务重启时委托未提交完成，已恢复待执行',
+      // 带「立即执行可重试」标记，避免 expirePendingPlans 按旧信号日再次过期清掉。
+      broker_status: '服务重启时委托未提交完成，已恢复为立即执行可重试',
     };
   }
   if (!isRetryableUncertainInstruction(instruction)) return instruction;

@@ -199,7 +199,7 @@ export function BacktestPage() {
   const [distanceFromLowWeightPct, setDistanceFromLowWeightPct] = useState(100);
   const [volatilityWeightPct, setVolatilityWeightPct] = useState(100);
   const [relativeStrengthWeightPct, setRelativeStrengthWeightPct] = useState(100);
-  const [sortColumn, setSortColumn] = useState<'win_rate' | 'total_return_pct' | null>(null);
+  const [sortColumn, setSortColumn] = useState<'win_rate' | 'total_return_pct' | 'max_drawdown_pct' | null>(null);
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
   const [historyPage, setHistoryPage] = useState(1);
   const [selectedRunIds, setSelectedRunIds] = useState<Set<string>>(() => new Set());
@@ -224,7 +224,7 @@ export function BacktestPage() {
     };
   }, [sortedHistory, historyPage]);
 
-  const toggleSort = (column: 'win_rate' | 'total_return_pct') => {
+  const toggleSort = (column: 'win_rate' | 'total_return_pct' | 'max_drawdown_pct') => {
     if (sortColumn === column) {
       setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
     } else {
@@ -873,6 +873,10 @@ export function BacktestPage() {
                   胜率
                   {sortColumn === 'win_rate' ? (sortDirection === 'asc' ? <ArrowUp className="ml-0.5 inline-block h-3 w-3" /> : <ArrowDown className="ml-0.5 inline-block h-3 w-3" />) : null}
                 </th>
+                <th className="cursor-pointer select-none text-right" onClick={() => toggleSort('max_drawdown_pct')}>
+                  最大回撤
+                  {sortColumn === 'max_drawdown_pct' ? (sortDirection === 'asc' ? <ArrowUp className="ml-0.5 inline-block h-3 w-3" /> : <ArrowDown className="ml-0.5 inline-block h-3 w-3" />) : null}
+                </th>
                 <th className="text-right">交易</th>
                 <th>参数</th>
                 <th className="w-10"></th>
@@ -880,7 +884,7 @@ export function BacktestPage() {
             </thead>
             <tbody>
               {history.length === 0 ? (
-                <tr><td colSpan={9}><EmptyState title="暂无历史记录" /></td></tr>
+                <tr><td colSpan={10}><EmptyState title="暂无历史记录" /></td></tr>
               ) : paginatedHistory.items.map((item) => (
                 <tr key={item.run_id} className="cursor-pointer" onClick={() => void loadRun(item.run_id)}>
                   <td className="w-10" onClick={(event) => event.stopPropagation()}>
@@ -897,6 +901,7 @@ export function BacktestPage() {
                   <td className="font-mono text-[11px] text-muted">{item.date_range}</td>
                   <td className={`text-right font-mono text-[11px] ${pctColor(item.total_return_pct)}`}>{item.total_return_pct > 0 ? '+' : ''}{item.total_return_pct.toFixed(2)}%</td>
                   <td className={`text-right font-mono text-[11px] ${pctColor(item.win_rate - 50)}`}>{item.win_rate.toFixed(1)}%</td>
+                  <td className="text-right font-mono text-[11px] text-trading-down">{item.max_drawdown_pct.toFixed(2)}%</td>
                   <td className="text-right font-mono text-[11px] text-muted">{item.total_trades}</td>
                   <td className="font-mono text-[11px] text-muted">{[item.position_size_pct ? `${item.position_size_pct}%` : null, item.max_positions ? `${item.max_positions}只` : null, item.max_hold_days ? `${item.max_hold_days}天` : null].filter(Boolean).join(' ')}</td>
                   <td className="w-10">

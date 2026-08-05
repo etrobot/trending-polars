@@ -188,7 +188,7 @@ Phase 2: 五维评分计算（scoreStock()）
   → 限制到 0~100 → 返回 RankingRow
 ```
 
-**核心引擎**：`scoreStock(series, date, sector?) → RankingRow | null`（`scoring-engine.ts`），同时被回测引擎和收盘决策使用。需要至少 20 根 K 线。
+**核心引擎**：`scoreStock(series, date, sector?) → RankingRow | null`（`scoring-engine.ts`），同时被回测引擎和决策流程使用。需要至少 20 根 K 线。
 
 **总分标度**：五维原始满分 `RAW_SCORE_MAX = 120`，先统一折算到 `SCORE_SCALE = 100`，
 再应用情境修正并限制在 0~100。
@@ -706,7 +706,7 @@ POST /api/backtest/optimize?days=20&date=YYYYMMDD
 | 排行榜 | `server/data/trending.db`：`ranking_factor` + `stock_ranking` | 选股标的；`runtime/ranking.json` 仅作最新缓存 |
 | 排行配置 | `server/data/runtime/ranking-config.json` | 因子权重 + 评分配置（可从回测优化回填） |
 | 市场情绪 | `analysis.json` 中的 sentiment | 买卖门控 |
-| 历史行情快照 | `server/data/trending.db`：`stock_daily_price` + `index_daily_price` + `historical_snapshot` | 收盘决策时重排行（`historicalStrategyCandidates()`） |
+| 历史行情快照 | `server/data/trending.db`：`stock_daily_price` + `index_daily_price` + `historical_snapshot` | 决策时刷新并重排行（`historicalStrategyCandidates()`） |
 
 **排行配置来源链**（`MarketService.computeAndSaveRanking()`）：
 
@@ -787,10 +787,10 @@ PaperMarketContext
   │     └─ 市场弱 → 临收盘买（window=near_close）
   │     （注：不再过滤 block_top 涨停股，由执行时的 broker 实际拒绝处理）
   │
-  ├─ 3. 收盘决策（generateCloseSignals，仅 15:00 后运行）
-  │     └─ 使用当日排行数据重新生成完整计划
+  ├─ 3. 决策（generateCloseSignals，手动可随时运行）
+  │     └─ 刷新最新行情并重新生成完整交易计划；手动运行以最新可用行情日期为信号日
   │
-  └─ 4. 收盘自动生成（ensureSameDayCloseSignals，15:00+）
+  └─ 4. 收盘自动生成（ensureSameDayCloseSignals，15:00+，机制保留）
         └─ 当排行截面日期=当天且尚未生成信号时，主动调用 generateCloseSignals()
         └─ 解决自动化关闭时 overview 不产生计划的场景
 ```
@@ -849,18 +849,19 @@ T1StrategyConfig {
 |------|------|------|
 | **开盘窗口** | 9:31 - 10:00 | 执行卖单（止损/止盈/到期） + 买单（市场强时） |
 | **临收盘窗口** | 14:55 - 15:00 | 执行买单（市场弱时） |
-| **收盘决策** | 15:05 - 23:30 | 采集当日排行生成次日交易计划 |
+| **手动决策** | 任意时间 | 刷新最新行情并生成交易计划 |
+| **收盘自动决策** | 15:05 - 23:30 | 采集当日排行生成次日交易计划 |
 | **盘后核对** | 15:10 - 23:30 | 状态核对 |
 
 开盘/临收盘窗口的时段就是**成交时段**，错过即作废，不做盘中补执行 ——
 `executePlannedOrders` 按 `execution_window` 精确匹配，开盘计划不会在临收盘被顺带打出去。
 
-收盘决策/盘后核对只读本地排行并回写次日计划，不涉及成交价，所以重试时段拉到
+决策/盘后核对只读本地排行并回写次日计划，不涉及成交价，所以自动重试时段拉到
 `LATE_WINDOW_END_MINUTE`（23:30）：同花顺晚间才恢复也能补生成次日计划，
 否则 15:05-15:20 内全失败就意味着次日无计划可执行。
 
 **收盘后不点同花顺**：15:00 后同花顺界面点控件易弹 "begin failed"，
-所以收盘决策/盘后核对/账户监控/页面同步一律**复用当日最近一次账户观测**
+所以收盘自动决策/盘后核对/账户监控/页面同步一律**复用当日最近一次账户观测**
 （持仓只随本方委托变化，且每次委托后都会立即快照，当日缓存与真实账户一致），
 零点击同花顺；仅当没有当日观测（如收盘后服务才启动）才回落为 account-only 快照。
 手动撤单同样限制在 09:25-15:00 交易时段内，收盘后拒绝。
@@ -891,7 +892,9 @@ T1StrategyConfig {
   ├─ 临收盘窗口 (14:55 - 15:00):
   │     └─ 如果市场弱 → 执行买入信号
   │
-  ├─ 收盘决策 (15:05 - 23:30):
+  ├─ 手动决策 (任意时间):
+  │        刷新行情并生成交易计划
+  ├─ 收盘自动决策 (15:05 - 23:30):
   │     └─ 生成下个交易日信号（卖出+买入）
   │
   └─ 盘后核对 (15:10 - 23:30):

@@ -700,7 +700,11 @@ export class MarketService {
     };
   }
 
-  async loadPaperContext(refreshForClose = false, traceId: string = randomUUID()) {
+  async loadPaperContext(
+    refreshForClose = false,
+    traceId: string = randomUUID(),
+    options: { enforceCloseTime?: boolean } = {},
+  ) {
     const [initialAnalysis, ranking] = await Promise.all([
       this.store.getAnalysis(),
       this.store.getRankingUniverse(),
@@ -709,7 +713,9 @@ export class MarketService {
     if (refreshForClose) {
       const now = formatDateTime();
       const hourMinute = Number(now.slice(11, 13)) * 60 + Number(now.slice(14, 16));
-      if (hourMinute < 15 * 60) throw new Error('收盘决策只能在交易日 15:00 后运行');
+      if (options.enforceCloseTime ?? true) {
+        if (hourMinute < 15 * 60) throw new Error('收盘决策自动机制只能在交易日 15:00 后运行');
+      }
       const refreshed = await this.refreshMarketAnalysis({ traceId });
       analysis = refreshed.analysis;
     }

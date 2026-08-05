@@ -261,10 +261,12 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
     set sideLabel to "买入"
     set submitLabel to "确定买入"
     set confirmTitle to "买入委托"
+    set flowMarker to "FLOW|buy|direct_form"
     if orderSide is "sell" then
         set sideLabel to "卖出"
         set submitLabel to "确定卖出"
         set confirmTitle to "卖出委托"
+        set flowMarker to "FLOW|sell|positions_double_click"
     end if
 
     tell application "System Events"
@@ -275,9 +277,44 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
             if simulationWindow is missing value then error "未找到同花顺模拟交易窗口，已取消下单"
             if not my elementContainsText(simulationWindow, "模拟练习") then error "当前窗口不是同花顺模拟交易，已取消下单"
 
-            my refreshSimulationConnection(simulationWindow)
-            my navigateTo(simulationWindow, orderSide)
-            if not my simulationPageReady(simulationWindow, orderSide) then error "未能切换到模拟交易" & sideLabel & "页面（可能仍停留在买入/卖出另一页）"
+            -- 不在下单路径点击无名连接刷新按钮：该控件的 AXPress 在 Swift 版本中
+            -- 可能阻塞整个 osascript，导致尚未进入持仓页就超时。账户快照已确认
+            -- 当前是模拟账户；若交易页不可用，后续表单/回查会明确失败。
+            if orderSide is "sell" then
+                -- 同花顺模拟盘的卖出表单必须从持仓行进入。直接点击“卖出”只打开空表单，
+                -- 不能可靠地带出可卖数量/证券上下文，部分版本甚至不会真正生成委托。
+                -- System Events 对非前台窗口的 click 可能永久挂起，表现为 30s 超时且界面无双击。
+                my logSellStep("sell_begin|" & orderCode)
+                my bringProcessToFront(it)
+                my logSellStep("frontmost_ok")
+                my navigateTo(simulationWindow, "positions")
+                my logSellStep("positions_page")
+                set positionRow to my waitForPositionRow(simulationWindow, orderCode, 50)
+                if positionRow is missing value then error "持仓页未找到可卖股票 " & orderCode & "，已取消下单"
+                my logSellStep("position_row_found|" & orderCode)
+                -- 双击偶发未打开卖出页（焦点未稳/界面忙）；最多重试 3 次并重新定位持仓行。
+                set openedSellPage to false
+                repeat with clickAttempt from 1 to 3
+                    my bringProcessToFront(it)
+                    set positionRow to my waitForPositionRow(simulationWindow, orderCode, 20)
+                    if positionRow is missing value then error "持仓页未找到可卖股票 " & orderCode & "，已取消下单"
+                    my logSellStep("double_click_attempt|" & clickAttempt)
+                    my doubleClickPositionRow(positionRow, orderCode)
+                    my waitForSimulationPage(simulationWindow, "sell")
+                    if my simulationPageReady(simulationWindow, "sell") then
+                        set openedSellPage to true
+                        exit repeat
+                    end if
+                    my logSellStep("double_click_retry|" & clickAttempt)
+                    my navigateTo(simulationWindow, "positions")
+                    delay 0.3
+                end repeat
+                if not openedSellPage then error "双击持仓行后未进入卖出页面，已取消下单"
+                my logSellStep("sell_page_ready")
+            else
+                my navigateTo(simulationWindow, "buy")
+                if not my simulationPageReady(simulationWindow, "buy") then error "未能切换到模拟交易买入页面（可能仍停留在另一页）"
+            end if
 
             tell simulationWindow
                 set orderFields to my allTextFields(simulationWindow)
@@ -288,11 +325,14 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
                 set codeField to item 2 of orderFields
                 set quantityField to item 3 of orderFields
 
+                set openedCodeValue to value of codeField as text
+                if orderSide is "sell" and openedCodeValue does not contain orderCode then error "双击持仓行后卖出股票代码不一致，已取消下单"
                 set value of codeField to orderCode
                 delay 0.8
-                if requestedPrice is not "AUTO" and requestedPrice is not "auto" then set value of priceField to requestedPrice
                 set value of quantityField to orderQuantity
                 delay 0.4
+                if requestedPrice is not "AUTO" and requestedPrice is not "auto" then set value of priceField to requestedPrice
+                delay 0.2
 
                 set codeValue to value of codeField as text
                 set priceValue to value of priceField as text
@@ -340,7 +380,7 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
             delay 0.5
             set verificationResult to my verifyOrderInWindow(simulationWindow, orderSide, orderCode, priceValue, orderQuantity)
             my restoreForegroundApp(previousApp)
-            return "ORDER_SUBMITTED|" & orderSide & "|" & orderCode & "|" & priceValue & "|" & orderQuantity & linefeed & verificationResult & linefeed & "RESULT|" & my sanitize(resultText)
+            return "ORDER_SUBMITTED|" & orderSide & "|" & orderCode & "|" & priceValue & "|" & orderQuantity & linefeed & flowMarker & linefeed & verificationResult & linefeed & "RESULT|" & my sanitize(resultText)
         end tell
     end tell
 end submitSimulatedOrder
@@ -366,8 +406,11 @@ on verifyOrderInWindow(simulationWindow, orderSide, orderCode, orderPrice, order
     my navigateTo(simulationWindow, "orders")
     delay 0.8
     set ordersSnapshot to my snapshotWindow(simulationWindow, "orders")
+    set sideLabel to "买入"
+    if orderSide is "sell" then set sideLabel to "卖出"
     if ordersSnapshot does not contain orderCode then error "委托列表中未找到股票代码 " & orderCode
     if ordersSnapshot does not contain orderQuantity then error "委托列表中未找到委托数量 " & orderQuantity
+    if ordersSnapshot does not contain sideLabel then error "委托列表中未找到" & sideLabel & "方向的委托 " & orderCode
     return "ORDER_VERIFIED|" & orderSide & "|" & orderCode & "|" & orderPrice & "|" & orderQuantity & linefeed & ordersSnapshot
 end verifyOrderInWindow
 
@@ -694,6 +737,59 @@ on findOrderRow(rootElement, sideLabel, orderCode, orderQuantity)
     return missing value
 end findOrderRow
 
+on findPositionRow(rootElement, orderCode)
+    tell application "System Events"
+        try
+            repeat with scrollItem in scroll areas of rootElement
+                repeat with tableItem in tables of scrollItem
+                    set rowCount to count of rows of tableItem
+                    set colCount to count of columns of tableItem
+                    -- 持仓表通常为 15 列；与快照扫描一致放宽到 10–20，排除 2 列资金表。
+                    if rowCount <= 100 and colCount >= 10 and colCount <= 20 then
+                        repeat with uiItem in rows of tableItem
+                            -- 只读取行的直接单元格。collectElementText 会遍历 entire contents，
+                            -- Swift 表格行在部分版本上会因此阻塞，导致双击永远执行不到。
+                            if my positionRowContainsCode(uiItem, orderCode) then return contents of uiItem
+                        end repeat
+                    end if
+                end repeat
+            end repeat
+        end try
+    end tell
+    return missing value
+end findPositionRow
+
+on positionRowContainsCode(rowElement, orderCode)
+    return my findPositionCodeCell(rowElement, orderCode) is not missing value
+end positionRowContainsCode
+
+on findPositionCodeCell(rowElement, orderCode)
+    tell application "System Events"
+        try
+            repeat with cellItem in UI elements of rowElement
+                if (my elementText(cellItem)) contains orderCode then return contents of cellItem
+            end repeat
+        end try
+    end tell
+    return missing value
+end findPositionCodeCell
+
+on waitForPositionRow(rootElement, orderCode, retryCount)
+    repeat with retryIndex from 1 to retryCount
+        set positionRow to my findPositionRow(rootElement, orderCode)
+        if positionRow is not missing value then return positionRow
+        delay 0.1
+    end repeat
+    return missing value
+end waitForPositionRow
+
+on logSellStep(messageText)
+    -- 卖出路径逐步落盘，超时后可对照 /tmp/ths-sell-debug.log 判断卡在前台/找行/双击哪一步。
+    try
+        do shell script "printf '%s %s\\n' \"$(date '+%Y-%m-%d %H:%M:%S')\" " & quoted form of (messageText as text) & " >> /tmp/ths-sell-debug.log"
+    end try
+end logSellStep
+
 on isFinalOrderStatus(statusText)
     if statusText contains "已撤" then return true
     if statusText contains "全部成交" then return true
@@ -729,6 +825,67 @@ on pressControl(uiControl)
     end tell
     error "控件无法点击：" & my elementName(uiControl)
 end pressControl
+
+on doubleClickControl(uiControl)
+    tell application "System Events"
+        try
+            set isEnabled to true
+            try
+                set isEnabled to (enabled of uiControl)
+            end try
+            if not isEnabled then error "控件当前不可用 (enabled = false)"
+            -- System Events 没有稳定的 AXDoubleClick 命令；两个短间隔 AXClick
+            -- 是 Swift/AppKit 表格行可识别的双击手势。
+            -- 必须带 timeout：非前台窗口上的 click 可能永不返回。
+            with timeout of 5 seconds
+                click uiControl
+            end timeout
+            delay 0.12
+            with timeout of 5 seconds
+                click uiControl
+            end timeout
+            return
+        on error
+            -- 某些版本的 AXRow 只接受 AXPress，作为同样的双击兜底。
+            try
+                with timeout of 5 seconds
+                    perform action "AXPress" of uiControl
+                end timeout
+                delay 0.12
+                with timeout of 5 seconds
+                    perform action "AXPress" of uiControl
+                end timeout
+                return
+            end try
+        end try
+    end tell
+    error "持仓行无法双击"
+end doubleClickControl
+
+on doubleClickPositionRow(positionRow, orderCode)
+    -- AXStaticText/AXRow 的 System Events click 会永久阻塞，AppleScript timeout 对该调用无效。
+    -- 改为读取代码单元格屏幕坐标，再由 CoreGraphics 投递真正的双击鼠标事件。
+    try
+        set selected of positionRow to true
+    end try
+    delay 0.15
+    set codeCell to my findPositionCodeCell(positionRow, orderCode)
+    if codeCell is missing value then error "持仓行中未找到证券代码单元格：" & orderCode
+    tell application "System Events"
+        set cellPosition to position of codeCell
+        set cellSize to size of codeCell
+    end tell
+    set clickX to (item 1 of cellPosition) + ((item 1 of cellSize) / 2)
+    set clickY to (item 2 of cellPosition) + ((item 2 of cellSize) / 2)
+    my logSellStep("double_click_core_graphics|" & orderCode & "|" & clickX & "|" & clickY)
+    set helperPath to "/tmp/trending-polars-ths-double-click"
+    try
+        do shell script "test -x " & quoted form of helperPath & " && " & quoted form of helperPath & " " & (clickX as text) & " " & (clickY as text)
+    on error errorMessage
+        error "系统级双击工具不可用：" & errorMessage
+    end try
+    my logSellStep("double_click_core_graphics_done|" & orderCode)
+end doubleClickPositionRow
 
 on waitForSheet(parentWindow, retryCount)
     tell application "System Events"

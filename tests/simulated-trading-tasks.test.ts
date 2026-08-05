@@ -45,7 +45,7 @@ describe('simulated-trading background tasks', () => {
     expect(started.body).toMatchObject({
       task_id: expect.any(String),
       status: 'started',
-      message: '收盘决策任务已启动',
+      message: '决策任务已启动',
     });
 
     const listed = await client.get('/api/tasks').expect(200);
@@ -53,7 +53,7 @@ describe('simulated-trading background tasks', () => {
       expect.objectContaining({
         id: started.body.task_id,
         type: 'paper_close_decision',
-        name: '收盘决策：刷新行情并生成交易计划',
+        name: '决策：刷新行情并生成交易计划',
       }),
     ]));
 
@@ -63,7 +63,7 @@ describe('simulated-trading background tasks', () => {
       message: '2026-07-28 收盘决策完成',
       result: { window: 'close', status: 'completed' },
     });
-    expect(loadPaperContext).toHaveBeenCalledWith(true, started.body.task_id);
+    expect(loadPaperContext).toHaveBeenCalledWith(true, started.body.task_id, { enforceCloseTime: false });
     expect(runWindowConfirmed).toHaveBeenCalledWith('close', context, started.body.task_id);
   });
 

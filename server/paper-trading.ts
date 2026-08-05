@@ -375,7 +375,9 @@ export class PaperTradingService extends EventEmitter {
       let pendingRemaining = 0;
 
       if (window === 'close') {
-        results = await this.generateCloseSignals(state, snapshot, market, clock.date, traceId);
+        // 手动“决策”可在任意时间运行，信号日以刷新后实际可用的行情日期为准；
+        // 自动 close 仍由 validateWindowTime 限制在收盘后。
+        results = await this.generateCloseSignals(state, snapshot, market, compactDate(market.rankingDate), traceId);
       } else if (window === 'open' || window === 'near_close') {
         await this.ensurePreviousClosePlan(state, snapshot, market, clock.date, traceId);
         ({ snapshot, results, pendingRemaining } = await this.executePlannedOrders(
@@ -1012,11 +1014,14 @@ export class PaperTradingService extends EventEmitter {
       throw new Error(`存在 ${inFlight.length} 笔正在提交中的委托，请稍候重试`);
     }
     const executionCalendar = this.effectiveTradingCalendar(context.calendar ?? []);
-    const eligible = (instruction: PaperStrategyInstruction) => (
-      instruction.status === 'pending'
-      && nextTradingDateAfter(instruction.signal_date, executionCalendar) === tradingDate
-      && (immediate || (instruction.execution_window ?? 'open') === executionWindow)
-    );
+    const eligible = (instruction: PaperStrategyInstruction) => {
+      if (instruction.status !== 'pending') return false;
+      const executionDate = nextTradingDateAfter(instruction.signal_date, executionCalendar);
+      // 立即执行用于恢复“曾提交但同花顺没有对应委托”的历史指令；
+      // 普通定时窗口仍严格只处理当天到期的计划。
+      const dateMatches = executionDate != null && (immediate ? executionDate <= tradingDate : executionDate === tradingDate);
+      return dateMatches && (immediate || (instruction.execution_window ?? 'open') === executionWindow);
+    };
     const sells = state.instructions.filter((instruction) => instruction.side === 'sell' && eligible(instruction));
     const buys = state.instructions.filter((instruction) => instruction.side === 'buy' && eligible(instruction));
     await this.audit.info('strategy', 'window_execution_started', {
@@ -1172,11 +1177,12 @@ export class PaperTradingService extends EventEmitter {
     calendar: readonly string[] = [],
   ): number {
     const executionCalendar = this.effectiveTradingCalendar(calendar);
-    return state.instructions.filter((instruction) => (
-      instruction.status === 'pending'
-      && nextTradingDateAfter(instruction.signal_date, executionCalendar) === tradingDate
-      && (immediate || (instruction.execution_window ?? 'open') === executionWindow)
-    )).length;
+    return state.instructions.filter((instruction) => {
+      if (instruction.status !== 'pending') return false;
+      const executionDate = nextTradingDateAfter(instruction.signal_date, executionCalendar);
+      const dateMatches = executionDate != null && (immediate ? executionDate <= tradingDate : executionDate === tradingDate);
+      return dateMatches && (immediate || (instruction.execution_window ?? 'open') === executionWindow);
+    }).length;
   }
 
   private reconcileState(state: PaperTradingRuntimeState, snapshot: SimulatedAccountSnapshot, tradingDate: string) {
@@ -1184,7 +1190,11 @@ export class PaperTradingService extends EventEmitter {
     const timestamp = shanghaiClock(this.now()).timestamp;
 
     for (const instruction of state.instructions) {
-      if (!['submitting', 'submitted', 'uncertain'].includes(instruction.status)) continue;
+      const retryableSubmissionFailure = (instruction.broker_status?.includes('AppleScript 读取超时')
+        || instruction.broker_status?.includes('服务重启时委托未提交完成')) ?? false;
+      const markedForImmediateRetry = instruction.broker_status?.includes('立即执行可重试')
+        || (instruction.status === 'expired' && instruction.side === 'sell' && retryableSubmissionFailure);
+      if (!['submitting', 'submitted', 'uncertain'].includes(instruction.status) && !(instruction.status === 'expired' && markedForImmediateRetry)) continue;
       const actual = actualByCode.get(instruction.stock_code);
       const brokerOrder = snapshot.orders.find((order) => order.side === instruction.side && order.stock_code === instruction.stock_code);
       if (instruction.side === 'buy' && actual) {
@@ -1206,6 +1216,21 @@ export class PaperTradingService extends EventEmitter {
         instruction.status = 'failed';
         instruction.completed_at = timestamp;
         instruction.broker_status = brokerOrder.status;
+      } else if (
+        instruction.side === 'sell'
+        && actual
+        && !brokerOrder
+        && (
+          (instruction.status === 'submitted' && Boolean(instruction.submitted_at) && compactDate(instruction.submitted_at!) < tradingDate)
+          || (instruction.status === 'expired' && markedForImmediateRetry)
+        )
+      ) {
+        // 旧委托已从同花顺当日委托中消失，但持仓仍在：不能继续显示“已提交”，
+        // 否则立即执行会永远跳过它，也无法触发新的持仓页双击卖出流程。
+        instruction.status = 'pending';
+        instruction.submitted_at = undefined;
+        instruction.broker_status = '同花顺无对应卖出委托，持仓仍在，已恢复为立即执行可重试';
+        this.recordEvent(state, 'system', 'stale_sell_order_retryable', `卖出 ${instruction.stock_code} 旧委托已消失，恢复立即执行重试`, instruction.stock_code);
       }
     }
 
@@ -1303,6 +1328,12 @@ export class PaperTradingService extends EventEmitter {
     let expired = 0;
     for (const instruction of state.instructions) {
       if (!this.planExpired(instruction, clock, executionCalendar)) continue;
+      // 旧卖出委托已经从同花顺消失、但持仓仍在时，保留为立即执行可重试，
+      // 不要在 overview 中再次按原执行日清算掉。
+      if (
+        instruction.broker_status?.includes('立即执行可重试')
+        || instruction.broker_status?.includes('服务重启时委托未提交完成')
+      ) continue;
       const executionDate = nextTradingDateAfter(instruction.signal_date, executionCalendar)!;
       instruction.status = 'expired';
       instruction.completed_at = clock.timestamp;
@@ -1585,7 +1616,7 @@ export class PaperTradingService extends EventEmitter {
       }
       instruction.status = 'pending';
       instruction.submitted_at = undefined;
-      instruction.broker_status = `上次提交失败：${summarizeSubmissionError(message)}`;
+      instruction.broker_status = `上次提交失败：${summarizeSubmissionError(message)}；立即执行可重试`;
       state.automation = { ...state.automation, last_error: summarizeSubmissionError(message) };
       await this.persist(state);
       await this.audit.warn('order', 'submission_failed_retryable', {
@@ -1929,6 +1960,9 @@ export class PaperTradingService extends EventEmitter {
     trigger: 'scheduled' | 'manual' | 'immediate',
   ) {
     if (!this.enforceTradingWindows) return;
+    // close 是内部窗口标识；手动入口展示为“决策”，允许随时刷新行情并生成计划。
+    // scheduled close 仍保留交易日和 15:00 后的自动运行限制。
+    if (window === 'close' && trigger === 'manual') return;
     if (clock.weekday === 0 || clock.weekday === 6) throw new Error('当前不是交易日，拒绝运行交易窗口');
     if (window === 'open' && trigger === 'immediate' && (clock.minute < 9 * 60 + 25 || clock.minute >= 15 * 60)) {
       throw new Error('立即执行仅允许在交易日 09:25-15:00 运行');
@@ -1940,7 +1974,7 @@ export class PaperTradingService extends EventEmitter {
       throw new Error('临收盘执行窗口仅允许在交易日 14:55-15:00 运行');
     }
     if (window === 'close' && clock.minute < MARKET_CLOSE_MINUTE) {
-      throw new Error('收盘决策窗口仅允许在交易日 15:00 后运行');
+      throw new Error('收盘决策自动机制仅允许在交易日 15:00 后运行');
     }
     if (window === 'post_close' && clock.minute < 15 * 60 + 5) {
       throw new Error('盘后核对窗口仅允许在交易日 15:05 后运行');

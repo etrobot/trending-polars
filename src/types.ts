@@ -259,6 +259,7 @@ export interface BacktestListItem {
   total_return_pct: number;
   total_trades: number;
   win_rate: number;
+  max_drawdown_pct: number;
   max_holdings: number;
   date_range: string;
   mode?: string;

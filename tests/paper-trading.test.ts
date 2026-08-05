@@ -222,6 +222,26 @@ describe('Node T+1 paper-trading core', () => {
     expect(confirmedBroker.placed).toEqual([]);
   });
 
+  it('allows the manual decision to generate a plan before close and on weekends', async () => {
+    let now = new Date('2026-07-24T10:00:00+08:00');
+    const service = new PaperTradingService(new FlowBroker({
+      availableCash: 100_000,
+      totalAssets: 100_000,
+      positions: [],
+      orders: [],
+    }), {
+      now: () => now,
+    });
+    const market = context('20260724', [], ['20260724', '20260727']);
+
+    await expect(service.runWindow('close', market)).rejects.toThrow('收盘决策自动机制仅允许在交易日 15:00 后运行');
+    now = new Date('2026-07-25T10:00:00+08:00');
+    const result = await service.runWindowConfirmed('close', market);
+
+    expect(result).toMatchObject({ window: 'close', status: 'completed' });
+    expect((await service.getRuntimeState()).last_signal_date).toBe('20260724');
+  });
+
   it('backfills the previous close plan from ranking order and respects the total position limit', async () => {
     const now = new Date('2026-07-23T11:00:00+08:00');
     const store = new TestStateStore();
@@ -1129,6 +1149,57 @@ describe('Node T+1 paper-trading core', () => {
       status: 'pending',
       broker_status: '同花顺无对应委托，已恢复待执行',
     });
+  });
+
+  it('retries a stale submitted sell during immediate execution', async () => {
+    const now = new Date('2026-07-24T09:31:00+08:00');
+    const store = new TestStateStore();
+    const broker = new FlowBroker({
+      availableCash: 100_000,
+      totalAssets: 110_000,
+      positions: [{
+        stock_code: '000862',
+        stock_name: '银星能源',
+        shares: 2100,
+        available_shares: 2100,
+        cost_price: 5.838,
+        current_price: 5.65,
+        market_value: 11_865,
+        pnl_amount: -393.91,
+        pnl_pct: -3.21,
+      }],
+      orders: [],
+    });
+    const service = new PaperTradingService(broker, {
+      stateStore: store,
+      now: () => now,
+      enforceTradingWindows: false,
+    });
+    store.state = {
+      ...defaultState('2026-07-23 15:05:00'),
+      instructions: [{
+        id: 'stale-sell-000862',
+        side: 'sell',
+        stock_code: '000862',
+        stock_name: '银星能源',
+        signal_date: '20260723',
+        signal_price: 5.64,
+        quantity: 2100,
+        reason: '止损信号；次日开盘卖出',
+        execution_window: 'open',
+        status: 'submitted',
+        created_at: '2026-07-23 15:05:00',
+        submitted_at: '2026-07-23 15:10:00',
+        broker_status: '已提交并回查',
+      }],
+    };
+
+    const result = await service.execute(context('20260723', [], ['20260723', '20260724']));
+
+    expect(broker.placed).toHaveLength(1);
+    expect(broker.placed[0]).toMatchObject({ side: 'sell', stock_code: '000862', quantity: 2100 });
+    expect(result.results[0]).toMatchObject({ side: 'sell', stock_code: '000862' });
+    expect((await service.getRuntimeState()).instructions[0]).toMatchObject({ status: 'filled' });
   });
 
   it('does not duplicate close signals when the close window is run twice on the same day', async () => {
