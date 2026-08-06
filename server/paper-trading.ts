@@ -1059,6 +1059,12 @@ export class PaperTradingService extends EventEmitter {
       try {
         await this.submitBrokerOrder(state, instruction, order, traceId);
       } catch (error) {
+        // 收盘后提交委托被拒，将当前及剩余待执行计划标为过期
+        if (error instanceof Error && error.message.includes('只读时段')) {
+          this.expirePendingPlans(state, shanghaiClock(this.now()), this.cachedTradingCalendar);
+          await this.persist(state);
+          break;
+        }
         if (instruction.status !== 'uncertain') throw error;
         await this.audit.warn('strategy', 'sell_submission_aborted', {
           traceId,
@@ -1137,6 +1143,12 @@ export class PaperTradingService extends EventEmitter {
       try {
         await this.submitBrokerOrder(state, instruction, order, traceId);
       } catch (error) {
+        // 收盘后提交委托被拒，将当前及剩余待执行计划标为过期
+        if (error instanceof Error && error.message.includes('只读时段')) {
+          this.expirePendingPlans(state, shanghaiClock(this.now()), this.cachedTradingCalendar);
+          await this.persist(state);
+          break;
+        }
         if (instruction.status !== 'uncertain') throw error;
         await this.audit.warn('strategy', 'buy_submission_aborted', {
           traceId,
@@ -1568,6 +1580,12 @@ export class PaperTradingService extends EventEmitter {
     order: PaperOrder,
     traceId: string,
   ): Promise<BrokerActionResult> {
+    // 15:00 收盘后不再向同花顺提交委托：收盘后操作同花顺界面容易弹 "begin failed"
+    // 或阻塞超时，且委托已无法成交。
+    const clock = shanghaiClock(this.now());
+    if (isThsBrokerReadOnlyPeriod(clock, [])) {
+      throw new Error(`当前为同花顺券商只读时段（${clock.timestamp}，09:25 前或 15:00 后），不再提交委托`);
+    }
     instruction.status = 'submitting';
     instruction.submitted_at = shanghaiClock(this.now()).timestamp;
     instruction.broker_status = '正在调用 AppleScript 提交并回查';

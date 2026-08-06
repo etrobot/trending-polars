@@ -319,7 +319,7 @@ function defaultRunner(scriptPath: string, timeoutMs: number): ThsCommandRunner 
         return;
       }
     }
-    // 卖出要前台化 + 持仓页双击 + 填单 + 回查，30s 偏紧；下单/撤单单独放宽。
+    // 下单/撤单统一放宽到 60s；卖出靠 15:00 前尽早启动保证不超时。
     const commandTimeoutMs = (args[0] === 'order' || args[0] === 'cancel')
       ? Math.max(timeoutMs, 60_000)
       : timeoutMs;

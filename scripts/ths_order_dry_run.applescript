@@ -293,6 +293,7 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
                 -- 同花顺模拟盘的卖出表单必须从持仓行进入。直接点击“卖出”只打开空表单，
                 -- 不能可靠地带出可卖数量/证券上下文，部分版本甚至不会真正生成委托。
                 -- System Events 对非前台窗口的 click 可能永久挂起，表现为 30s 超时且界面无双击。
+                if my isMarketClosed() then error "已过收盘时间（15:00），不再执行卖出操作"
                 my logSellStep("sell_begin|" & orderCode)
                 my bringProcessToFront(it)
                 my logSellStep("frontmost_ok")
@@ -302,8 +303,10 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
                 if positionRow is missing value then error "持仓页未找到可卖股票 " & orderCode & "，已取消下单"
                 my logSellStep("position_row_found|" & orderCode)
                 -- 双击偶发未打开卖出页（焦点未稳/界面忙）；最多重试 3 次并重新定位持仓行。
+                -- 卖出页打开但代码字段不对时也重试：双击可能命中了错误行或前次残留。
                 set openedSellPage to false
                 repeat with clickAttempt from 1 to 3
+                    if my isMarketClosed() then error "已过收盘时间（15:00），不再重试卖出操作"
                     my bringProcessToFront(it)
                     set positionRow to my waitForPositionRow(simulationWindow, orderCode, 50)
                     if positionRow is missing value then error "持仓页未找到可卖股票 " & orderCode & "，已取消下单"
@@ -311,14 +314,26 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
                     my doubleClickPositionRow(positionRow, orderCode)
                     my waitForSimulationPage(simulationWindow, "sell")
                     if my simulationPageReady(simulationWindow, "sell") then
-                        set openedSellPage to true
-                        exit repeat
+                        -- 卖出页已打开，校验代码字段是否匹配
+                        set orderFields to my allTextFields(simulationWindow)
+                        if (count of orderFields) >= 2 then
+                            set codeField to item 2 of orderFields
+                            set openedCodeValue to value of codeField as text
+                            if openedCodeValue contains orderCode then
+                                set openedSellPage to true
+                                exit repeat
+                            end if
+                            my logSellStep("code_mismatch|" & clickAttempt & "|expected=" & orderCode & "|got=" & openedCodeValue)
+                        else
+                            -- 字段不足，视为页面未完全加载，继续重试
+                            my logSellStep("fields_missing|" & clickAttempt)
+                        end if
                     end if
                     my logSellStep("double_click_retry|" & clickAttempt)
                     my navigateTo(simulationWindow, "positions")
                     delay 0.3
                 end repeat
-                if not openedSellPage then error "双击持仓行后未进入卖出页面，已取消下单"
+                if not openedSellPage then error "双击持仓行后未进入卖出页面或股票代码不一致，已取消下单"
                 my logSellStep("sell_page_ready")
             else
                 my navigateTo(simulationWindow, "buy")
@@ -827,6 +842,14 @@ on positionRowInteractable(rowElement, orderCode)
         end try
     end tell
 end positionRowInteractable
+
+on isMarketClosed()
+    -- 判断当前是否已过 A 股收盘时间（15:00）。收盘后不再重试双击/导航，
+    -- 避免同花顺弹 "begin failed" 或界面操作阻塞超时。
+    set currentHours to hours of (current date)
+    set currentMinutes to minutes of (current date)
+    return (currentHours > 15) or (currentHours is 15 and currentMinutes ≥ 0)
+end isMarketClosed
 
 on logSellStep(messageText)
     -- 卖出路径逐步落盘，超时后可对照 /tmp/ths-sell-debug.log 判断卡在前台/找行/双击哪一步。
