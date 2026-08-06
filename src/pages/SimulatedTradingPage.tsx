@@ -21,6 +21,11 @@ import type { AutomationState, BacktestListItem, PaperOverview, PaperPlanHistory
 const HISTORY_PAGE_SIZE = 15;
 const BACKTEST_HISTORY_PAGE_SIZE = 15;
 
+interface BacktestApplyTaskResult {
+  ranking_task_id?: string | null;
+  message?: string;
+}
+
 function historyItemTitle(item: BacktestListItem) {
   if (item.mode === 'random' && (item.strategy_count ?? 1) > 1) {
     return `随机组合 ${item.combo_index}/${item.strategy_count}`;
@@ -102,6 +107,8 @@ export function SimulatedTradingPage() {
   const [backtestSortColumn, setBacktestSortColumn] = useState<'win_rate' | 'total_return_pct' | null>(null);
   const [backtestSortDirection, setBacktestSortDirection] = useState<'asc' | 'desc'>('desc');
   const [applyingBacktestRunId, setApplyingBacktestRunId] = useState('');
+  const [backtestApplyTaskId, setBacktestApplyTaskId] = useState<string | null>(null);
+  const [backtestRankingTaskId, setBacktestRankingTaskId] = useState<string | null>(null);
   const [windowTaskId, setWindowTaskId] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const refreshInFlight = useRef<Promise<void> | null>(null);
@@ -130,6 +137,46 @@ export function SimulatedTradingPage() {
     void loadBootstrap();
   }, [loadBootstrap]);
   useTaskResult(windowTaskId, onWindowTaskDone);
+
+  const onBacktestApplyTaskDone = useCallback((task: TaskSnapshot) => {
+    setBacktestApplyTaskId(null);
+    if (task.status !== 'completed') {
+      setApplyingBacktestRunId('');
+      setError(task.message || '回测策略应用未完成');
+      return;
+    }
+    void (async () => {
+      try {
+        const detail = await api<TaskSnapshot>(`/api/tasks/${task.id}`);
+        const result = (detail.result ?? {}) as BacktestApplyTaskResult;
+        void loadBootstrap();
+        if (result.ranking_task_id) {
+          setBacktestRankingTaskId(result.ranking_task_id);
+          setNotice('策略已应用，排行重算正在后台进行');
+          return;
+        }
+        setApplyingBacktestRunId('');
+        setNotice(result.message ?? '策略已应用；当前股票池为空，未启动排行重算');
+      } catch (taskError) {
+        setApplyingBacktestRunId('');
+        setError(taskError instanceof Error ? taskError.message : String(taskError));
+      }
+    })();
+  }, [loadBootstrap]);
+  useTaskResult(backtestApplyTaskId, onBacktestApplyTaskDone);
+
+  const onBacktestRankingTaskDone = useCallback((task: TaskSnapshot) => {
+    setBacktestRankingTaskId(null);
+    setApplyingBacktestRunId('');
+    if (task.status !== 'completed') {
+      setError(`策略已应用，但排行重算未完成：${task.message || '未知错误'}`);
+      return;
+    }
+    setError('');
+    setNotice('策略已应用，排行重算完成');
+    void loadBootstrap();
+  }, [loadBootstrap]);
+  useTaskResult(backtestRankingTaskId, onBacktestRankingTaskDone);
 
   const refreshAccount = useCallback((): Promise<void> => {
     if (refreshInFlight.current) return refreshInFlight.current;
@@ -181,64 +228,24 @@ export function SimulatedTradingPage() {
   const closeBacktestHistory = () => {
     setBacktestHistoryOpen(false);
     setBacktestHistoryPage(1);
-    setApplyingBacktestRunId('');
   };
 
   const applyBacktestParams = async (runId: string) => {
     setApplyingBacktestRunId(runId);
     setError('');
     try {
-      const applied = await api<{
-        ok: boolean;
-        run_id: string;
-        strategy: Record<string, number>;
-        plan: {
-          target_position_pct: number;
-          position_size_pct: number;
-          max_positions: number;
-          max_entries_per_day: number;
-          max_hold_days: number;
-          stop_loss_pct: number;
-          take_profit_pct: number;
-        };
-        ranking?: {
-          trendWeightPct: number;
-          volumePriceWeightPct: number;
-          distanceFromLowWeightPct: number;
-          volatilityTrendWeightPct: number;
-        };
-        ranking_recomputed?: boolean;
-        ranking_message?: string;
-      }>(
+      const started = await api<{ task_id: string; run_id: string; message?: string }>(
         '/api/simulated-trading/strategy/apply-backtest',
         { method: 'POST', body: JSON.stringify({ run_id: runId }) },
       );
-      console.log('[simulated-trading] applied backtest params', applied);
-      const weights = applied.ranking;
-      const weightSummary = weights
-        ? `排行权重 趋势${weights.trendWeightPct}% 价量${weights.volumePriceWeightPct}% 距低点${weights.distanceFromLowWeightPct}% 波动${weights.volatilityTrendWeightPct}%`
-        : '';
-      setNotice(`已加载回测参数（${runId}）${weightSummary ? `；${weightSummary}` : ''}${applied.ranking_recomputed ? '；排行已重算' : applied.ranking_message ? `；${applied.ranking_message}` : ''}；退出规则 ${applied.plan.stop_loss_pct}% / +${applied.plan.take_profit_pct}% / ${applied.plan.max_hold_days}d`);
+      console.log('[simulated-trading] backtest strategy application started', started);
+      setBacktestApplyTaskId(started.task_id);
+      setNotice(started.message ?? `回测策略应用任务已启动（${runId}）`);
       setBacktestHistoryOpen(false);
-      setOverview((prev) => (prev ? {
-        ...prev,
-        plan: {
-          ...prev.plan,
-          ...applied.plan,
-        },
-      } : prev));
-      await loadBootstrap();
-      setOverview((prev) => (prev ? {
-        ...prev,
-        plan: {
-          ...prev.plan,
-          ...applied.plan,
-        },
-      } : prev));
+      setPanelOpen(true);
     } catch (applyError) {
-      setError(applyError instanceof Error ? applyError.message : String(applyError));
-    } finally {
       setApplyingBacktestRunId('');
+      setError(applyError instanceof Error ? applyError.message : String(applyError));
     }
   };
 
@@ -510,7 +517,7 @@ export function SimulatedTradingPage() {
                         disabled={Boolean(applyingBacktestRunId)}
                         onClick={() => void applyBacktestParams(item.run_id)}
                       >
-                        {applyingBacktestRunId === item.run_id ? '应用中' : '应用'}
+                        {applyingBacktestRunId === item.run_id ? '后台处理中' : '应用'}
                       </Button>
                     </td>
                   </tr>

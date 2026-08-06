@@ -9,7 +9,7 @@
     "dev:api": "tsx watch server/index.ts",
     "dev:web": "vite",
     "build": "tsc -b && vite build",
-    "start": "NODE_ENV=production tsx server/index.ts",
+    "start": "NODE_ENV=production tsx scripts/start.mjs",
     "ths-lifecycle": "tsx scripts/ths-lifecycle.mjs",
     "test": "vitest run",
     "test:watch": "vitest"

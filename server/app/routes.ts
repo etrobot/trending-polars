@@ -11,7 +11,7 @@ import { compactDate, formatDateTime, round } from '../format.js';
 import { fetchAdjustedKlines, fetchBlockKlines, MAX_BACKTEST_DAYS, MIN_BACKTEST_DAYS, type BlockKlinePeriod } from '../historical-market.js';
 import { queryRankings } from '../polars-engine.js';
 import { normalizeScoreStockConfig } from '../scoring-engine.js';
-import { rankingConfigFromBacktest } from '../ranking-config.js';
+import { rankingConfigFromBacktest, type RankingRuntimeConfig } from '../ranking-config.js';
 import type { TaskRegistry } from '../tasks.js';
 import { ThsSimulatedBrokerError } from '../ths-simulated-broker.js';
 import { MarketService, analysisWithStats, priceRows, averageRankingChange } from './market-service.js';
@@ -117,6 +117,24 @@ export function registerRoutes(
       }), 'http', 'request_completed');
     });
     next();
+  });
+
+  const startRankingTask = (
+    requestedDate: string,
+    days: number,
+    name = '计算多因子排行榜',
+    rankingConfig?: RankingRuntimeConfig,
+  ) => tasks.start('ranking_compute', name, async ({ progress, cancelled, traceId }) => {
+    const source = await store.getRankingUniverse();
+    if (!source.rankings.length) throw new Error('当前股票池为空，无法获取个股行情并计算排行');
+    return marketService.computeAndSaveRanking({
+      requestedDate,
+      days,
+      traceId,
+      rankingConfig,
+      cancelled,
+      progress,
+    });
   });
 
   // Health
@@ -309,17 +327,7 @@ export function registerRoutes(
   app.post('/api/ranking/compute', asyncHandler(async (request, response) => {
     const requestedDate = marketDateParam(request.query.date);
     const days = numberParam(request.query.days, 20, 5, 60);
-    const task = tasks.start('ranking_compute', '计算多因子排行榜', async ({ progress, cancelled, traceId }) => {
-      const source = await store.getRankingUniverse();
-      if (!source.rankings.length) throw new Error('当前股票池为空，无法获取个股行情并计算排行');
-      return marketService.computeAndSaveRanking({
-        requestedDate,
-        days,
-        traceId,
-        cancelled,
-        progress,
-      });
-    });
+    const task = startRankingTask(requestedDate, days);
     response.status(202).json({ task_id: task.id, status: 'started', message: '排行计算已启动' });
   }));
 
@@ -826,39 +834,55 @@ export function registerRoutes(
       response.status(404).json({ ok: false, error: '回测记录不存在', run_id: runId });
       return;
     }
-    const traceId = String(response.locals.traceId);
-    try {
-      const applied = await paper.applyBacktestStrategy(runId, backtest.config, traceId);
-      const rankingConfig = rankingConfigFromBacktest(runId, backtest.config);
-      await store.saveRankingConfig(rankingConfig);
-      console.log('[paper] saved ranking config from backtest', {
-        run_id: runId,
-        factor_weights: rankingConfig.factor_weights,
-        has_custom_scoring: Boolean(backtest.config.scoring_config_json),
-      });
-      const source = await store.getRankingUniverse();
-      let ranking: Awaited<ReturnType<MarketService['computeAndSaveRanking']>> | null = null;
-      if (source.rankings.length) {
-        ranking = await marketService.computeAndSaveRanking({
-          requestedDate: source.date,
-          traceId,
-          rankingConfig,
+    const task = tasks.start('strategy_apply_backtest', `应用回测策略 ${runId}`, async ({ progress, traceId }) => {
+      try {
+        progress(5, '正在应用回测策略参数');
+        const applied = await paper.applyBacktestStrategy(runId, backtest.config, traceId);
+        const rankingConfig = rankingConfigFromBacktest(runId, backtest.config);
+        await store.saveRankingConfig(rankingConfig);
+        console.log('[paper] saved ranking config from backtest', {
+          run_id: runId,
+          factor_weights: rankingConfig.factor_weights,
+          has_custom_scoring: Boolean(backtest.config.scoring_config_json),
         });
+
+        const source = await store.getRankingUniverse();
+        const rankingTask = source.rankings.length
+          ? startRankingTask(
+            source.date,
+            20,
+            `应用回测策略后重算排行 ${runId}`,
+            rankingConfig,
+          )
+          : null;
+        const message = rankingTask
+          ? '策略已应用，排行重算已转入后台'
+          : '策略已应用，股票池为空，排行参数已保存但未重算';
+        progress(100, message);
+        return {
+          ...applied,
+          ranking: rankingConfig.factor_weights,
+          ranking_task_id: rankingTask?.id ?? null,
+          ranking_started: Boolean(rankingTask),
+          ranking_recomputed: false,
+          ranking_message: message,
+          message,
+        };
+      } catch (error) {
+        await audit.error('paper_trading', 'apply_backtest_strategy_failed', {
+          traceId,
+          data: { run_id: runId },
+          error,
+        });
+        throw error;
       }
-      response.json({
-        ...applied,
-        ranking: rankingConfig.factor_weights,
-        ranking_recomputed: Boolean(ranking),
-        ranking_message: ranking?.message ?? '股票池为空，排行参数已保存但未重算',
-      });
-    } catch (error) {
-      await audit.error('paper_trading', 'apply_backtest_strategy_failed', {
-        traceId,
-        data: { run_id: runId },
-        error,
-      });
-      response.status(400).json({ ok: false, error: error instanceof Error ? error.message : String(error) });
-    }
+    });
+    response.status(202).json({
+      task_id: task.id,
+      status: 'started',
+      run_id: runId,
+      message: '回测策略应用任务已启动，排行将在策略应用后后台重算',
+    });
   }));
 
   // Audit

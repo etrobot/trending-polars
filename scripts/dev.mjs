@@ -11,17 +11,24 @@ const shutdown = (code = 0) => {
   process.exit(code);
 };
 
-const watchServer = spawn('tsx', ['watch', 'server/index.ts'], { stdio: 'inherit', env: process.env });
-processes.push(watchServer);
+function trackProcess(child, label) {
+  processes.push(child);
+  child.on('exit', (code, signal) => {
+    if (!shuttingDown && (code ?? 0) !== 0 && signal !== 'SIGTERM') {
+      console.error(`${label} 已退出：code=${code ?? 'null'} signal=${signal ?? 'null'}`);
+      shutdown(code ?? 1);
+    }
+  });
+  return child;
+}
+
+const watchServer = trackProcess(
+  spawn('tsx', ['watch', 'server/index.ts'], { stdio: 'inherit', env: process.env }),
+  'server',
+);
 
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
-
-for (const child of processes) {
-  child.on('exit', (code, signal) => {
-    if (!shuttingDown && (code ?? 0) !== 0 && signal !== 'SIGTERM') shutdown(code ?? 1);
-  });
-}
 
 async function portIsOpen(port) {
   return new Promise((resolve) => {
@@ -48,11 +55,12 @@ try {
   // API 未准备好时不启动 Vite，避免浏览器立即重连 WebSocket 产生 EPIPE 洪水。
   await waitForApi(Number(process.env.PORT ?? 8787));
   if (!shuttingDown) {
-    const vite = spawn('vite', [], { stdio: 'inherit', env: process.env });
-    processes.push(vite);
-    vite.on('exit', (code, signal) => {
-      if (!shuttingDown && (code ?? 0) !== 0 && signal !== 'SIGTERM') shutdown(code ?? 1);
-    });
+    // lifecycle 依赖 server 的自动化 API；API 就绪后再启动，避免首个 tick 因连接失败跳过。
+    trackProcess(
+      spawn('tsx', ['scripts/ths-lifecycle.mjs'], { stdio: 'inherit', env: process.env }),
+      'ths-lifecycle',
+    );
+    trackProcess(spawn('vite', [], { stdio: 'inherit', env: process.env }), 'vite');
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));

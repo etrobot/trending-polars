@@ -502,8 +502,15 @@ describe('Trending Polars API', () => {
     const task = await waitForTask(started.body.task_id);
     expect(task.status).toBe('completed');
     const runId = task.result.run_id;
-    const applied = await http.post('/api/simulated-trading/strategy/apply-backtest').send({ run_id: runId }).expect(200);
-    expect(applied.body).toMatchObject({
+    const appliedStarted = await http.post('/api/simulated-trading/strategy/apply-backtest').send({ run_id: runId }).expect(202);
+    expect(appliedStarted.body).toMatchObject({
+      task_id: expect.any(String),
+      status: 'started',
+      run_id: runId,
+    });
+    const appliedTask = await waitForTask(appliedStarted.body.task_id);
+    expect(appliedTask.status).toBe('completed');
+    expect(appliedTask.result).toMatchObject({
       ok: true,
       run_id: runId,
       strategy: {
@@ -527,8 +534,12 @@ describe('Trending Polars API', () => {
         volatilityTrendWeightPct: 100,
         relativeStrengthWeightPct: 100,
       },
-      ranking_recomputed: true,
+      ranking_started: true,
+      ranking_recomputed: false,
     });
+    const rankingTask = await waitForTask(appliedTask.result.ranking_task_id);
+    expect(rankingTask.status).toBe('completed');
+    expect(rankingTask.type).toBe('ranking_compute');
     const savedRankingConfig = await store.getRankingConfig();
     expect(savedRankingConfig).toMatchObject({
       applied_backtest_run_id: runId,

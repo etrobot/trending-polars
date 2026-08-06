@@ -298,14 +298,14 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
                 my logSellStep("frontmost_ok")
                 my navigateTo(simulationWindow, "positions")
                 my logSellStep("positions_page")
-                set positionRow to my waitForPositionRow(simulationWindow, orderCode, 50)
+                set positionRow to my waitForPositionRow(simulationWindow, orderCode, 80)
                 if positionRow is missing value then error "持仓页未找到可卖股票 " & orderCode & "，已取消下单"
                 my logSellStep("position_row_found|" & orderCode)
                 -- 双击偶发未打开卖出页（焦点未稳/界面忙）；最多重试 3 次并重新定位持仓行。
                 set openedSellPage to false
                 repeat with clickAttempt from 1 to 3
                     my bringProcessToFront(it)
-                    set positionRow to my waitForPositionRow(simulationWindow, orderCode, 20)
+                    set positionRow to my waitForPositionRow(simulationWindow, orderCode, 50)
                     if positionRow is missing value then error "持仓页未找到可卖股票 " & orderCode & "，已取消下单"
                     my logSellStep("double_click_attempt|" & clickAttempt)
                     my doubleClickPositionRow(positionRow, orderCode)
@@ -424,7 +424,9 @@ on verifyOrderInWindow(simulationWindow, orderSide, orderCode, orderPrice, order
 end verifyOrderInWindow
 
 on navigateTo(simulationWindow, destination)
-    if my simulationPageReady(simulationWindow, destination) then return
+    -- 持仓页不能因为旧表格仍挂在 AX 树上就直接返回。重新选中一次持仓页，
+    -- 让同花顺有机会重新查询/重建持仓表；否则后面的双击可能命中尚未刷新的行。
+    if destination is not "positions" and my simulationPageReady(simulationWindow, destination) then return
     set labels to {}
     if destination is "funds" then
         set labels to {"资金股份", "资金", "持仓"}
@@ -784,13 +786,47 @@ on findPositionCodeCell(rowElement, orderCode)
 end findPositionCodeCell
 
 on waitForPositionRow(rootElement, orderCode, retryCount)
+    -- 仅一次读到代码不代表持仓列表已经刷新完成：Swift 表格可能先暴露旧行，
+    -- 随后才重建单元格。要求加载提示消失、目标行可交互，并连续多次读到同一行。
+    set stableSamples to 0
     repeat with retryIndex from 1 to retryCount
-        set positionRow to my findPositionRow(rootElement, orderCode)
-        if positionRow is not missing value then return positionRow
-        delay 0.1
+        if my positionListBusy(rootElement) then
+            set stableSamples to 0
+        else
+            set positionRow to my findPositionRow(rootElement, orderCode)
+            if positionRow is not missing value and my positionRowInteractable(positionRow, orderCode) then
+                set stableSamples to stableSamples + 1
+                if stableSamples ≥ 6 then return positionRow
+            else
+                set stableSamples to 0
+            end if
+        end if
+        delay 0.2
     end repeat
     return missing value
 end waitForPositionRow
+
+on positionListBusy(rootElement)
+    return my shallowTextContains(rootElement, {"加载中", "正在加载", "查询中", "刷新中", "数据加载", "请稍候"})
+end positionListBusy
+
+on positionRowInteractable(rowElement, orderCode)
+    set codeCell to my findPositionCodeCell(rowElement, orderCode)
+    if codeCell is missing value then return false
+    tell application "System Events"
+        try
+            -- 完整持仓行应已暴露主要单元格；空容器/半成品行不允许双击。
+            if (count of UI elements of rowElement) < 10 then return false
+            set cellPosition to position of codeCell
+            set cellSize to size of codeCell
+            if (item 1 of cellSize) ≤ 0 or (item 2 of cellSize) ≤ 0 then return false
+            if (item 1 of cellPosition) < 0 or (item 2 of cellPosition) < 0 then return false
+            return true
+        on error
+            return false
+        end try
+    end tell
+end positionRowInteractable
 
 on logSellStep(messageText)
     -- 卖出路径逐步落盘，超时后可对照 /tmp/ths-sell-debug.log 判断卡在前台/找行/双击哪一步。
