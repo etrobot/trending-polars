@@ -511,6 +511,43 @@ describe('Node T+1 paper-trading core', () => {
       });
     });
 
+    it('盘后核对会把普通下单失败的立即重试计划移入已过期', async () => {
+      const store = new TestStateStore();
+      store.state = stalePlanState(true);
+      store.state.instructions[0].broker_status = '上次提交失败：同花顺读取超时；立即执行可重试';
+      store.state.completed_windows = { '20260724': ['post_close'] };
+      const service = new PaperTradingService(new FlowBroker({
+        availableCash: 100_000,
+        totalAssets: 100_000,
+        positions: [],
+        orders: [],
+      }), {
+        stateStore: store,
+        now: () => new Date('2026-07-24T15:10:00+08:00'),
+      });
+
+      const result = await service.runWindowConfirmed('post_close', context('20260723', [], ['20260723', '20260724']));
+
+      expect(result.status).toBe('completed');
+      expect(store.state?.instructions[0]).toMatchObject({
+        status: 'expired',
+        reason: expect.stringContaining('当日未执行'),
+      });
+    });
+
+    it('仅保留旧卖出委托消失后的立即重试计划，不延误普通失败计划清算', async () => {
+      const store = new TestStateStore();
+      store.state = stalePlanState(true);
+      store.state.instructions[0].broker_status = '同花顺无对应卖出委托，持仓仍在，已恢复为立即执行可重试';
+      const service = new PaperTradingService(new OfflineBroker(), {
+        stateStore: store,
+        now: () => new Date('2026-07-25T20:00:00+08:00'),
+      });
+
+      expect(await service.expireStalePlans()).toBe(0);
+      expect(store.state?.instructions[0]?.status).toBe('pending');
+    });
+
     it('周末也清算上一交易日遗留的计划', async () => {
       const store = new TestStateStore();
       store.state = stalePlanState(true);

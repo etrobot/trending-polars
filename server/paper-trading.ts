@@ -83,6 +83,19 @@ export type { PaperMarketContext, PaperTradingServiceOptions, PaperTradingStateS
 /** 账户资产走势最多保留的采样点数；只记录数值或日期变化，避免高频轮询产生冗余点。 */
 const ASSET_HISTORY_LIMIT = 240;
 
+/**
+ * 只有这些状态代表“旧卖出委托已经消失，但持仓仍在”，允许跨执行日保留并由“立即执行”重试。
+ * 普通下单失败虽然也会标记“立即执行可重试”，但只允许在当日收盘前重试；收盘后必须过期。
+ */
+const PERSISTENT_IMMEDIATE_RETRY_MARKERS = [
+  '同花顺无对应卖出委托，持仓仍在',
+  '服务重启时委托未提交完成',
+] as const;
+
+function shouldPreserveImmediateRetry(instruction: Pick<PaperStrategyInstruction, 'broker_status'>): boolean {
+  return PERSISTENT_IMMEDIATE_RETRY_MARKERS.some((marker) => instruction.broker_status?.includes(marker));
+}
+
 export class PaperTradingService extends EventEmitter {
   private overviewInFlight: Promise<PaperOverview> | null = null;
   private operationQueue: Promise<void> = Promise.resolve();
@@ -338,7 +351,20 @@ export class PaperTradingService extends EventEmitter {
         data: { window, trigger: options.trigger ?? 'scheduled', trading_date: clock.date, strategy: this.strategy },
       });
       const allowManualOpenRetry = window === 'open' && options.trigger === 'immediate';
-      if (this.isWindowCompleted(state, clock.date, window) && !allowManualOpenRetry) {
+      // 过期清算独立于窗口是否已经完成：用户手动补点盘后核对时，不能因为自动
+      // 任务已经记过 completed 就跳过仍停在 pending 的遗留计划。
+      // 配置了日历刷新器但日历尚未就绪时不清算，避免节假日被工作日兜底误判。
+      const preflightCalendar = context?.calendar ?? [];
+      const calendarReadyForExpiry = !this.calendarRefresher
+        || this.cachedTradingCalendar.length > 0
+        || preflightCalendar.length > 0;
+      const preflightExpired = calendarReadyForExpiry
+        ? this.expirePendingPlans(state, clock, preflightCalendar)
+        : 0;
+      if (preflightExpired > 0) {
+        await this.persist(state);
+      }
+      if (this.isWindowCompleted(state, clock.date, window) && !allowManualOpenRetry && preflightExpired === 0) {
         await this.audit.warn('paper_trading', 'window_already_completed', {
           traceId,
           data: { window, trading_date: clock.date },
@@ -1202,11 +1228,10 @@ export class PaperTradingService extends EventEmitter {
     const timestamp = shanghaiClock(this.now()).timestamp;
 
     for (const instruction of state.instructions) {
-      const retryableSubmissionFailure = (instruction.broker_status?.includes('AppleScript 读取超时')
-        || instruction.broker_status?.includes('服务重启时委托未提交完成')) ?? false;
-      const markedForImmediateRetry = instruction.broker_status?.includes('立即执行可重试')
-        || (instruction.status === 'expired' && instruction.side === 'sell' && retryableSubmissionFailure);
-      if (!['submitting', 'submitted', 'uncertain'].includes(instruction.status) && !(instruction.status === 'expired' && markedForImmediateRetry)) continue;
+      if (
+        !['submitting', 'submitted', 'uncertain'].includes(instruction.status)
+        && !(instruction.status === 'expired' && instruction.side === 'sell' && shouldPreserveImmediateRetry(instruction))
+      ) continue;
       const actual = actualByCode.get(instruction.stock_code);
       const brokerOrder = snapshot.orders.find((order) => order.side === instruction.side && order.stock_code === instruction.stock_code);
       if (instruction.side === 'buy' && actual) {
@@ -1234,7 +1259,7 @@ export class PaperTradingService extends EventEmitter {
         && !brokerOrder
         && (
           (instruction.status === 'submitted' && Boolean(instruction.submitted_at) && compactDate(instruction.submitted_at!) < tradingDate)
-          || (instruction.status === 'expired' && markedForImmediateRetry)
+          || (instruction.status === 'expired' && shouldPreserveImmediateRetry(instruction))
         )
       ) {
         // 旧委托已从同花顺当日委托中消失，但持仓仍在：不能继续显示“已提交”，
@@ -1341,11 +1366,9 @@ export class PaperTradingService extends EventEmitter {
     for (const instruction of state.instructions) {
       if (!this.planExpired(instruction, clock, executionCalendar)) continue;
       // 旧卖出委托已经从同花顺消失、但持仓仍在时，保留为立即执行可重试，
-      // 不要在 overview 中再次按原执行日清算掉。
-      if (
-        instruction.broker_status?.includes('立即执行可重试')
-        || instruction.broker_status?.includes('服务重启时委托未提交完成')
-      ) continue;
+      // 不要在 overview 中再次按原执行日清算掉。普通提交失败的“立即执行可重试”
+      // 只在当日收盘前有效，盘后核对时必须归入已过期。
+      if (shouldPreserveImmediateRetry(instruction)) continue;
       const executionDate = nextTradingDateAfter(instruction.signal_date, executionCalendar)!;
       instruction.status = 'expired';
       instruction.completed_at = clock.timestamp;
