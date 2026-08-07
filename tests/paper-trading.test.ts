@@ -1009,6 +1009,85 @@ describe('Node T+1 paper-trading core', () => {
     expect(broker.placed[1]).toMatchObject({ side: 'buy', stock_code: '000001', execution_window: 'near_close' });
   });
 
+  it('refreshes holdings after a same-day sell and skips an old buy plan for the same stock', async () => {
+    let now = new Date('2026-07-23T09:31:00+08:00');
+    const store = new TestStateStore();
+    const broker = new FlowBroker({
+      availableCash: 90_000,
+      totalAssets: 100_000,
+      positions: [{
+        stock_code: '600100',
+        stock_name: '同日回买测试',
+        shares: 1_000,
+        available_shares: 1_000,
+        cost_price: 10,
+        current_price: 10,
+        market_value: 10_000,
+        pnl_amount: 0,
+        pnl_pct: 0,
+      }],
+      orders: [],
+    });
+    store.state = {
+      ...defaultState('2026-07-22 15:05:00'),
+      reference_capital: 100_000,
+      last_signal_date: '20260722',
+      instructions: [
+        {
+          id: 'same-day-sell',
+          side: 'sell',
+          stock_code: '600100',
+          stock_name: '同日回买测试',
+          signal_date: '20260722',
+          signal_price: 10,
+          quantity: 1_000,
+          reason: '持仓到期；次日开盘卖出',
+          execution_window: 'open',
+          status: 'pending',
+          created_at: '2026-07-22 15:05:00',
+        },
+        {
+          id: 'same-day-buy',
+          side: 'buy',
+          stock_code: '600100',
+          stock_name: '同日回买测试',
+          signal_date: '20260722',
+          signal_price: 10,
+          quantity: 1_000,
+          rank: 1,
+          reason: '信号日20260722 排名#1 次日临近收盘买入',
+          execution_window: 'near_close',
+          status: 'pending',
+          created_at: '2026-07-22 15:05:00',
+        },
+      ],
+    };
+    const service = new PaperTradingService(broker, {
+      stateStore: store,
+      now: () => now,
+      enforceTradingWindows: false,
+    });
+    const market = context('20260722', [], ['20260722', '20260723'], analysisForTiming('hot', 6));
+
+    await service.runWindow('open', market);
+    expect(broker.placed).toHaveLength(1);
+    expect(broker.placed[0]).toMatchObject({ side: 'sell', stock_code: '600100' });
+    expect(broker.account.positions).toHaveLength(0);
+
+    now = new Date('2026-07-23T14:57:00+08:00');
+    await service.runWindow('near_close', market);
+
+    expect(broker.placed).toHaveLength(1);
+    expect((await service.getRuntimeState()).instructions).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'same-day-buy',
+        status: 'skipped',
+        reason: expect.stringContaining('同日已卖出，禁止当日回买'),
+      }),
+    ]));
+    expect((await service.getRuntimeState()).tracked_positions).toEqual([]);
+  });
+
   it('does not reuse a strong-market near-close sell slot for an earlier opening buy', async () => {
     let now = new Date('2026-07-22T15:10:00+08:00');
     const broker = new FlowBroker({

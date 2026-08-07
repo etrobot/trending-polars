@@ -375,6 +375,7 @@ ws://localhost:8787/ws/simulated-trading  # 模拟交易状态推送
 | 行情接口网络失败 | 腾讯/新浪/东方财富暂时不可用 | 已落库的个股/指数 K 线会自动从 `stock_daily_price` / `index_daily_price` 回退 |
 | 同花顺 AppleScript 失败 | 未打开模拟练习窗口 | 打开同花顺 → 模拟练习 |
 | 委托回查失败 | 界面未更新 / 弹窗遮挡 | 检查同花顺界面状态 |
+| 看不到已成交委托 | 勾选了“只显示可撤委托” | 查看委托时取消勾选“只显示可撤委托”，否则只显示未成交/可撤委托 |
 | 自动化调度不执行 | 未启用 | 前端调用 `POST /api/simulated-trading/automation/toggle` |
 | 回测失败 | 历史数据不足 | 先调用 `POST /api/backtest/collect` |
 | 涨停采集返回空 | 同花顺反爬拦截 | 检查网络，保留现有 `analysis.json` 快照 |

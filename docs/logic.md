@@ -782,7 +782,7 @@ PaperMarketContext
   │     ├─ 情绪门控: cold 情绪 → 不买入
   │     ├─ 仓位门控: 当前持仓数 ≥ 目标 → 不买入
   │     ├─ 排行榜取前 N 名（maxCandidates=5）
-  │     ├─ 过滤: 已持仓/已清仓/不满足条件
+  │     ├─ 过滤: 已持仓/已清仓/本交易日已卖出/不满足条件
   │     ├─ 市场强 → 开盘买（window=open）
   │     └─ 市场弱 → 临收盘买（window=near_close）
   │     （注：不再过滤 block_top 涨停股，由执行时的 broker 实际拒绝处理）

@@ -271,6 +271,7 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
     set submitLabel to "确定买入"
     set confirmTitle to "买入委托"
     set flowMarker to "FLOW|buy|direct_form"
+    set sellPageFields to missing value
     if orderSide is "sell" then
         set sideLabel to "卖出"
         set submitLabel to "确定卖出"
@@ -307,20 +308,27 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
                 set openedSellPage to false
                 repeat with clickAttempt from 1 to 3
                     if my isMarketClosed() then error "已过收盘时间（15:00），不再重试卖出操作"
-                    my bringProcessToFront(it)
-                    set positionRow to my waitForPositionRow(simulationWindow, orderCode, 50)
-                    if positionRow is missing value then error "持仓页未找到可卖股票 " & orderCode & "，已取消下单"
+                    -- 第一次使用刚刚连续确认过的行，避免再次遍历 Swift 表格 AX 树。
+                    -- 旧逻辑这里无条件二次 waitForPositionRow，正是日志停在
+                    -- position_row_found 后长期不再前进的原因。
+                    if clickAttempt is not 1 then
+                        my bringProcessToFront(it)
+                        set positionRow to my waitForPositionRow(simulationWindow, orderCode, 50)
+                        if positionRow is missing value then error "持仓页未找到可卖股票 " & orderCode & "，已取消下单"
+                    end if
                     my logSellStep("double_click_attempt|" & clickAttempt)
                     my doubleClickPositionRow(positionRow, orderCode)
                     my waitForSimulationPage(simulationWindow, "sell")
                     if my simulationPageReady(simulationWindow, "sell") then
                         -- 卖出页已打开，校验代码字段是否匹配
+                        my logSellStep("sell_page_detected|" & clickAttempt)
                         set orderFields to my allTextFields(simulationWindow)
                         if (count of orderFields) >= 2 then
                             set codeField to item 2 of orderFields
                             set openedCodeValue to value of codeField as text
                             if openedCodeValue contains orderCode then
                                 set openedSellPage to true
+                                set sellPageFields to orderFields
                                 exit repeat
                             end if
                             my logSellStep("code_mismatch|" & clickAttempt & "|expected=" & orderCode & "|got=" & openedCodeValue)
@@ -341,8 +349,15 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
             end if
 
             tell simulationWindow
-                set orderFields to my allTextFields(simulationWindow)
+                my logSellStep("form_scan_begin|" & orderSide)
+                if orderSide is "sell" and sellPageFields is not missing value then
+                    -- 卖出页检测阶段已经拿到这组字段，复用它们，不再次触发 AX 全树扫描。
+                    set orderFields to sellPageFields
+                else
+                    set orderFields to my allTextFields(simulationWindow)
+                end if
                 if (count of orderFields) < 3 then error "未识别到交易输入框，请先手动打开模拟交易的" & sideLabel & "页面"
+                my logSellStep("form_scan_done|" & (count of orderFields))
 
                 -- 当前同花顺 macOS 模拟交易页辅助功能顺序：价格、代码、数量。
                 set priceField to item 1 of orderFields
@@ -351,8 +366,12 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
 
                 set openedCodeValue to value of codeField as text
                 if orderSide is "sell" and openedCodeValue does not contain orderCode then error "双击持仓行后卖出股票代码不一致，已取消下单"
-                set value of codeField to orderCode
-                delay 0.8
+                -- 双击持仓行已经带入证券代码。卖出时重复 set value 会触发同花顺
+                -- Swift 表单重新查询，界面看似正常但 AX 调用会一直不返回。
+                if orderSide is not "sell" then
+                    set value of codeField to orderCode
+                    delay 0.8
+                end if
                 set value of quantityField to orderQuantity
                 delay 0.4
                 if requestedPrice is not "AUTO" and requestedPrice is not "auto" then set value of priceField to requestedPrice
@@ -370,10 +389,14 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
                 if not my isPositiveNumber(priceValue) then error "未能从交易页读取有效委托价格，已取消下单"
                 if not my elementContainsText(simulationWindow, "模拟练习") then error "提交前无法确认模拟交易状态，已取消下单"
 
-                set submitButton to my findNamedControl(simulationWindow, {submitLabel})
+                my logSellStep("fields_verified|" & orderCode & "|" & quantityValue)
+                set submitButton to my findOrderActionControl(simulationWindow, submitLabel)
                 if submitButton is missing value then error "未识别到“" & submitLabel & "”按钮，界面结构可能已变化"
                 if not (enabled of submitButton) then error "“" & submitLabel & "”按钮不可用，已取消下单"
-                my pressControl(submitButton)
+                my logSellStep("submit_button_found|" & submitLabel)
+                -- 用屏幕坐标投递真实鼠标事件，绕过同花顺 Swift 控件 AXPress 偶发阻塞。
+                my clickControlByCoordinates(submitButton)
+                my logSellStep("submit_button_clicked|" & submitLabel)
 
                 set confirmationSheet to my waitForSheet(simulationWindow, 30)
                 if confirmationSheet is missing value then error "未出现" & confirmTitle & "确认弹窗"
@@ -382,9 +405,10 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
                 if not my elementContainsText(confirmationSheet, orderQuantity) then error "确认弹窗中的委托数量不一致，已取消下单"
                 if not my elementContainsText(simulationWindow, "模拟练习") then error "确认前无法确认模拟交易状态，已取消下单"
 
-                set confirmButton to my findNamedControl(confirmationSheet, {"确认"})
+                set confirmButton to my findOrderActionControl(confirmationSheet, "确认")
                 if confirmButton is missing value then error "未识别到委托确认按钮"
-                my pressControl(confirmButton)
+                my clickControlByCoordinates(confirmButton)
+                my logSellStep("confirmation_clicked|" & confirmTitle)
             end tell
 
             -- 等待委托结果；若出现结果弹窗，读取后关闭。
@@ -428,6 +452,7 @@ end verifyOrder
 on verifyOrderInWindow(simulationWindow, orderSide, orderCode, orderPrice, orderQuantity)
     if not my elementContainsText(simulationWindow, "模拟练习") then error "委托核验前无法确认模拟交易状态"
     my navigateTo(simulationWindow, "orders")
+    my ensureAllOrdersVisible(simulationWindow)
     delay 0.8
     set ordersSnapshot to my snapshotWindow(simulationWindow, "orders")
     set sideLabel to "买入"
@@ -441,7 +466,10 @@ end verifyOrderInWindow
 on navigateTo(simulationWindow, destination)
     -- 持仓页不能因为旧表格仍挂在 AX 树上就直接返回。重新选中一次持仓页，
     -- 让同花顺有机会重新查询/重建持仓表；否则后面的双击可能命中尚未刷新的行。
-    if destination is not "positions" and my simulationPageReady(simulationWindow, destination) then return
+    if destination is not "positions" and my simulationPageReady(simulationWindow, destination) then
+        if destination is "orders" then my ensureAllOrdersVisible(simulationWindow)
+        return
+    end if
     set labels to {}
     if destination is "funds" then
         set labels to {"资金股份", "资金", "持仓"}
@@ -467,6 +495,7 @@ on navigateTo(simulationWindow, destination)
         if destination is in {"buy", "sell", "funds", "positions", "orders"} then
             my waitForSimulationPage(simulationWindow, destination)
         end if
+        if destination is "orders" then my ensureAllOrdersVisible(simulationWindow)
         return
     end if
 
@@ -745,6 +774,72 @@ on findNamedControl(rootElement, wantedNames)
     return missing value
 end findNamedControl
 
+on isCheckboxChecked(uiControl)
+    tell application "System Events"
+        try
+            set checkboxValue to value of uiControl
+            if checkboxValue is true or checkboxValue is 1 or (checkboxValue as text) is "1" then return true
+        end try
+    end tell
+    return false
+end isCheckboxChecked
+
+on findCancelableOnlyFilterCheckbox(rootElement)
+    -- 同花顺委托页默认勾选「只显示可撤委托」，会把已成交/已撤单过滤掉。
+    -- 标签是 static text，复选框在标签左侧同一行。
+    tell application "System Events"
+        set labelPosition to missing value
+        try
+            repeat with labelItem in static texts of rootElement
+                set labelText to my elementText(labelItem)
+                if labelText contains "只显示可撤委托" or labelText contains "只显示可撤" then
+                    set labelPosition to position of labelItem
+                    exit repeat
+                end if
+            end repeat
+        end try
+        if labelPosition is missing value then return missing value
+        set labelY to item 2 of labelPosition
+        set labelX to item 1 of labelPosition
+        try
+            repeat with checkboxItem in checkboxes of rootElement
+                set checkboxPosition to position of checkboxItem
+                set checkboxY to item 2 of checkboxPosition
+                set checkboxX to item 1 of checkboxPosition
+                if checkboxY >= labelY - 5 and checkboxY <= labelY + 5 and checkboxX < labelX then return contents of checkboxItem
+            end repeat
+        end try
+    end tell
+    return missing value
+end findCancelableOnlyFilterCheckbox
+
+on ensureAllOrdersVisible(simulationWindow)
+    set filterCheckbox to my findCancelableOnlyFilterCheckbox(simulationWindow)
+    if filterCheckbox is missing value then return
+    if not my isCheckboxChecked(filterCheckbox) then return
+    my pressControl(filterCheckbox)
+    delay 0.4
+end ensureAllOrdersVisible
+
+on findOrderActionControl(rootElement, wantedName)
+    -- 窗口直属按钮是最快且最稳定的路径；Swift 版本也可能把按钮放在嵌套容器中，
+    -- 此时退回到文本控件搜索。两条路径都只返回可点击控件，避免误点静态文本。
+    set foundControl to missing value
+    try
+        with timeout of 5 seconds
+            set foundControl to my findNamedControl(rootElement, {wantedName})
+        end timeout
+    end try
+    if foundControl is not missing value then return foundControl
+    try
+        with timeout of 5 seconds
+            return my findClickableByText(rootElement, wantedName)
+        end timeout
+    on error
+        return missing value
+    end try
+end findOrderActionControl
+
 on findOrderRow(rootElement, sideLabel, orderCode, orderQuantity)
     tell application "System Events"
         try
@@ -893,6 +988,29 @@ on pressControl(uiControl)
     end tell
     error "控件无法点击：" & my elementName(uiControl)
 end pressControl
+
+on clickControlByCoordinates(uiControl)
+    -- AXPress 在同花顺 Swift 界面偶发不返回；控件坐标已经由 AX 读取到，
+    -- 交给同一个 CoreGraphics helper 投递真实的单击事件。
+    tell application "System Events"
+        try
+            with timeout of 5 seconds
+                set controlPosition to position of uiControl
+                set controlSize to size of uiControl
+            end timeout
+        on error errorMessage
+            error "无法读取按钮坐标：" & errorMessage
+        end try
+    end tell
+    set clickX to (item 1 of controlPosition) + ((item 1 of controlSize) / 2)
+    set clickY to (item 2 of controlPosition) + ((item 2 of controlSize) / 2)
+    set helperPath to "/tmp/trending-polars-ths-double-click"
+    try
+        do shell script "test -x " & quoted form of helperPath & " && " & quoted form of helperPath & " " & (clickX as text) & " " & (clickY as text) & " single"
+    on error errorMessage
+        error "系统级单击工具不可用：" & errorMessage
+    end try
+end clickControlByCoordinates
 
 on doubleClickControl(uiControl)
     tell application "System Events"

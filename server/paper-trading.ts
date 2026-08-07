@@ -951,10 +951,13 @@ export class PaperTradingService extends EventEmitter {
     const existingSignalBuyCodes = state.instructions
       .filter((instruction) => instruction.side === 'buy' && instruction.signal_date === signalDate)
       .map((instruction) => instruction.stock_code);
+    const sameDaySellCodes = this.sameDaySellCodes(state, signalDate);
     const excludedCodes = new Set([
       ...snapshot.positions.map((position) => position.stock_code),
       ...activeBuys.map((instruction) => instruction.stock_code),
       ...existingSignalBuyCodes,
+      ...plannedSellCodes,
+      ...sameDaySellCodes,
     ]);
     const candidates = rankEntryCandidates(
       context.rankings,
@@ -1106,7 +1109,7 @@ export class PaperTradingService extends EventEmitter {
       }
     }
 
-    if (sells.some((instruction) => instruction.status === 'submitted')) {
+    if (sells.some((instruction) => ['submitted', 'uncertain', 'filled'].includes(instruction.status))) {
       snapshot = await this.readAndObserveAccount(state, traceId, `${executionWindow}:after_sells`);
       this.reconcileState(state, snapshot, tradingDate);
     }
@@ -1114,12 +1117,24 @@ export class PaperTradingService extends EventEmitter {
     let availableCash = snapshot.availableCash;
     const referenceCapital = state.reference_capital ?? snapshot.totalAssets;
     const occupiedCodes = new Set(snapshot.positions.map((position) => position.stock_code));
+    // 卖出后必须以最新账户快照为准；即使旧买入计划仍 pending，也禁止同一交易日回买。
+    const sameDaySellCodes = this.sameDaySellCodes(state, tradingDate);
     const pendingBuys = state.instructions
       .filter((instruction) => instruction.side === 'buy' && eligible(instruction))
       .slice(0, this.strategy.maxEntriesPerDay);
     const executionLimitUpCodes = exactLimitUpCodes(context, tradingDate);
 
     for (const instruction of pendingBuys) {
+      if (sameDaySellCodes.has(instruction.stock_code)) {
+        instruction.status = 'skipped';
+        instruction.completed_at = shanghaiClock(this.now()).timestamp;
+        instruction.reason = `${instruction.reason}；同日已卖出，禁止当日回买（持仓状态已刷新）`;
+        await this.audit.warn('strategy', 'buy_skipped_same_day_sell', {
+          traceId,
+          data: { instruction, trading_date: tradingDate, sold_codes: [...sameDaySellCodes] },
+        });
+        continue;
+      }
       if (occupiedCodes.has(instruction.stock_code)) {
         instruction.status = 'filled';
         instruction.completed_at = shanghaiClock(this.now()).timestamp;
@@ -1205,6 +1220,23 @@ export class PaperTradingService extends EventEmitter {
       data: { trading_date: tradingDate, execution_window: executionWindow, immediate, results, pending_remaining: pendingRemaining, final_account: snapshot },
     });
     return { snapshot, results, pendingRemaining };
+  }
+
+  /**
+   * 当日已经提交、结果不确定或核对成交的卖出，不允许被旧买入计划重新买回。
+   * 时间优先取完成时间，避免卖出回查后仍沿用提交前的状态判断。
+   */
+  private sameDaySellCodes(
+    state: PaperTradingRuntimeState,
+    tradingDate: string,
+  ): Set<string> {
+    return new Set(state.instructions
+      .filter((instruction) => (
+        instruction.side === 'sell'
+        && ['submitting', 'submitted', 'uncertain', 'filled'].includes(instruction.status)
+        && compactDate(instruction.completed_at ?? instruction.submitted_at ?? '') === compactDate(tradingDate)
+      ))
+      .map((instruction) => instruction.stock_code));
   }
 
   private countPendingWindowOrders(
