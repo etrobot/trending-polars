@@ -28,6 +28,10 @@ osascript scripts/ths_order_dry_run.applescript quote 600519       # 实时价�
 osascript scripts/ths_order_dry_run.applescript order buy 600519 AUTO 100   # 买入
 osascript scripts/ths_order_dry_run.applescript order sell 600519 AUTO 100  # 持仓页双击后卖出
 osascript scripts/ths_order_dry_run.applescript cancel buy 600519 100       # 撤单
+
+# AX 结构缓存（窗口直属下标，跨进程复用；调试日志 /tmp/ths-ax-cache-debug.log）
+osascript scripts/ths_order_dry_run.applescript cache show
+osascript scripts/ths_order_dry_run.applescript cache rebuild
 ```
 
 ### 1.2 执行流程 —— `ThsSimulatedBroker`（`server/ths-simulated-broker.ts`）

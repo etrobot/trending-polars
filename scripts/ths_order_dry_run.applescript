@@ -15,13 +15,27 @@
 --   osascript scripts/ths_order_dry_run.applescript order buy 600519 AUTO 100
 --   osascript scripts/ths_order_dry_run.applescript order sell 600519 AUTO 100
 --
+-- AX 结构缓存（窗口直属子元素下标，跨 osascript 进程复用）：
+--   osascript scripts/ths_order_dry_run.applescript cache show
+--   osascript scripts/ths_order_dry_run.applescript cache rebuild
+--
 -- 兼容旧调用：
 --   osascript scripts/ths_order_dry_run.applescript 600519 1327.50 100
+--
+-- 缓存硬约束（与 ths_lifecycle.applescript 一致）：
+-- 1. 不缓存 System Events 控件引用（会塌缩成按名字引用，同名按钮会点错）。
+-- 2. 只缓存窗口直属子元素下标 + name/几何指纹；命中后在同一表达式里按下标 AXPress。
+-- 3. 指纹校验失败立即重建，再不行才回退到旧的浅层/全树搜索。
 
 property stoleFocus : false
 property snapshotHintCodes : {}
 property snapshotFundRowsFound : false
 property snapshotFoundCodes : {}
+property simulationWindowIndex : 1
+property axCacheLoaded : false
+property axCacheRaw : ""
+property axCachePath : "/tmp/trending-polars-ths-ax-cache.txt"
+property clickableRoles : {"AXButton", "AXRadioButton", "AXCheckBox", "AXLink", "AXTab", "AXMenuItem"}
 
 on run argv
     if (count of argv) >= 2 then
@@ -46,6 +60,12 @@ on run argv
         else if commandName is "cancel" then
             if (count of argv) is not 4 then error my usageText()
             return my cancelSimulatedOrder(item 2 of argv as text, item 3 of argv as text, item 4 of argv as text)
+        else if commandName is "cache" then
+            if (count of argv) is not 2 then error my usageText()
+            set cacheAction to item 2 of argv as text
+            if cacheAction is "show" then return my showAxCache()
+            if cacheAction is "rebuild" then return my rebuildAxCacheCommand()
+            error my usageText()
         end if
     end if
 
@@ -57,7 +77,7 @@ on run argv
 end run
 
 on usageText()
-    return "用法：snapshot funds|positions|orders|account|account_passive [代码1,代码2]；quote 股票代码；order buy|sell 股票代码 价格|AUTO 数量；verify buy|sell 股票代码 价格|AUTO 数量；cancel buy|sell 股票代码 数量"
+    return "用法：snapshot funds|positions|orders|account|account_passive [代码1,代码2]；quote 股票代码；order buy|sell 股票代码 价格|AUTO 数量；verify buy|sell 股票代码 价格|AUTO 数量；cancel buy|sell 股票代码 数量；cache show|rebuild"
 end usageText
 
 on parseHintCodes(rawHints)
@@ -105,10 +125,7 @@ on cancelSimulatedOrder(orderSide, orderCode, orderQuantity)
             end try
             delay 0.2
 
-            set cancelButton to my findNamedControl(simulationWindow, {"撤单", "撤销委托", "撤销"})
-            if cancelButton is missing value then error "未识别到撤单按钮"
-            if not (enabled of cancelButton) then error "撤单按钮不可用"
-            my pressControl(cancelButton)
+            if not my pressResolvedControl(simulationWindow, "cancel", {"撤单", "撤销委托", "撤销"}) then error "未识别到撤单按钮"
 
             set cancelSheet to my waitForSheet(simulationWindow, 15)
             if cancelSheet is not missing value then
@@ -390,12 +407,15 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
                 if not my elementContainsText(simulationWindow, "模拟练习") then error "提交前无法确认模拟交易状态，已取消下单"
 
                 my logSellStep("fields_verified|" & orderCode & "|" & quantityValue)
-                set submitButton to my findOrderActionControl(simulationWindow, submitLabel)
-                if submitButton is missing value then error "未识别到“" & submitLabel & "”按钮，界面结构可能已变化"
-                if not (enabled of submitButton) then error "“" & submitLabel & "”按钮不可用，已取消下单"
-                my logSellStep("submit_button_found|" & submitLabel)
-                -- 用屏幕坐标投递真实鼠标事件，绕过同花顺 Swift 控件 AXPress 偶发阻塞。
-                my clickControlByCoordinates(submitButton)
+                set submitCacheKey to "submit_buy"
+                if orderSide is "sell" then set submitCacheKey to "submit_sell"
+                if not my clickResolvedControl(simulationWindow, submitCacheKey, {submitLabel}) then
+                    set submitButton to my findOrderActionControl(simulationWindow, submitLabel)
+                    if submitButton is missing value then error "未识别到“" & submitLabel & "”按钮，界面结构可能已变化"
+                    if not (enabled of submitButton) then error "“" & submitLabel & "”按钮不可用，已取消下单"
+                    my logSellStep("submit_button_found_fallback|" & submitLabel)
+                    my clickControlByCoordinates(submitButton)
+                end if
                 my logSellStep("submit_button_clicked|" & submitLabel)
 
                 set confirmationSheet to my waitForSheet(simulationWindow, 30)
@@ -470,19 +490,20 @@ on navigateTo(simulationWindow, destination)
         if destination is "orders" then my ensureAllOrdersVisible(simulationWindow)
         return
     end if
-    set labels to {}
-    if destination is "funds" then
-        set labels to {"资金股份", "资金", "持仓"}
-    else if destination is "positions" then
-        set labels to {"持仓", "资金股份"}
-    else if destination is "orders" then
-        set labels to {"当日委托", "委托", "查询"}
-    else if destination is "buy" then
-        set labels to {"买入", "普通买入"}
-    else if destination is "sell" then
-        set labels to {"卖出", "普通卖出"}
+    set labels to my navWantedNames(destination)
+    if (count of labels) is 0 then error "未知模拟交易页面：" & destination
+
+    -- 优先：磁盘/会话缓存的窗口直属下标（一次 Apple Event），校验失败再批量扫一层重建。
+    if my pressResolvedControl(simulationWindow, destination, labels) then
+        if destination is in {"buy", "sell", "funds", "positions", "orders"} then
+            my waitForSimulationPage(simulationWindow, destination)
+        end if
+        if destination is "orders" then my ensureAllOrdersVisible(simulationWindow)
+        return
     end if
 
+    -- 兜底：旧浅层按钮 / entire contents 搜索（仅缓存未命中且批量扫失败时）。
+    my logAxCache("navigate_fallback|" & destination)
     set targetControl to my findNamedControl(simulationWindow, labels)
     if targetControl is missing value then
         repeat with labelText in labels
@@ -501,6 +522,442 @@ on navigateTo(simulationWindow, destination)
 
     error "无法切换到模拟交易页面：" & destination
 end navigateTo
+
+-- ---------------------------------------------------------------------------
+-- AX 结构缓存：窗口直属子元素下标 + name/几何指纹
+-- 文件格式（| 分隔）：
+--   THS_AX_CACHE_V1
+--   META|childCount|winW|winH
+--   CTRL|key|index|name|role|relX|relY|w|h
+-- ---------------------------------------------------------------------------
+
+on navWantedNames(destination)
+    if destination is "funds" then return {"资金股份", "资金", "持仓"}
+    if destination is "positions" then return {"持仓", "资金股份"}
+    if destination is "orders" then return {"当日委托", "委托", "查询"}
+    if destination is "buy" then return {"买入", "普通买入"}
+    if destination is "sell" then return {"卖出", "普通卖出"}
+    if destination is "cancel" then return {"撤单", "撤销委托", "撤销"}
+    if destination is "submit_buy" then return {"确定买入"}
+    if destination is "submit_sell" then return {"确定卖出"}
+    return {}
+end navWantedNames
+
+on controlCacheKeyForLabel(wantedName)
+    if wantedName is "确定买入" then return "submit_buy"
+    if wantedName is "确定卖出" then return "submit_sell"
+    if wantedName is in {"撤单", "撤销委托", "撤销"} then return "cancel"
+    if wantedName is in {"买入", "普通买入"} then return "buy"
+    if wantedName is in {"卖出", "普通卖出"} then return "sell"
+    if wantedName is "持仓" then return "positions"
+    if wantedName is in {"当日委托", "委托", "查询"} then return "orders"
+    if wantedName is in {"资金", "资金股份"} then return "funds"
+    return ""
+end controlCacheKeyForLabel
+
+on logAxCache(messageText)
+    try
+        do shell script "printf '%s %s\\n' \"$(date '+%Y-%m-%d %H:%M:%S')\" " & quoted form of (messageText as text) & " >> /tmp/ths-ax-cache-debug.log"
+    end try
+end logAxCache
+
+on ensureAxCacheLoaded()
+    if my axCacheLoaded then return
+    set my axCacheLoaded to true
+    set my axCacheRaw to ""
+    try
+        set my axCacheRaw to do shell script "test -f " & quoted form of (my axCachePath) & " && cat " & quoted form of (my axCachePath) & " || true"
+    end try
+end ensureAxCacheLoaded
+
+on showAxCache()
+    my ensureAxCacheLoaded()
+    if my axCacheRaw is "" then return "AX_CACHE|empty|" & (my axCachePath)
+    return "AX_CACHE|ok" & linefeed & (my axCacheRaw)
+end showAxCache
+
+on rebuildAxCacheCommand()
+    set previousApp to my saveForegroundApp()
+    tell application "System Events"
+        if not (exists process "同花顺") then error "同花顺尚未运行"
+        tell process "同花顺"
+            my ensureWindowAvailable(it)
+            set simulationWindow to my findSimulationWindow(it)
+            if simulationWindow is missing value then error "未找到同花顺模拟交易窗口"
+            set rebuilt to my rebuildAxCache(simulationWindow)
+            my restoreForegroundApp(previousApp)
+            return rebuilt
+        end tell
+    end tell
+end rebuildAxCacheCommand
+
+on windowChildCount()
+    set winIdx to my simulationWindowIndex
+    tell application "System Events"
+        try
+            return count of UI elements of window winIdx of process "同花顺"
+        on error
+            return 0
+        end try
+    end tell
+end windowChildCount
+
+on windowOrigin()
+    set winIdx to my simulationWindowIndex
+    tell application "System Events"
+        try
+            return position of window winIdx of process "同花顺"
+        on error
+            return {0, 0}
+        end try
+    end tell
+end windowOrigin
+
+on windowSize()
+    set winIdx to my simulationWindowIndex
+    tell application "System Events"
+        try
+            return size of window winIdx of process "同花顺"
+        on error
+            return {0, 0}
+        end try
+    end tell
+end windowSize
+
+-- 一次 Apple Event 取回整层属性；失败时返回与 childCount 等长的空列表，保证下标对齐。
+on childAttribute(attributeName)
+    set childCount to my windowChildCount()
+    if childCount is 0 then return {}
+    set winIdx to my simulationWindowIndex
+    tell application "System Events"
+        try
+            tell window winIdx of process "同花顺"
+                if attributeName is "role" then
+                    set rawList to role of UI elements
+                else if attributeName is "name" then
+                    set rawList to name of UI elements
+                else if attributeName is "value" then
+                    set rawList to value of UI elements
+                else if attributeName is "position" then
+                    set rawList to position of UI elements
+                else
+                    set rawList to size of UI elements
+                end if
+            end tell
+            if (count of rawList) is childCount then return rawList
+        end try
+    end tell
+    set fallbackList to {}
+    repeat childCount times
+        set end of fallbackList to missing value
+    end repeat
+    return fallbackList
+end childAttribute
+
+on textOf(rawValue)
+    if rawValue is missing value then return ""
+    try
+        return my sanitize(rawValue as text)
+    on error
+        return ""
+    end try
+end textOf
+
+on parsePoint(rawValue)
+    try
+        return {item 1 of rawValue as integer, item 2 of rawValue as integer}
+    on error
+        return {0, 0}
+    end try
+end parsePoint
+
+on readCachedCtrl(ctrlKey)
+    my ensureAxCacheLoaded()
+    if my axCacheRaw is "" then return missing value
+    set marker to "CTRL|" & ctrlKey & "|"
+    repeat with lineText in paragraphs of (my axCacheRaw)
+        set lineText to lineText as text
+        if lineText starts with marker then
+            set AppleScript's text item delimiters to "|"
+            set parts to text items of lineText
+            set AppleScript's text item delimiters to ""
+            -- CTRL|key|index|name|role|relX|relY|w|h
+            if (count of parts) < 9 then return missing value
+            try
+                return {ctrlKey, (item 3 of parts) as integer, item 4 of parts as text, item 5 of parts as text, (item 6 of parts) as integer, (item 7 of parts) as integer, (item 8 of parts) as integer, (item 9 of parts) as integer}
+            on error
+                return missing value
+            end try
+        end if
+    end repeat
+    return missing value
+end readCachedCtrl
+
+on readCachedMeta()
+    my ensureAxCacheLoaded()
+    if my axCacheRaw is "" then return missing value
+    repeat with lineText in paragraphs of (my axCacheRaw)
+        set lineText to lineText as text
+        if lineText starts with "META|" then
+            set AppleScript's text item delimiters to "|"
+            set parts to text items of lineText
+            set AppleScript's text item delimiters to ""
+            if (count of parts) < 4 then return missing value
+            try
+                return {(item 2 of parts) as integer, (item 3 of parts) as integer, (item 4 of parts) as integer}
+            on error
+                return missing value
+            end try
+        end if
+    end repeat
+    return missing value
+end readCachedMeta
+
+on writeAxCacheFile(metaChildCount, metaW, metaH, ctrlLines)
+    set outputLines to {"THS_AX_CACHE_V1", "META|" & metaChildCount & "|" & metaW & "|" & metaH}
+    repeat with i from 1 to count of ctrlLines
+        set end of outputLines to item i of ctrlLines as text
+    end repeat
+    set fileBody to my joinList(outputLines, linefeed)
+    do shell script "printf '%s\\n' " & quoted form of fileBody & " > " & quoted form of (my axCachePath)
+    set my axCacheRaw to fileBody
+    set my axCacheLoaded to true
+    my logAxCache("cache_written|childCount=" & metaChildCount & "|controls=" & (count of ctrlLines))
+end writeAxCacheFile
+
+on upsertCachedCtrl(ctrlKey, childIndex, childName, childRole, relX, relY, widthValue, heightValue)
+    my ensureAxCacheLoaded()
+    set meta to my readCachedMeta()
+    set metaChildCount to my windowChildCount()
+    set winSize to my windowSize()
+    set metaW to item 1 of winSize
+    set metaH to item 2 of winSize
+    if meta is not missing value then
+        -- 保留旧 META 宽高仅当当前读数异常为 0 时；否则用实时窗口尺寸。
+        if metaW is 0 then set metaW to item 2 of meta
+        if metaH is 0 then set metaH to item 3 of meta
+    end if
+    set newLine to "CTRL|" & ctrlKey & "|" & childIndex & "|" & childName & "|" & childRole & "|" & relX & "|" & relY & "|" & widthValue & "|" & heightValue
+    set ctrlLines to {}
+    set replaced to false
+    if my axCacheRaw is not "" then
+        repeat with lineText in paragraphs of (my axCacheRaw)
+            set lineText to lineText as text
+            if lineText starts with "CTRL|" then
+                set AppleScript's text item delimiters to "|"
+                set parts to text items of lineText
+                set AppleScript's text item delimiters to ""
+                if (count of parts) ≥ 2 and (item 2 of parts as text) is ctrlKey then
+                    set end of ctrlLines to newLine
+                    set replaced to true
+                else
+                    set end of ctrlLines to lineText
+                end if
+            end if
+        end repeat
+    end if
+    if not replaced then set end of ctrlLines to newLine
+    my writeAxCacheFile(metaChildCount, metaW, metaH, ctrlLines)
+end upsertCachedCtrl
+
+on nameMatchesWanted(childName, wantedNames)
+    if childName is "" then return false
+    repeat with i from 1 to count of wantedNames
+        set wanted to item i of wantedNames as text
+        if childName is wanted then return true
+        if childName contains wanted then return true
+    end repeat
+    return false
+end nameMatchesWanted
+
+on cachedControlStillValid(ctrlEntry, wantedNames)
+    set childIndex to item 2 of ctrlEntry
+    set expectedName to item 3 of ctrlEntry
+    set expectedRelX to item 5 of ctrlEntry
+    set expectedRelY to item 6 of ctrlEntry
+    set expectedW to item 7 of ctrlEntry
+    set expectedH to item 8 of ctrlEntry
+    set meta to my readCachedMeta()
+    set childCount to my windowChildCount()
+    if childCount is 0 then return false
+    if childIndex < 1 or childIndex > childCount then return false
+    if meta is not missing value then
+        set cachedCount to item 1 of meta
+        -- 子元素数量突变通常意味着换页/改版；允许小幅波动但差太大直接失效。
+        if cachedCount > 0 and (childCount > cachedCount + 8 or childCount < cachedCount - 8) then return false
+    end if
+    set winIdx to my simulationWindowIndex
+    tell application "System Events"
+        try
+            tell window winIdx of process "同花顺"
+                set liveRole to role of UI element childIndex as text
+                set liveName to my textOf(name of UI element childIndex)
+                set livePos to position of UI element childIndex
+                set liveSize to size of UI element childIndex
+            end tell
+        on error
+            return false
+        end try
+    end tell
+    if liveRole is not in my clickableRoles then return false
+    if not my nameMatchesWanted(liveName, wantedNames) then
+        -- 名称偶发为空时，退回用缓存名做一次包含检查（侧栏 icon 等）。
+        if liveName is not "" then return false
+        if expectedName is "" then return false
+        if not my nameMatchesWanted(expectedName, wantedNames) then return false
+    end if
+    set origin to my windowOrigin()
+    set liveRelX to (item 1 of livePos) - (item 1 of origin)
+    set liveRelY to (item 2 of livePos) - (item 2 of origin)
+    set liveW to item 1 of liveSize
+    set liveH to item 2 of liveSize
+    if (liveRelX - expectedRelX > 40) or (expectedRelX - liveRelX > 40) then return false
+    if (liveRelY - expectedRelY > 40) or (expectedRelY - liveRelY > 40) then return false
+    if (liveW - expectedW > 30) or (expectedW - liveW > 30) then return false
+    if (liveH - expectedH > 30) or (expectedH - liveH > 30) then return false
+    return true
+end cachedControlStillValid
+
+-- 必须在同一表达式按下标：存进变量会被塌缩成按名字引用。
+on pressWindowChildAtIndex(childIndex)
+    set winIdx to my simulationWindowIndex
+    tell application "System Events"
+        try
+            if not (enabled of UI element childIndex of window winIdx of process "同花顺") then
+                error "控件当前不可用 (enabled = false)"
+            end if
+        end try
+        try
+            perform action "AXPress" of UI element childIndex of window winIdx of process "同花顺"
+            return
+        end try
+        try
+            click UI element childIndex of window winIdx of process "同花顺"
+            return
+        end try
+    end tell
+    error "控件无法点击（窗口直属下标 " & childIndex & "）"
+end pressWindowChildAtIndex
+
+on discoverChildIndexByNames(wantedNames)
+    set roleList to my childAttribute("role")
+    set childCount to count of roleList
+    if childCount is 0 then return 0
+    set nameList to my childAttribute("name")
+    set positionList to my childAttribute("position")
+    set sizeList to my childAttribute("size")
+    set origin to my windowOrigin()
+    -- 按 wantedNames 优先级找，避免 funds 的兜底词「持仓」抢到 positions 按钮。
+    repeat with wantedIndex from 1 to count of wantedNames
+        set wanted to item wantedIndex of wantedNames as text
+        repeat with childIndex from 1 to childCount
+            try
+                if (my textOf(item childIndex of roleList)) is in my clickableRoles then
+                    set childName to my textOf(item childIndex of nameList)
+                    if childName is wanted or childName contains wanted then
+                        set absPos to my parsePoint(item childIndex of positionList)
+                        set sz to my parsePoint(item childIndex of sizeList)
+                        set relX to (item 1 of absPos) - (item 1 of origin)
+                        set relY to (item 2 of absPos) - (item 2 of origin)
+                        return {childIndex, childName, my textOf(item childIndex of roleList), relX, relY, item 1 of sz, item 2 of sz}
+                    end if
+                end if
+            end try
+        end repeat
+    end repeat
+    return 0
+end discoverChildIndexByNames
+
+on resolveControlIndex(simulationWindow, ctrlKey, wantedNames)
+    -- 返回窗口直属下标；0 表示未找到。命中缓存或新发现时都会写回磁盘。
+    set cached to my readCachedCtrl(ctrlKey)
+    if cached is not missing value then
+        if my cachedControlStillValid(cached, wantedNames) then
+            my logAxCache("cache_hit|" & ctrlKey & "|" & (item 2 of cached))
+            return item 2 of cached
+        end if
+        my logAxCache("cache_stale|" & ctrlKey & "|" & (item 2 of cached))
+    end if
+    set discovered to my discoverChildIndexByNames(wantedNames)
+    if discovered is 0 then
+        my logAxCache("cache_miss|" & ctrlKey)
+        return 0
+    end if
+    set childIndex to item 1 of discovered
+    set childName to item 2 of discovered
+    set childRole to item 3 of discovered
+    my upsertCachedCtrl(ctrlKey, childIndex, childName, childRole, item 4 of discovered, item 5 of discovered, item 6 of discovered, item 7 of discovered)
+    my logAxCache("cache_store|" & ctrlKey & "|" & childIndex & "|" & childName)
+    return childIndex
+end resolveControlIndex
+
+on pressResolvedControl(simulationWindow, ctrlKey, wantedNames)
+    set childIndex to my resolveControlIndex(simulationWindow, ctrlKey, wantedNames)
+    if childIndex ≤ 0 then return false
+    try
+        my pressWindowChildAtIndex(childIndex)
+        return true
+    on error errMsg
+        my logAxCache("cache_press_fail|" & ctrlKey & "|" & childIndex & "|" & errMsg)
+        return false
+    end try
+end pressResolvedControl
+
+-- 读取下标控件的实时坐标后用 CoreGraphics 单击；避免把 UI element 存进变量导致按名字塌缩。
+on clickWindowChildByCoordinates(childIndex)
+    set winIdx to my simulationWindowIndex
+    tell application "System Events"
+        try
+            with timeout of 5 seconds
+                if not (enabled of UI element childIndex of window winIdx of process "同花顺") then
+                    error "控件当前不可用 (enabled = false)"
+                end if
+                set controlPosition to position of UI element childIndex of window winIdx of process "同花顺"
+                set controlSize to size of UI element childIndex of window winIdx of process "同花顺"
+            end timeout
+        on error errorMessage
+            error "无法读取窗口直属控件坐标（下标 " & childIndex & "）：" & errorMessage
+        end try
+    end tell
+    set clickX to (item 1 of controlPosition) + ((item 1 of controlSize) / 2)
+    set clickY to (item 2 of controlPosition) + ((item 2 of controlSize) / 2)
+    set helperPath to "/tmp/trending-polars-ths-double-click"
+    try
+        do shell script "test -x " & quoted form of helperPath & " && " & quoted form of helperPath & " " & (clickX as text) & " " & (clickY as text) & " single"
+    on error errorMessage
+        error "系统级单击工具不可用：" & errorMessage
+    end try
+end clickWindowChildByCoordinates
+
+on clickResolvedControl(simulationWindow, ctrlKey, wantedNames)
+    set childIndex to my resolveControlIndex(simulationWindow, ctrlKey, wantedNames)
+    if childIndex ≤ 0 then return false
+    try
+        my clickWindowChildByCoordinates(childIndex)
+        my logAxCache("cache_click|" & ctrlKey & "|" & childIndex)
+        return true
+    on error errMsg
+        my logAxCache("cache_click_fail|" & ctrlKey & "|" & childIndex & "|" & errMsg)
+        return false
+    end try
+end clickResolvedControl
+
+on rebuildAxCache(simulationWindow)
+    set keys to {"buy", "sell", "positions", "orders", "funds", "cancel", "submit_buy", "submit_sell"}
+    set ctrlLines to {}
+    set childCount to my windowChildCount()
+    set winSize to my windowSize()
+    repeat with i from 1 to count of keys
+        set ctrlKey to item i of keys as text
+        set wanted to my navWantedNames(ctrlKey)
+        set discovered to my discoverChildIndexByNames(wanted)
+        if discovered is not 0 then
+            set end of ctrlLines to "CTRL|" & ctrlKey & "|" & (item 1 of discovered) & "|" & (item 2 of discovered) & "|" & (item 3 of discovered) & "|" & (item 4 of discovered) & "|" & (item 5 of discovered) & "|" & (item 6 of discovered) & "|" & (item 7 of discovered)
+        end if
+    end repeat
+    my writeAxCacheFile(childCount, item 1 of winSize, item 2 of winSize, ctrlLines)
+    return "AX_CACHE_REBUILT|controls=" & (count of ctrlLines) & "|childCount=" & childCount & linefeed & (my axCacheRaw)
+end rebuildAxCache
 
 on findClickableByText(rootElement, wantedText)
     tell application "System Events"
@@ -728,21 +1185,40 @@ end windowUnavailableReason
 on findSimulationWindow(appProcess)
     tell application "System Events"
         -- 第一轮：最多 8 次静默扫描，让 Swift 应用的 AX 树有时间填充。命中即返回。
+        -- 用窗口下标定位，供后续「UI element i of window n」按下标点击（不可缓存引用对象）。
         repeat 8 times
-            repeat with candidateWindow in windows of appProcess
-                tell candidateWindow
-                    if (exists button "模拟股票") or (exists static text "模拟练习") or (exists static text "模拟股票") then return candidateWindow
+            set windowCount to 0
+            try
+                set windowCount to count of windows of appProcess
+            end try
+            repeat with windowIndex from 1 to windowCount
+                set matched to false
+                tell window windowIndex of appProcess
+                    if (exists button "模拟股票") or (exists static text "模拟练习") or (exists static text "模拟股票") then set matched to true
                 end tell
+                if matched then
+                    set my simulationWindowIndex to windowIndex
+                    return window windowIndex of appProcess
+                end if
             end repeat
             delay 0.3
         end repeat
         -- 静默扫描失败才走兜底激活；保证 Swift 应用即便未在最前也能完成读取，但仅此一次。
         my bringProcessToFront(appProcess)
         repeat 4 times
-            repeat with candidateWindow in windows of appProcess
-                tell candidateWindow
-                    if (exists button "模拟股票") or (exists static text "模拟练习") or (exists static text "模拟股票") then return candidateWindow
+            set windowCount to 0
+            try
+                set windowCount to count of windows of appProcess
+            end try
+            repeat with windowIndex from 1 to windowCount
+                set matched to false
+                tell window windowIndex of appProcess
+                    if (exists button "模拟股票") or (exists static text "模拟练习") or (exists static text "模拟股票") then set matched to true
                 end tell
+                if matched then
+                    set my simulationWindowIndex to windowIndex
+                    return window windowIndex of appProcess
+                end if
             end repeat
             delay 0.4
         end repeat
@@ -751,6 +1227,8 @@ on findSimulationWindow(appProcess)
 end findSimulationWindow
 
 on findNamedControl(rootElement, wantedNames)
+    -- 窗口只扫直属 buttons（浅层）；全树搜索留给 findClickableByText 兜底。
+    -- 导航热路径已走 pressResolvedControl 下标缓存，这里不再二次猜 cache key（资金股份/持仓易混淆）。
     tell application "System Events"
         try
             if (role of rootElement as text) is "AXWindow" then
@@ -822,8 +1300,25 @@ on ensureAllOrdersVisible(simulationWindow)
 end ensureAllOrdersVisible
 
 on findOrderActionControl(rootElement, wantedName)
-    -- 窗口直属按钮是最快且最稳定的路径；Swift 版本也可能把按钮放在嵌套容器中，
-    -- 此时退回到文本控件搜索。两条路径都只返回可点击控件，避免误点静态文本。
+    -- 窗口直属按钮优先走下标缓存；sheet 等嵌套容器仍走浅层/文本搜索。
+    set rootRole to ""
+    try
+        tell application "System Events"
+            set rootRole to role of rootElement as text
+        end tell
+    end try
+    if rootRole is "AXWindow" then
+        set cacheKey to my controlCacheKeyForLabel(wantedName)
+        if cacheKey is not "" then
+            set childIndex to my resolveControlIndex(rootElement, cacheKey, {wantedName})
+            if childIndex > 0 then
+                set winIdx to my simulationWindowIndex
+                tell application "System Events"
+                    return UI element childIndex of window winIdx of process "同花顺"
+                end tell
+            end if
+        end if
+    end if
     set foundControl to missing value
     try
         with timeout of 5 seconds
