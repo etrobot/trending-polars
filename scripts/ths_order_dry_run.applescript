@@ -98,6 +98,7 @@ on cancelSimulatedOrder(orderSide, orderCode, orderQuantity)
     if orderSide is not in {"buy", "sell"} then error "撤单方向必须是 buy 或 sell"
     if not my isStockCode(orderCode) then error "股票代码必须是6位数字"
     if not my isPositiveInteger(orderQuantity) then error "撤单数量必须是正整数"
+    my dismissBeginFailedDialogs()
     set sideLabel to "买入"
     if orderSide is "sell" then set sideLabel to "卖出"
     set previousApp to my saveForegroundApp()
@@ -167,6 +168,7 @@ end cancelSimulatedOrder
 
 on readSimulatedQuote(orderCode)
     if not my isStockCode(orderCode) then error "股票代码必须是6位数字"
+    my dismissBeginFailedDialogs()
     set previousApp to my saveForegroundApp()
     tell application "System Events"
         if not (exists process "同花顺") then error "同花顺尚未运行"
@@ -196,6 +198,7 @@ end readSimulatedQuote
 
 on takeSnapshot(snapshotKind, hintCodes)
     if snapshotKind is "account" then return my takeAccountSnapshot(hintCodes, false)
+    my dismissBeginFailedDialogs()
     set my snapshotHintCodes to hintCodes
     if snapshotKind is not in {"funds", "positions", "orders"} then error "未知查询类型：" & snapshotKind
     set previousApp to my saveForegroundApp()
@@ -223,6 +226,7 @@ on takeSnapshot(snapshotKind, hintCodes)
 end takeSnapshot
 
 on takeAccountSnapshot(hintCodes, passive)
+    my dismissBeginFailedDialogs()
     set my snapshotHintCodes to hintCodes
     -- 单次会话读取资金+持仓，避免两次 osascript 冷启动和重复找窗口。
     -- 只读同步跳过 refreshSimulationConnection，省 1.5 秒且非交易时段无需重连。
@@ -283,6 +287,7 @@ on submitSimulatedOrder(orderSide, orderCode, requestedPrice, orderQuantity)
     if not my isStockCode(orderCode) then error "股票代码必须是6位数字"
     if not my isPositiveInteger(orderQuantity) then error "委托数量必须是正整数"
     if requestedPrice is not "AUTO" and requestedPrice is not "auto" and not my isPositiveNumber(requestedPrice) then error "委托价格必须是正数或 AUTO"
+    my dismissBeginFailedDialogs()
     set previousApp to my saveForegroundApp()
     set sideLabel to "买入"
     set submitLabel to "确定买入"
@@ -1183,6 +1188,8 @@ on windowUnavailableReason(appProcess)
 end windowUnavailableReason
 
 on findSimulationWindow(appProcess)
+    -- 进入前先清理 begin failed 弹窗，否则后续 AX 操作全部被阻塞。
+    my dismissBeginFailedDialogs()
     tell application "System Events"
         -- 第一轮：最多 8 次静默扫描，让 Swift 应用的 AX 树有时间填充。命中即返回。
         -- 用窗口下标定位，供后续「UI element i of window n」按下标点击（不可缓存引用对象）。
@@ -1931,6 +1938,82 @@ on replaceText(findText, replacementText, sourceText)
     set AppleScript's text item delimiters to previousDelimiters
     return replacedText
 end replaceText
+
+-- ---------------------------------------------------------------------------
+-- begin failed 弹窗检测与关闭
+-- 同花顺在收盘后/非交易时段对任何 UI 操作都可能弹出 "begin failed" 对话框，
+-- 该弹窗会阻塞后续所有 AX 操作。此函数在所有交互入口处被调用，发现弹窗即自动关闭。
+-- ---------------------------------------------------------------------------
+
+on dismissBeginFailedDialogs()
+    tell application "System Events"
+        if not (exists process "同花顺") then return false
+        tell process "同花顺"
+            repeat with w in windows
+                -- 检查窗口直属 sheet（同花顺的 begin failed 通常以 sheet 形式出现）
+                try
+                    repeat with s in sheets of w
+                        if my dismissSheetIfBeginFailed(s) then return true
+                    end repeat
+                end try
+                -- 兜底：检查窗口本身的 UI 元素（某些版本以独立弹窗形式出现）
+                try
+                    if my dismissSheetIfBeginFailed(w) then return true
+                end try
+            end repeat
+        end tell
+    end tell
+    return false
+end dismissBeginFailedDialogs
+
+on dismissSheetIfBeginFailed(rootElement)
+    tell application "System Events"
+        try
+            -- 先快速检查文本内容，避免不必要的 entire contents 遍历
+            set allText to ""
+            try
+                repeat with t in static texts of rootElement
+                    set allText to allText & (my elementText(t))
+                end repeat
+            end try
+            if allText does not contain "begin failed" and allText does not contain "Begin failed" and allText does not contain "开始失败" then return false
+        on error
+            return false
+        end try
+        -- 确认是 begin failed 弹窗，点击确认按钮关闭
+        try
+            set confirmButton to my findNamedControlInSheet(rootElement, {"确定", "确认", "OK", "好", "知道了"})
+            if confirmButton is not missing value then
+                my pressControl(confirmButton)
+                delay 0.5
+                my logAxCache("begin_failed_dismissed")
+                return true
+            end if
+        end try
+    end tell
+    return false
+end dismissSheetIfBeginFailed
+
+-- 在 sheet/弹窗中查找按钮（不限制 rootElement 角色，sheet 没有 AXWindow 的浅层 buttons 优化）
+on findNamedControlInSheet(rootElement, wantedNames)
+    tell application "System Events"
+        try
+            set allItems to {rootElement} & (entire contents of rootElement)
+        on error
+            set allItems to {rootElement}
+        end try
+        repeat with uiItem in allItems
+            try
+                set itemRole to role of uiItem as text
+                if itemRole is in {"AXButton", "AXRadioButton", "AXCheckBox", "AXLink", "AXTab", "AXMenuItem"} then
+                    set itemName to my elementName(uiItem)
+                    if itemName is in wantedNames then return contents of uiItem
+                end if
+            end try
+        end repeat
+    end tell
+    return missing value
+end findNamedControlInSheet
 
 on joinList(itemsToJoin, delimiterText)
     set previousDelimiters to AppleScript's text item delimiters

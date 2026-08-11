@@ -5,7 +5,6 @@ import {
   DEFAULT_SCORE_STOCK_CONFIG,
   distanceFromLowScore,
   normalizeScoreStockConfig,
-  type Alignment,
   type DistanceFromLowTier,
   type ScoreStockConfig,
   type TrendAxis,
@@ -75,7 +74,7 @@ export interface ParamOptimizeResult {
 
 interface RawObservation {
   distancePct: number;
-  alignment: Alignment;
+  bollingerScore: number;
   trendStrength: number;
   volumePriceScore: number;
   limitUpCount20d: number;
@@ -192,7 +191,7 @@ function collectRawObservations(history: HistoricalMarketData, days: number): Ra
 
       observations.push({
         distancePct: row.distance_from_low_pct ?? 0,
-        alignment: (row.alignment ?? 'tangled') as Alignment,
+        bollingerScore: (row.trend_strength ?? 0),  // placeholder, will be recomputed by scoreStock
         trendStrength: row.trend_strength ?? 0,
         volumePriceScore: Number(row.volume_price_score ?? row.volume_score ?? 0),
         limitUpCount20d: row.limit_up_count_20d ?? 0,
@@ -324,9 +323,11 @@ function scoreConfigCandidates(observations: RawObservation[]): ScoreStockConfig
     { nearLow: 5, earlyLeave: 18, launchConfirm: 35, trendUp: 55, farFromLow: 85 },
   ];
   const trendGrid = [
-    { trendBonusMultiplier: 400, bullishAlignment: 28 },
-    { trendBonusMultiplier: 300, bullishAlignment: 24 },
-    { trendBonusMultiplier: 500, bullishAlignment: 32 },
+    { bollingerScale: 0.5, bollingerWindow: 60 },
+    { bollingerScale: 0.3, bollingerWindow: 40 },
+    { bollingerScale: 0.7, bollingerWindow: 60 },
+    { bollingerScale: 0.5, bollingerWindow: 40 },
+    { bollingerScale: 0.7, bollingerWindow: 80 },
   ];
 
   const candidates: ScoreStockConfig[] = [normalizeScoreStockConfig()];

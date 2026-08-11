@@ -26,7 +26,7 @@ const PROBE_INTERVAL_MS = 500;
 const PROBE_TIMEOUT_MS = 15_000;
 const QUIT_TIMEOUT_MS = 20_000;
 
-export type ThsLifecycleCommand = 'probe' | 'launch-flow' | 'quit';
+export type ThsLifecycleCommand = 'probe' | 'launch-flow' | 'quit' | 'dismiss-begin-failed';
 
 export interface ThsProbe {
   running: boolean;
@@ -177,6 +177,13 @@ export class ThsLifecycle {
       } catch (error) {
         message = error instanceof Error ? error.message : String(error);
         await this.audit.warn('ths_lifecycle', 'launch_flow_failed', { data: { reason }, error });
+        // launch-flow 失败可能因为同花顺弹了 begin failed 对话框，
+        // 尝试关闭弹窗以便后续操作不被阻塞。
+        try {
+          await this.runner.runScript('dismiss-begin-failed', 10_000);
+        } catch {
+          // dismiss 本身失败是预期内的（可能没有弹窗或进程已退出），忽略。
+        }
       }
 
       const final = await this.probe();

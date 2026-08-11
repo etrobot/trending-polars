@@ -37,6 +37,8 @@ on run argv
 		return my quitThs()
 	else if commandName is "probe" then
 		return my probeThs()
+	else if commandName is "dismiss-begin-failed" then
+		return my dismissBeginFailedCommand()
 	else
 		error my usageText()
 	end if
@@ -53,6 +55,7 @@ end usageText
 -- 屏幕锁定）下单脚本一样会失败，所以窗口数才是"可用"的判据。
 
 on probeThs()
+	my dismissBeginFailedDialogs()
 	tell application "System Events"
 		if not (exists process thsProcessName) then return "THS_PROBE|running=false|windows=0"
 		try
@@ -69,6 +72,7 @@ end probeThs
 -- ---------------------------------------------------------------------------
 
 on launchFlow()
+	my dismissBeginFailedDialogs()
 	tell application "System Events"
 		if not (exists process thsProcessName) then error "同花顺进程尚未出现，请先由调用方 open -a 启动"
 	end tell
@@ -415,6 +419,7 @@ on thsWindowExists()
 end thsWindowExists
 
 on quitThs()
+	my dismissBeginFailedDialogs()
 	tell application "System Events"
 		if not (exists process thsProcessName) then return "QUIT_NOT_RUNNING|同花顺未在运行"
 	end tell
@@ -461,3 +466,96 @@ on replaceText(findText, replacementText, sourceText)
 	set AppleScript's text item delimiters to previousDelimiters
 	return replacedText
 end replaceText
+
+-- ---------------------------------------------------------------------------
+-- begin failed 弹窗检测与关闭
+-- 同花顺在收盘后/非交易时段对任何 UI 操作都可能弹出 "begin failed" 对话框，
+-- 该弹窗会阻塞后续所有 AX 操作。此函数在所有交互入口处被调用，发现弹窗即自动关闭。
+-- ---------------------------------------------------------------------------
+
+on dismissBeginFailedDialogs()
+	tell application "System Events"
+		if not (exists process thsProcessName) then return false
+		tell process thsProcessName
+			repeat with w in windows
+				-- 检查窗口直属 sheet（同花顺的 begin failed 通常以 sheet 形式出现）
+				try
+					repeat with s in sheets of w
+						if my dismissSheetIfBeginFailed(s) then return true
+					end repeat
+				end try
+				-- 兜底：检查窗口本身的 UI 元素（某些版本以独立弹窗形式出现）
+				try
+					if my dismissSheetIfBeginFailed(w) then return true
+				end try
+			end repeat
+		end tell
+	end tell
+	return false
+end dismissBeginFailedDialogs
+
+-- 独立命令：仅检测并关闭 begin failed 弹窗，不执行其他操作。
+-- 用于 launch-flow 失败后的错误恢复，避免弹窗阻塞后续操作。
+on dismissBeginFailedCommand()
+	if my dismissBeginFailedDialogs() then
+		return "BEGIN_FAILED_DISMISSED|已关闭 begin failed 弹窗"
+	end if
+	return "BEGIN_FAILED_NONE|未发现 begin failed 弹窗"
+end dismissBeginFailedCommand
+
+on dismissSheetIfBeginFailed(rootElement)
+	tell application "System Events"
+		try
+			-- 先快速检查文本内容
+			set allText to ""
+			try
+				repeat with t in static texts of rootElement
+					set allText to allText & (my textOf(value of t))
+				end repeat
+			end try
+			if allText does not contain "begin failed" and allText does not contain "Begin failed" and allText does not contain "开始失败" then return false
+		on error
+			return false
+		end try
+		-- 确认是 begin failed 弹窗，点击确认按钮关闭
+		try
+			set confirmButton to my findButtonInSheet(rootElement, {"确定", "确认", "OK", "好", "知道了"})
+			if confirmButton is not missing value then
+				tell application "System Events"
+					try
+						perform action "AXPress" of confirmButton
+					end try
+					try
+						click confirmButton
+					end try
+				end tell
+				delay 0.5
+				return true
+			end if
+		end try
+	end tell
+	return false
+end dismissSheetIfBeginFailed
+
+on findButtonInSheet(rootElement, wantedNames)
+	tell application "System Events"
+		try
+			set allItems to {rootElement} & (entire contents of rootElement)
+		on error
+			set allItems to {rootElement}
+		end try
+		repeat with uiItem in allItems
+			try
+				set itemRole to role of uiItem as text
+				if itemRole is in {"AXButton", "AXRadioButton", "AXCheckBox", "AXLink", "AXTab", "AXMenuItem"} then
+					set itemName to ""
+					try
+						set itemName to name of uiItem as text
+					end try
+					if itemName is in wantedNames then return contents of uiItem
+				end if
+			end try
+		end repeat
+	end tell
+	return missing value
+end findButtonInSheet

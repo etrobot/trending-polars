@@ -105,6 +105,58 @@ export function trendStrength(bars: Bar[], endIndex: number, lookback = 20): num
   return mean > 0 ? slope / mean : 0;
 }
 
+/**
+ * 简化布林带趋势分数。
+ *
+ * 核心思想：用 MA5 的窗口起止值构造等差序列 L_t，
+ * 计算区间涨跌幅与收盘价相对 L_t 的最大偏移之比，得到兼具方向与趋势质量的分数：
+ *   - score > 0：多头趋势（涨跌幅 > 0），值越大趋势越流畅
+ *   - score < 0：空头趋势（涨跌幅 < 0），值越小下跌越流畅
+ *   - score ≈ 0：震荡/无趋势
+ *
+ * 用 MA5 起点：趋势反转时等差序列能更快跟上新方向，避免 MA20 的滞后。
+ * 代价是 MA5 更抖，等差序列的倾斜度变化更频繁，但分数本身已经通过
+ * 涨跌幅/最大偏移之比做了归一化，不会因为 MA5 的噪音而剧烈波动。
+ *
+ * @param bars   K 线序列
+ * @param endIndex  计算终点索引
+ * @param window  回看天数
+ * @returns 趋势分数（无界，正值多头、负值空头）
+ */
+export function simplifiedBollingerTrendScore(bars: Bar[], endIndex: number, window = 60): number {
+  const startIdx = Math.max(0, endIndex - window + 1);
+  const n = endIndex - startIdx + 1;
+  if (n < 2) return 0;
+
+  // 窗口起止点的 MA5 决定等差序列方向；MA5 不可用时退回收盘价。
+  const startMA5 = movingAverage(bars, startIdx, 5) ?? bars[startIdx].close;
+  const endMA5 = movingAverage(bars, endIndex, 5);
+  if (endMA5 == null) return 0;
+
+  // 收集窗口内的收盘价，同时构造等差序列 L_t、计算 L 均值和最大偏移
+  let LSum = 0;
+  let maxDev = 0;
+  const closes: number[] = [];
+  for (let i = startIdx; i <= endIndex; i += 1) {
+    const close = bars[i].close;
+    closes.push(close);
+    const t = i - startIdx;
+    const LVal = startMA5 + (endMA5 - startMA5) * t / (n - 1);
+    LSum += LVal;
+    maxDev = Math.max(maxDev, Math.abs(close - LVal));
+  }
+
+  // 相对涨跌幅
+  const ret = (closes[n - 1] - closes[0]) / closes[0];
+
+  // 收盘价相对 L 的最大偏移
+  const LMean = LSum / n;
+  const relDev = LMean > 0 ? maxDev / LMean : 0;
+
+  if (relDev === 0) return ret > 0 ? Infinity : ret < 0 ? -Infinity : 0;
+  return ret / relDev;
+}
+
 // ---- ADX / +DI / -DI：趋势强度（不区分方向）+ 方向指示 -------------------
 // 经典 Welles Wilder 实现。ADX > 25 视为有趋势，+DI > -DI 为多头，反之空头。
 // 与 trendStrength（线性回归斜率）互补：trendStrength 对极端值敏感、ADX 更稳健。
@@ -327,12 +379,10 @@ export interface DistanceFromLowConfig {
 }
 
 export interface TrendScoreConfig {
-  bullishAlignment: number;
-  tangledAlignment: number;
-  bearishAlignment: number;
-  trendBonusMultiplier: number;
-  trendBonusCap: number;
-  trendStrengthThreshold: number;
+  /** 布林带趋势分数缩放系数（用于 tanh 映射到 [0,40] 区间）。 */
+  bollingerScale: number;
+  /** 布林带趋势计算窗口（天数）。 */
+  bollingerWindow: number;
   sectorUpBonus: number;
   sectorDownBonus: number;
 }
@@ -429,6 +479,10 @@ export interface MarketStateThresholds {
   adxTrending: number;
   /** ADX 方向（+DI - -DI）正负方向阈值，绝对值小于此值视为方向不明。 */
   adxDirectionDeadZone: number;
+  /** 布林带趋势分数 > 此值视为上升趋势。 */
+  bollingerRisingThreshold: number;
+  /** 布林带趋势分数 < 此负值视为下降趋势。 */
+  bollingerFallingThreshold: number;
   /** 距 60 日高点小于此距离（百分比/100）视为「接近高点」。 */
   nearHighDistance: number;
   /** 距 60 日高点小于此负距离视为「回调中」。 */
@@ -463,6 +517,8 @@ export const DEFAULT_MARKET_STATE_THRESHOLDS: Readonly<MarketStateThresholds> = 
   fallingStrength: -0.003,
   adxTrending: 20,
   adxDirectionDeadZone: 3,
+  bollingerRisingThreshold: 0.3,
+  bollingerFallingThreshold: -0.3,
   nearHighDistance: -0.03,
   pullbackDistance: -0.05,
   panicReturn5: -0.08,
@@ -505,12 +561,8 @@ export const DEFAULT_SCORE_STOCK_CONFIG: Readonly<ScoreStockConfig> = Object.fre
     ],
   },
   trend: {
-    bullishAlignment: 28,
-    tangledAlignment: 14,
-    bearishAlignment: 0,
-    trendBonusMultiplier: 400,
-    trendBonusCap: 12,
-    trendStrengthThreshold: 0.003,
+    bollingerScale: 0.5,
+    bollingerWindow: 60,
     sectorUpBonus: 4,
     sectorDownBonus: -4,
   },
@@ -652,44 +704,34 @@ export function volatilityClassOf(
 }
 
 function trendScoreFromParts(
-  alignment: Alignment,
-  strength: number,
+  bollingerScore: number,
   sectorTrend: TrendAxis | undefined,
   config: ScoreStockConfig,
 ): number {
   const { trend } = config;
-  const alignmentScore = alignment === 'bullish'
-    ? trend.bullishAlignment
-    : alignment === 'bearish'
-      ? trend.bearishAlignment
-      : trend.tangledAlignment;
-  const trendBonus = strength > trend.trendStrengthThreshold
-    ? Math.min(trend.trendBonusCap, strength * trend.trendBonusMultiplier)
-    : strength < -trend.trendStrengthThreshold
-      ? Math.max(-trend.trendBonusCap, strength * trend.trendBonusMultiplier)
-      : 0;
+  // tanh 映射到 (0, 40) 区间：中轴 20 对应无趋势，趋于 40 为强多头，趋于 0 为强空头
+  const baseScore = 20 + 20 * Math.tanh(bollingerScore * trend.bollingerScale);
   const sectorBonus = sectorTrend === 'up'
     ? trend.sectorUpBonus
     : sectorTrend === 'down'
       ? trend.sectorDownBonus
       : 0;
-  return Math.max(0, Math.min(40, alignmentScore + trendBonus + sectorBonus));
+  return Math.max(0, Math.min(40, baseScore + sectorBonus));
 }
 
 /** 用给定 scoreStock 配置合成四维分（供参数优化快速评估）。 */
 export function composeDimensionScores(
   input: {
     distanceFromLowPct: number;
-    alignment: Alignment;
-    trendStrength: number;
+    bollingerScore: number;
     volumePriceScore: number;
     limitUpCount20d: number;
     sectorTrend?: TrendAxis;
   },
   config: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
 ) {
-  const trendAxis = input.sectorTrend ?? alignmentToTrendAxis(input.alignment);
-  const trendScore = round(trendScoreFromParts(input.alignment, input.trendStrength, input.sectorTrend, config), 1);
+  const trendAxis = input.sectorTrend ?? bollingerToTrendAxis(input.bollingerScore);
+  const trendScore = round(trendScoreFromParts(input.bollingerScore, input.sectorTrend, config), 1);
   const fromLow = distanceFromLowScore(input.distanceFromLowPct, config);
   const volatility = volatilityClassOf(input.limitUpCount20d, config);
   const volatilityScore = volatilityTrendScore(volatility, trendAxis, config);
@@ -711,8 +753,20 @@ export function volatilityTrendScore(
   return config.volatilityTrend.matrix[volatility][trend];
 }
 
-function alignmentToTrendAxis(alignment: Alignment): TrendAxis {
-  return alignment === 'bullish' ? 'up' : alignment === 'bearish' ? 'down' : 'range';
+/** 布林带趋势分数 → 趋势轴方向（up / down / range）。 */
+function bollingerToTrendAxis(bollingerScore: number, threshold = 0.3): TrendAxis {
+  if (!isFinite(bollingerScore)) return 'range';
+  if (bollingerScore > threshold) return 'up';
+  if (bollingerScore < -threshold) return 'down';
+  return 'range';
+}
+
+/** 布林带趋势分数 → 均线排列标签（仅用于展示兼容，不参与计算）。 */
+function bollingerToAlignment(bollingerScore: number): Alignment {
+  if (!isFinite(bollingerScore)) return 'tangled';
+  if (bollingerScore > 0.3) return 'bullish';
+  if (bollingerScore < -0.3) return 'bearish';
+  return 'tangled';
 }
 
 const VOLATILITY_LABEL: Record<VolatilityClass, string> = { high: '高波动', medium: '中波动', low: '低波动' };
@@ -1075,17 +1129,13 @@ export function scoreStock(
   const latest = series.bars[endIndex];
   if (!latest.volume || latest.open <= 0 || latest.close <= 0) return null;
 
-  const ma5 = movingAverage(series.bars, endIndex, 5);
-  const ma10 = movingAverage(series.bars, endIndex, 10);
-  const ma20 = movingAverage(series.bars, endIndex, 20);
-  const ma60 = movingAverage(series.bars, endIndex, 60);
   const low60 = Math.min(...series.bars.slice(Math.max(0, endIndex - 59), endIndex + 1).map((bar) => bar.low));
   const distanceFromLowPct = low60 > 0 ? round((latest.close - low60) / low60 * 100, 2) : 0;
   const strength = trendStrength(series.bars, endIndex);
-  const alignment = alignmentOf(ma5, ma10, ma20, ma60);
-  const trendAxis = sector?.trend ?? alignmentToTrendAxis(alignment);
+  const bollingerScore = simplifiedBollingerTrendScore(series.bars, endIndex, config.trend.bollingerWindow);
+  const trendAxis = sector?.trend ?? bollingerToTrendAxis(bollingerScore);
 
-  const trendScore = trendScoreFromParts(alignment, strength, sector?.trend, config);
+  const trendScore = trendScoreFromParts(bollingerScore, sector?.trend, config);
   const volumePrice = volumePriceScore(series.bars, endIndex);
   const fromLow = distanceFromLowScore(distanceFromLowPct, config);
   const exactLimitUpDates = sector?.limitUpDates ?? new Set<string>();
@@ -1127,7 +1177,7 @@ export function scoreStock(
     sector_strategy_label: sectorStrategy.label,
     sector_strategy_reason: sectorStrategy.reason,
     limit_up_count_20d: limitUps,
-    alignment,
+    alignment: bollingerToAlignment(bollingerScore),
     trend_strength: round(strength, 4),
     distance_from_low_pct: distanceFromLowPct,
     sector_code: sector?.code,
@@ -1321,11 +1371,7 @@ export function classifyMarketState(
 ): MarketStateResult {
   if (bars.length < 20) return buildStateResult(0, bars);
   const endIndex = bars.length - 1;
-  const ma5 = movingAverage(bars, endIndex, 5);
-  const ma10 = movingAverage(bars, endIndex, 10);
-  const ma20 = movingAverage(bars, endIndex, 20);
-  const ma60 = movingAverage(bars, endIndex, 60);
-  const alignment = alignmentOf(ma5, ma10, ma20, ma60);
+  const bollingerScore = simplifiedBollingerTrendScore(bars, endIndex, 60);
   const strength = trendStrength(bars, endIndex, 20);
   const adx = computeADX(bars, endIndex, 14);
   const close = bars[endIndex].close;
@@ -1336,16 +1382,16 @@ export function classifyMarketState(
   const volumeRatio = volumeTrendRatio(bars, endIndex);
   const volatility = standardDeviation(bars.slice(Math.max(0, endIndex - 19), endIndex + 1).map((bar) => bar.changePct));
 
-  // 趋势确认：均线排列明确 OR (trendStrength 越线 AND ADX 足够强)。
+  // 趋势确认：布林带趋势分数 OR (trendStrength 越线 AND ADX 足够强)。
   // ADX 未完成预热（样本 < period*2）时它不构成否决条件，退回纯斜率判断 ——
   // 否则数据刚够 20 根的板块会被系统性地全部压成震荡市。
   const adxUsable = adx.warm;
   const adxTrending = adx.adx >= thresholds.adxTrending;
   const adxBullish = adx.direction > thresholds.adxDirectionDeadZone;
   const adxBearish = adx.direction < -thresholds.adxDirectionDeadZone;
-  const rising = alignment === 'bullish'
+  const rising = bollingerScore > thresholds.bollingerRisingThreshold
     || (strength > thresholds.risingStrength && (!adxUsable || (adxTrending && adxBullish)));
-  const falling = alignment === 'bearish'
+  const falling = bollingerScore < thresholds.bollingerFallingThreshold
     || (strength < thresholds.fallingStrength && (!adxUsable || (adxTrending && adxBearish)));
 
   const bottomingEvidence = bottomingConfirmations(bars, endIndex, adx);

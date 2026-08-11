@@ -648,7 +648,15 @@ export class PaperTradingService extends EventEmitter {
       .slice(-8)
       .map((instruction) => `${instruction.stock_code} ${instruction.reason}`);
 
-    if (!active.length) skipped.unshift('暂无待执行信号；每个交易日收盘后会生成下一交易日的开盘或临收盘计划。');
+    if (!active.length) {
+      const lastSignalEvent = [...state.events].reverse().find((event) => event.type === 'signals_generated');
+      if (lastSignalEvent && state.last_signal_date) {
+        const planCount = state.instructions.filter((instruction) => instruction.signal_date === state.last_signal_date).length;
+        skipped.unshift(`暂无待执行信号；最近一次决策 ${lastSignalEvent.timestamp} 生成 ${planCount} 个计划。`);
+      } else {
+        skipped.unshift('暂无待执行信号；每个交易日收盘后会生成下一交易日的开盘或临收盘计划。');
+      }
+    }
 
     return {
       ok: true,
@@ -1510,24 +1518,72 @@ export class PaperTradingService extends EventEmitter {
       source: 'paper_trading',
       hintStockCodes: state.last_account_observation?.positions.map((position) => position.stock_code) ?? [],
     };
-    const snapshot = await this.broker.snapshotAccountOnly(context);
-    const previousOrders = state.last_account_observation?.orders ?? [];
-    const merged: SimulatedAccountSnapshot = {
-      ...snapshot,
-      orders: previousOrders.map((order) => ({ ...order })),
+    try {
+      const snapshot = await this.broker.snapshotAccountOnly(context);
+      const previousOrders = state.last_account_observation?.orders ?? [];
+      const merged: SimulatedAccountSnapshot = {
+        ...snapshot,
+        orders: previousOrders.map((order) => ({ ...order })),
+      };
+      await this.audit.info('account_monitor', 'account_only_sync', {
+        traceId,
+        data: {
+          stage,
+          mode: 'broker',
+          hint_stock_codes: context.hintStockCodes,
+          positions: merged.positions.length,
+          preserved_orders: merged.orders.length,
+        },
+      });
+      await this.observeAccountChanges(state, merged, traceId, stage);
+      return merged;
+    } catch (error) {
+      const clock = shanghaiClock(this.now());
+      const isReadOnly = isThsBrokerReadOnlyPeriod(clock, this.cachedTradingCalendar);
+      const message = error instanceof Error ? error.message : String(error);
+      const isThsUnavailable = message.includes('同花顺') || message.includes('begin failed') || message.includes('未找到');
+      // 只读时段且同花顺不可用时，使用本地缓存的最后观测或参考本金构造最小快照，
+      // 避免反复重试触发 begin failed 弹窗。
+      if (isReadOnly && isThsUnavailable) {
+        const fallback = this.buildFallbackSnapshot(state);
+        await this.audit.warn('account_monitor', 'account_only_fallback', {
+          traceId,
+          data: {
+            stage,
+            mode: 'fallback',
+            reason: message,
+            positions: fallback.positions.length,
+            available_cash: fallback.availableCash,
+            total_assets: fallback.totalAssets,
+          },
+        });
+        return fallback;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * 构造同花顺不可用时的兜底快照：优先复用跨日缓存，否则用参考本金 + 空持仓。
+   * 仅用于 close/post_close 等只读窗口，避免因同花顺不可用而阻塞策略计算。
+   */
+  private buildFallbackSnapshot(state: PaperTradingRuntimeState): SimulatedAccountSnapshot {
+    const previous = state.last_account_observation;
+    if (previous) {
+      return {
+        availableCash: previous.available_cash,
+        totalAssets: previous.total_assets,
+        positions: previous.positions.map((position) => ({ ...position })),
+        orders: previous.orders.map((order) => ({ ...order })),
+      };
+    }
+    const referenceCapital = state.reference_capital ?? 200_000;
+    return {
+      availableCash: round(referenceCapital, 2),
+      totalAssets: round(referenceCapital, 2),
+      positions: [],
+      orders: [],
     };
-    await this.audit.info('account_monitor', 'account_only_sync', {
-      traceId,
-      data: {
-        stage,
-        mode: 'broker',
-        hint_stock_codes: context.hintStockCodes,
-        positions: merged.positions.length,
-        preserved_orders: merged.orders.length,
-      },
-    });
-    await this.observeAccountChanges(state, merged, traceId, stage);
-    return merged;
   }
 
   private async observeAccountChanges(
@@ -1840,6 +1896,19 @@ export class PaperTradingService extends EventEmitter {
           this.windowRetry.delete(retryKey);
         } catch (error) {
           const failures = (this.windowRetry.get(retryKey)?.failures ?? 0) + 1;
+          // close/post_close 窗口（15:00 后）仅依赖本地排行数据，同花顺不可用不应无限重试。
+          // 失败 3 次后强制标记完成，避免反复触发 begin failed 弹窗。
+          const isPostCloseWindow = due === 'close' || due === 'post_close';
+          const maxRetries = isPostCloseWindow ? 3 : 999;
+          if (failures >= maxRetries) {
+            await this.audit.warn('paper_trading', 'window_retry_exhausted', {
+              data: { window: due, failures, date: clock.date },
+            });
+            this.markWindowCompleted(state, clock.date, due);
+            await this.persist(state);
+            this.windowRetry.delete(retryKey);
+            return;
+          }
           this.windowRetry.set(retryKey, {
             failures,
             retryAfter: this.now().getTime() + windowRetryDelayMs(due, failures),

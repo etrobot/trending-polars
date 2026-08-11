@@ -4,6 +4,7 @@ import {
   ArrowUp,
   CalendarRange,
   Clock3,
+  FlaskConical,
   Play,
   RefreshCw,
   SlidersHorizontal,
@@ -49,11 +50,8 @@ interface ScoreStockConfigView {
     tiers: Array<{ label: string; maxPct: number; score: number }>;
   };
   trend: {
-    bullishAlignment: number;
-    tangledAlignment: number;
-    bearishAlignment: number;
-    trendBonusMultiplier: number;
-    trendBonusCap: number;
+    bollingerScale: number;
+    bollingerWindow: number;
   };
 }
 
@@ -70,11 +68,8 @@ const DEFAULT_SCORE_STOCK_CONFIG: ScoreStockConfigView = {
     ],
   },
   trend: {
-    bullishAlignment: 28,
-    tangledAlignment: 14,
-    bearishAlignment: 0,
-    trendBonusMultiplier: 400,
-    trendBonusCap: 12,
+    bollingerScale: 0.5,
+    bollingerWindow: 60,
   },
 };
 
@@ -168,6 +163,58 @@ interface OptimizeResult {
   message?: string;
 }
 
+interface OverfitWindowResult {
+  label: string;
+  startIndex: number;
+  days: number;
+  date_range: string;
+  total_return_pct: number;
+  win_rate: number;
+  max_drawdown_pct: number;
+  total_trades: number;
+  run_id: string;
+}
+
+interface OverfitBucket {
+  lower: number;
+  upper: number;
+  count: number;
+  containsCurrent: boolean;
+}
+
+interface OverfitAnalysisResult {
+  base_run_id: string;
+  base_summary: BacktestListItem;
+  windows: OverfitWindowResult[];
+  mean_return_pct: number;
+  std_return_pct: number;
+  cv: number;
+  cv_flag: 'stable' | 'unstable';
+  random_sample_size: number;
+  random_min: number;
+  random_max: number;
+  random_percentiles: Record<'P25' | 'P50' | 'P75' | 'P90' | 'P99', number>;
+  current_percentile: number;
+  current_in_tail: boolean;
+  buckets: OverfitBucket[];
+  /** 回撤分析 */
+  mean_drawdown_pct: number;
+  std_drawdown_pct: number;
+  drawdown_cv: number;
+  drawdown_cv_flag: 'stable' | 'unstable';
+  random_drawdown_min: number;
+  random_drawdown_max: number;
+  random_drawdown_percentiles: Record<'P25' | 'P50' | 'P75' | 'P90' | 'P99', number>;
+  current_drawdown_percentile: number;
+  current_drawdown_in_tail: boolean;
+  drawdown_buckets: OverfitBucket[];
+  verdict: 'ok' | 'warn_tail' | 'warn_unstable' | 'risk';
+  verdict_summary: string;
+  methodology: string;
+  bias_notes: string[];
+  message?: string;
+}
+
 export function BacktestPage() {
   const { setPanelOpen } = useTasks();
   const [history, setHistory] = useState<BacktestListItem[]>([]);
@@ -178,13 +225,17 @@ export function BacktestPage() {
   const [runTaskId, setRunTaskId] = useState<string | null>(null);
   const [collectTaskId, setCollectTaskId] = useState<string | null>(null);
   const [optimizeTaskId, setOptimizeTaskId] = useState<string | null>(null);
+  const [overfitTaskId, setOverfitTaskId] = useState<string | null>(null);
   const [appliedMessage, setAppliedMessage] = useState('');
   const [running, setRunning] = useState(false);
   const [optimizing, setOptimizing] = useState(false);
+  const [overfitting, setOverfitting] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [optimizeOpen, setOptimizeOpen] = useState(false);
+  const [overfitOpen, setOverfitOpen] = useState(false);
   const [optimizeResult, setOptimizeResult] = useState<OptimizeResult | null>(null);
+  const [overfitResult, setOverfitResult] = useState<OverfitAnalysisResult | null>(null);
   const [appliedScoringConfig, setAppliedScoringConfig] = useState<ScoreStockConfigView | null>(null);
   const [days, setDays] = useState(60);
   const [optimizationDays, setOptimizationDays] = useState(40);
@@ -201,6 +252,8 @@ export function BacktestPage() {
   const [relativeStrengthWeightPct, setRelativeStrengthWeightPct] = useState(100);
   const [sortColumn, setSortColumn] = useState<'win_rate' | 'total_return_pct' | 'max_drawdown_pct' | null>(null);
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
+  const [statsSortColumn, setStatsSortColumn] = useState<'name' | 'sellCount' | 'winRate' | 'maxProfit' | 'maxLoss' | null>('sellCount');
+  const [statsSortDirection, setStatsSortDirection] = useState<'asc' | 'desc'>('desc');
   const [historyPage, setHistoryPage] = useState(1);
   const [selectedRunIds, setSelectedRunIds] = useState<Set<string>>(() => new Set());
 
@@ -328,6 +381,69 @@ export function BacktestPage() {
     })().catch((loadError) => setError(loadError instanceof Error ? loadError.message : String(loadError)));
   }, []);
   useTaskResult(optimizeTaskId, onOptimizeDone);
+
+  const onOverfitDone = useCallback(async (task: TaskSnapshot) => {
+    setOverfitTaskId(null);
+    setOverfitting(false);
+    if (task.status !== 'completed') {
+      setError(task.message || '过拟合分析未完成');
+      return;
+    }
+    void (async () => {
+      const detail = await api<TaskSnapshot>(`/api/tasks/${task.id}`);
+      const payload = detail.result as OverfitAnalysisResult | undefined;
+      if (!payload) {
+        setError('过拟合分析结果为空');
+        return;
+      }
+      console.log('[backtest] overfit analysis completed', payload);
+      setOverfitResult(payload);
+      setOverfitOpen(true);
+      setError('');
+    })().catch((loadError) => setError(loadError instanceof Error ? loadError.message : String(loadError)));
+  }, []);
+  useTaskResult(overfitTaskId, onOverfitDone);
+
+  const runOverfitAnalysis = async () => {
+    if (!result) return;
+    setOverfitting(true);
+    setError('');
+    setNotice('');
+    const config = result.config;
+    const params = new URLSearchParams({
+      days: String(configNumberValue(config, 'days', days)),
+      strategy_count: String(Math.max(20, Math.min(200, configNumberValue(config, 'strategy_count', strategyCount)))),
+      max_hold_days: String(configNumberValue(config, 'max_hold_days', maxHoldDays)),
+      max_positions: String(configNumberValue(config, 'max_positions', maxPositions)),
+      position_size_pct: String(configNumberValue(config, 'position_size_pct', positionSizePct)),
+      take_profit_pct: String(configNumberValue(config, 'take_profit_pct', takeProfitPct)),
+      stop_loss_pct: String(Math.abs(configNumberValue(config, 'stop_loss_pct', stopLossPct))),
+      trend_weight_pct: String(configNumberValue(config, 'trend_weight_pct', trendWeightPct)),
+      volume_price_weight_pct: String(configNumberValue(config, 'volume_price_weight_pct', volumePriceWeightPct)),
+      distance_from_low_weight_pct: String(configNumberValue(config, 'distance_from_low_weight_pct', distanceFromLowWeightPct)),
+      volatility_weight_pct: String(configNumberValue(config, 'volatility_weight_pct', volatilityWeightPct)),
+      relative_strength_weight_pct: String(configNumberValue(config, 'relative_strength_weight_pct', relativeStrengthWeightPct)),
+    });
+    if (config.scoring_config_json) {
+      params.set('scoring_config', String(config.scoring_config_json));
+    }
+    console.log('[backtest] start overfit analysis', Object.fromEntries(params.entries()));
+    try {
+      const response = await api<{ task_id: string }>(`/api/backtest/overfit-analysis?${params.toString()}`, { method: 'POST' });
+      setOverfitTaskId(response.task_id);
+      setPanelOpen(true);
+    } catch (overfitError) {
+      setOverfitting(false);
+      setError(overfitError instanceof Error ? overfitError.message : String(overfitError));
+    }
+  };
+
+  const onOverfitClick = () => {
+    void runOverfitAnalysis().catch((clickError) => {
+      setOverfitting(false);
+      setError(clickError instanceof Error ? clickError.message : String(clickError));
+    });
+  };
 
   const run = async (mode: 'current' | 'random') => {
     setSettingsOpen(false);
@@ -498,6 +614,57 @@ export function BacktestPage() {
   };
 
   const curve = useMemo(() => result ? curveFromTrades(result) : [], [result]);
+
+  const perStockStats = useMemo(() => {
+    if (!result) return [] as Array<{ name: string; sellCount: number; winCount: number; winRate: number; maxProfit: number; maxLoss: number }>;
+    const byName = new Map<string, { name: string; sellCount: number; winCount: number; maxProfit: number; maxLoss: number }>();
+    for (const trade of result.trades) {
+      if (trade.action !== '卖出') continue;
+      const existing = byName.get(trade.stock_name) ?? {
+        name: trade.stock_name,
+        sellCount: 0,
+        winCount: 0,
+        maxProfit: -Infinity,
+        maxLoss: Infinity,
+      };
+      existing.sellCount += 1;
+      if (trade.pnl_pct > 0) existing.winCount += 1;
+      if (trade.pnl_pct > existing.maxProfit) existing.maxProfit = trade.pnl_pct;
+      if (trade.pnl_pct < existing.maxLoss) existing.maxLoss = trade.pnl_pct;
+      byName.set(trade.stock_name, existing);
+    }
+    return Array.from(byName.values())
+      .map((row) => ({ ...row, winRate: row.sellCount ? (row.winCount / row.sellCount) * 100 : 0 }));
+  }, [result]);
+
+  const sortedPerStockStats = useMemo(() => {
+    if (!statsSortColumn) return perStockStats;
+    const direction = statsSortDirection === 'asc' ? 1 : -1;
+    return [...perStockStats].sort((left, right) => {
+      const valueA = left[statsSortColumn];
+      const valueB = right[statsSortColumn];
+      if (typeof valueA === 'string' && typeof valueB === 'string') {
+        return direction * valueA.localeCompare(valueB, 'zh-Hans-CN');
+      }
+      return direction * (Number(valueA) - Number(valueB));
+    });
+  }, [perStockStats, statsSortColumn, statsSortDirection]);
+
+  const toggleStatsSort = (column: 'name' | 'sellCount' | 'winRate' | 'maxProfit' | 'maxLoss') => {
+    if (statsSortColumn === column) {
+      setStatsSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setStatsSortColumn(column);
+      setStatsSortDirection(column === 'name' ? 'asc' : 'desc');
+    }
+  };
+
+  const statsSortIndicator = (column: 'name' | 'sellCount' | 'winRate' | 'maxProfit' | 'maxLoss') => {
+    if (statsSortColumn !== column) return null;
+    return statsSortDirection === 'asc'
+      ? <ArrowUp className="ml-0.5 inline-block h-3 w-3" />
+      : <ArrowDown className="ml-0.5 inline-block h-3 w-3" />;
+  };
   const resultDays = Number(result?.config.days ?? days);
   const configNumber = (key: string) => Number(result?.config?.[key] ?? 0);
   const displayScoringConfig = useMemo(
@@ -571,10 +738,16 @@ export function BacktestPage() {
           <section className="panel flex min-w-0 flex-col p-3.5">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="font-display text-base text-ink">参数</h2>
-              <Button variant="secondary" onClick={openSettingsWithDisplayedScheme}>
-                <SlidersHorizontal className="h-3.5 w-3.5" />
-                用当前方案打开回测设置
-              </Button>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="secondary" onClick={openSettingsWithDisplayedScheme}>
+                  <SlidersHorizontal className="h-3.5 w-3.5" />
+                  用当前方案打开回测设置
+                </Button>
+                <Button variant="secondary" onClick={onOverfitClick} disabled={overfitting || !result}>
+                  <FlaskConical className="h-3.5 w-3.5" />
+                  {overfitting ? '分析中…' : '过拟合分析'}
+                </Button>
+              </div>
             </div>
             <div className="mt-3 grid grid-cols-3 gap-x-3 gap-y-0">
               <div>
@@ -609,12 +782,8 @@ export function BacktestPage() {
                 </div>
                 <h3 className="mb-1.5 mt-3 font-mono text-[11px] text-ink font-semibold">趋势维度</h3>
                 <div className="space-y-1">
-                  {[
-                    ['多头排列', formatScorePts(displayScoringConfig.trend.bullishAlignment)],
-                    ['纠缠', formatScorePts(displayScoringConfig.trend.tangledAlignment)],
-                    ['空头排列', formatScorePts(displayScoringConfig.trend.bearishAlignment)],
-                    ['强度乘数', String(displayScoringConfig.trend.trendBonusMultiplier)],
-                    ['强度上限', formatScorePts(displayScoringConfig.trend.trendBonusCap)],
+                  {[['布林带缩放', String(displayScoringConfig.trend.bollingerScale)],
+                    ['布林带窗口', String(displayScoringConfig.trend.bollingerWindow)],
                   ].map(([label, value]) => <div key={label} className="flex justify-between gap-2 font-mono text-[11px]"><span className="text-muted">{label}</span><span className="text-ink">{value}</span></div>)}
                 </div>
               </div>
@@ -643,7 +812,36 @@ export function BacktestPage() {
 
         <section>
           <SectionHeading title="交易记录" description={`${result.trades.length} 条`} />
-          <div className="table-scroll"><table className="data-table min-w-[1040px]"><thead><tr><th>日期</th><th>代码</th><th>名称</th><th className="text-center">操作</th><th className="text-right">价格</th><th className="text-right">数量</th><th className="text-right">金额</th><th className="text-right">仓位</th><th className="text-right">持仓日</th><th className="text-right">盈亏</th><th>原因</th></tr></thead><tbody>{result.trades.map((trade, index) => <tr key={`${trade.date}-${trade.stock_code}-${index}`}><td className="font-mono text-xs">{trade.date}</td><td className="font-mono text-xs text-muted">{trade.stock_code}</td><td className="font-semibold text-ink">{trade.stock_name}</td><td className={`text-center text-xs ${tradeAction(trade.action)}`}>{trade.action}</td><td className="text-right font-mono text-xs">{trade.price.toFixed(2)}</td><td className="text-right font-mono text-xs">{trade.shares.toLocaleString()}</td><td className="text-right font-mono text-xs">{formatMoney(trade.amount)}</td><td className="text-right font-mono text-xs">{trade.position_pct.toFixed(1)}%</td><td className="text-right font-mono text-xs">{trade.hold_days}</td><td className={`text-right font-mono text-xs ${trade.pnl_pct > 0 ? 'text-trading-up' : trade.pnl_pct < 0 ? 'text-trading-down' : 'text-muted'}`}>{trade.pnl_pct > 0 ? '+' : ''}{trade.pnl_pct.toFixed(2)}%</td><td className="max-w-sm whitespace-normal text-xs text-muted">{trade.reason}</td></tr>)}</tbody></table></div>
+          <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_320px]">
+            <div className="table-scroll min-w-0 max-h-[420px]"><table className="data-table min-w-[1040px]"><thead><tr><th>日期</th><th>代码</th><th>名称</th><th className="text-center">操作</th><th className="text-right">价格</th><th className="text-right">数量</th><th className="text-right">金额</th><th className="text-right">仓位</th><th className="text-right">持仓日</th><th className="text-right">盈亏</th><th>原因</th></tr></thead><tbody>{result.trades.map((trade, index) => <tr key={`${trade.date}-${trade.stock_code}-${index}`}><td className="font-mono text-xs">{trade.date}</td><td className="font-mono text-xs text-muted">{trade.stock_code}</td><td className="font-semibold text-ink">{trade.stock_name}</td><td className={`text-center text-xs ${tradeAction(trade.action)}`}>{trade.action}</td><td className="text-right font-mono text-xs">{trade.price.toFixed(2)}</td><td className="text-right font-mono text-xs">{trade.shares.toLocaleString()}</td><td className="text-right font-mono text-xs">{formatMoney(trade.amount)}</td><td className="text-right font-mono text-xs">{trade.position_pct.toFixed(1)}%</td><td className="text-right font-mono text-xs">{trade.hold_days}</td><td className={`text-right font-mono text-xs ${trade.pnl_pct > 0 ? 'text-trading-up' : trade.pnl_pct < 0 ? 'text-trading-down' : 'text-muted'}`}>{trade.pnl_pct > 0 ? '+' : ''}{trade.pnl_pct.toFixed(2)}%</td><td className="max-w-sm whitespace-normal text-xs text-muted">{trade.reason}</td></tr>)}</tbody></table></div>
+            <section className="panel flex min-w-0 flex-col overflow-hidden">
+              <div className="module-header"><h3 className="font-display text-[13px] text-ink">个股统计</h3><span className="font-mono text-[11px] text-muted">共 {perStockStats.length} 只</span></div>
+              <div className="table-scroll min-w-0 max-h-[420px]">
+                <table className="data-table min-w-[300px]">
+                  <thead><tr>
+                    <th className="cursor-pointer select-none" onClick={() => toggleStatsSort('name')}>名称{statsSortIndicator('name')}</th>
+                    <th className="cursor-pointer select-none text-right" onClick={() => toggleStatsSort('sellCount')}>交易次数{statsSortIndicator('sellCount')}</th>
+                    <th className="cursor-pointer select-none text-right" onClick={() => toggleStatsSort('winRate')}>胜率{statsSortIndicator('winRate')}</th>
+                    <th className="cursor-pointer select-none text-right" onClick={() => toggleStatsSort('maxProfit')}>最大盈利{statsSortIndicator('maxProfit')}</th>
+                    <th className="cursor-pointer select-none text-right" onClick={() => toggleStatsSort('maxLoss')}>最大亏损{statsSortIndicator('maxLoss')}</th>
+                  </tr></thead>
+                  <tbody>
+                    {sortedPerStockStats.length === 0 ? (
+                      <tr><td colSpan={5}><EmptyState title="暂无个股" description="当前结果中无已完成平仓的卖出记录。" /></td></tr>
+                    ) : sortedPerStockStats.map((stats) => (
+                      <tr key={stats.name}>
+                        <td className="font-semibold text-ink">{stats.name}</td>
+                        <td className="text-right font-mono text-xs text-ink">{stats.sellCount}</td>
+                        <td className={`text-right font-mono text-xs ${pctColor(stats.winRate - 50)}`}>{stats.winRate.toFixed(1)}%</td>
+                        <td className="text-right font-mono text-xs text-trading-up">+{stats.maxProfit.toFixed(2)}%</td>
+                        <td className="text-right font-mono text-xs text-trading-down">{stats.maxLoss.toFixed(2)}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </div>
         </section>
         </>
       )}
@@ -746,11 +944,8 @@ export function BacktestPage() {
                   <h4 className="mb-1 font-mono text-[11px] text-muted">趋势维度</h4>
                   <div className="space-y-1 font-mono text-[11px]">
                     {[
-                      ['多头排列', `${optimizeResult.scoring.config.trend.bullishAlignment} 分`],
-                      ['纠缠', `${optimizeResult.scoring.config.trend.tangledAlignment} 分`],
-                      ['空头排列', `${optimizeResult.scoring.config.trend.bearishAlignment} 分`],
-                      ['强度乘数', String(optimizeResult.scoring.config.trend.trendBonusMultiplier)],
-                      ['强度上限', `${optimizeResult.scoring.config.trend.trendBonusCap} 分`],
+                      ['布林带缩放', String(optimizeResult.scoring.config.trend.bollingerScale)],
+                      ['布林带窗口', String(optimizeResult.scoring.config.trend.bollingerWindow)],
                     ].map(([label, value]) => <div key={label} className="flex justify-between gap-2"><span className="text-muted">{label}</span><span className="text-ink">{value}</span></div>)}
                   </div>
                 </div>
@@ -830,6 +1025,149 @@ export function BacktestPage() {
             </div>
           </div>
         ) : <EmptyState title="暂无优化结果" />}
+      </Modal>
+
+      <Modal open={overfitOpen} onClose={() => setOverfitOpen(false)} title="过拟合分析结果" description="多窗口滚动回测 + 随机扰动验证当前参数的稳健性" width="max-w-3xl">
+        {overfitResult ? (
+          <div className="space-y-4">
+            <section className="border border-line bg-surface-elevated p-3">
+              <h3 className="mb-2 font-display text-sm text-ink">稳健性指标</h3>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <h4 className="mb-1 font-mono text-[11px] text-muted">滚动窗口表现</h4>
+                  <div className="space-y-1 font-mono text-[11px]">
+                    {overfitResult.windows.map((w) => (
+                      <div key={w.label} className="flex justify-between gap-2">
+                        <span className="text-muted">{w.label} ({w.date_range})</span>
+                        <span className={pctColor(w.total_return_pct)}>{w.total_return_pct >= 0 ? '+' : ''}{w.total_return_pct.toFixed(2)}%</span>
+                      </div>
+                    ))}
+                    <div className="flex justify-between gap-2 border-t border-line-soft pt-1">
+                      <span className="text-muted">平均收益</span>
+                      <span className={pctColor(overfitResult.mean_return_pct)}>{overfitResult.mean_return_pct >= 0 ? '+' : ''}{overfitResult.mean_return_pct.toFixed(2)}%</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">收益标准差</span>
+                      <span className="text-ink">{overfitResult.std_return_pct.toFixed(2)}%</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">变异系数 (CV)</span>
+                      <span className={overfitResult.cv_flag === 'stable' ? 'text-trading-up' : 'text-trading-down'}>{overfitResult.cv.toFixed(2)} ({overfitResult.cv_flag === 'stable' ? '稳健' : '波动'})</span>
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <h4 className="mb-1 font-mono text-[11px] text-muted">随机扰动验证</h4>
+                  <div className="space-y-1 font-mono text-[11px]">
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">当前收益</span>
+                      <span className={pctColor(overfitResult.base_summary.total_return_pct)}>{overfitResult.base_summary.total_return_pct >= 0 ? '+' : ''}{overfitResult.base_summary.total_return_pct.toFixed(2)}%</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">随机样本数</span>
+                      <span className="text-ink">{overfitResult.random_sample_size}</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">随机样本范围</span>
+                      <span className="text-ink">{overfitResult.random_min.toFixed(2)}% ~ {overfitResult.random_max.toFixed(2)}%</span>
+                    </div>
+                    <div className="flex justify-between gap-2 border-t border-line-soft pt-1">
+                      <span className="text-muted">当前百分位</span>
+                      <span className={overfitResult.current_percentile >= 75 ? 'text-trading-up' : overfitResult.current_percentile <= 25 ? 'text-trading-down' : 'text-ink'}>{overfitResult.current_percentile.toFixed(1)}%</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">是否处于尾部</span>
+                      <span className={overfitResult.current_in_tail ? 'text-trading-down' : 'text-trading-up'}>{overfitResult.current_in_tail ? '是 (风险)' : '否 (正常)'}</span>
+                    </div>
+                    <div className="flex justify-between gap-2 border-t border-line-soft pt-1">
+                      <span className="text-muted">P25 / P50 / P75 / P90 / P99</span>
+                      <span className="text-ink">{overfitResult.random_percentiles.P25.toFixed(2)}% / {overfitResult.random_percentiles.P50.toFixed(2)}% / {overfitResult.random_percentiles.P75.toFixed(2)}% / {overfitResult.random_percentiles.P90.toFixed(2)}% / {overfitResult.random_percentiles.P99.toFixed(2)}%</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="border border-line bg-surface-elevated p-3">
+              <h3 className="mb-2 font-display text-sm text-ink">回撤分析</h3>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div>
+                  <h4 className="mb-1 font-mono text-[11px] text-muted">滚动窗口回撤</h4>
+                  <div className="space-y-1 font-mono text-[11px]">
+                    {overfitResult.windows.map((w) => (
+                      <div key={w.label} className="flex justify-between gap-2">
+                        <span className="text-muted">{w.label} ({w.date_range})</span>
+                        <span className="text-trading-down">{w.max_drawdown_pct.toFixed(2)}%</span>
+                      </div>
+                    ))}
+                    <div className="flex justify-between gap-2 border-t border-line-soft pt-1">
+                      <span className="text-muted">平均回撤</span>
+                      <span className="text-trading-down">{overfitResult.mean_drawdown_pct.toFixed(2)}%</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">回撤标准差</span>
+                      <span className="text-ink">{overfitResult.std_drawdown_pct.toFixed(2)}%</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">回撤 CV</span>
+                      <span className={overfitResult.drawdown_cv_flag === 'stable' ? 'text-trading-up' : 'text-trading-down'}>{overfitResult.drawdown_cv.toFixed(2)} ({overfitResult.drawdown_cv_flag === 'stable' ? '稳健' : '波动'})</span>
+                    </div>
+                  </div>
+                </div>
+                <div>
+                  <h4 className="mb-1 font-mono text-[11px] text-muted">随机扰动回撤</h4>
+                  <div className="space-y-1 font-mono text-[11px]">
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">当前回撤</span>
+                      <span className="text-trading-down">{overfitResult.base_summary.max_drawdown_pct.toFixed(2)}%</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">随机回撤范围</span>
+                      <span className="text-ink">{overfitResult.random_drawdown_min.toFixed(2)}% ~ {overfitResult.random_drawdown_max.toFixed(2)}%</span>
+                    </div>
+                    <div className="flex justify-between gap-2 border-t border-line-soft pt-1">
+                      <span className="text-muted">回撤百分位</span>
+                      <span className={overfitResult.current_drawdown_percentile >= 75 ? 'text-trading-down' : overfitResult.current_drawdown_percentile <= 25 ? 'text-trading-up' : 'text-ink'}>{overfitResult.current_drawdown_percentile.toFixed(1)}%</span>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <span className="text-muted">回撤尾部</span>
+                      <span className={overfitResult.current_drawdown_in_tail ? 'text-trading-down' : 'text-trading-up'}>{overfitResult.current_drawdown_in_tail ? '是 (风险)' : '否 (正常)'}</span>
+                    </div>
+                    <div className="flex justify-between gap-2 border-t border-line-soft pt-1">
+                      <span className="text-muted">P25 / P50 / P75 / P90 / P99</span>
+                      <span className="text-ink">{overfitResult.random_drawdown_percentiles.P25.toFixed(2)}% / {overfitResult.random_drawdown_percentiles.P50.toFixed(2)}% / {overfitResult.random_drawdown_percentiles.P75.toFixed(2)}% / {overfitResult.random_drawdown_percentiles.P90.toFixed(2)}% / {overfitResult.random_drawdown_percentiles.P99.toFixed(2)}%</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="border border-line bg-surface-elevated p-3">
+              <h3 className="mb-2 font-display text-sm text-ink">综合评估</h3>
+              <div className="grid gap-3 sm:grid-cols-3">
+                <div className={`rounded border px-3 py-2 ${overfitResult.verdict === 'ok' ? 'border-green/55 bg-accent-green-soft' : overfitResult.verdict.startsWith('warn') ? 'border-amber/55 bg-accent-amber-soft' : 'border-red/55 bg-accent-red-soft'}`}>
+                  <div className="font-mono text-[10px] text-muted uppercase">评估结论</div>
+                  <div className="font-display text-sm font-semibold text-ink">{overfitResult.verdict === 'ok' ? '通过' : overfitResult.verdict.startsWith('warn') ? '警告' : '风险'}</div>
+                  <div className="font-mono text-[10px] text-muted">{overfitResult.verdict_summary}</div>
+                </div>
+                <div className="rounded border border-line bg-surface px-3 py-2">
+                  <div className="font-mono text-[10px] text-muted uppercase">方法论</div>
+                  <div className="font-mono text-[11px] text-ink leading-tight">{overfitResult.methodology}</div>
+                </div>
+                <div className="rounded border border-line bg-surface px-3 py-2">
+                  <div className="font-mono text-[10px] text-muted uppercase">偏差提示</div>
+                  <ul className="list-disc list-inside font-mono text-[10px] text-muted leading-tight">
+                    {overfitResult.bias_notes.map((note, idx) => <li key={idx}>{note}</li>)}
+                  </ul>
+                </div>
+              </div>
+            </section>
+
+            <div className="flex justify-end">
+              <Button variant="secondary" onClick={() => setOverfitOpen(false)}>关闭</Button>
+            </div>
+          </div>
+        ) : <EmptyState title="暂无分析结果" description="点击「过拟合分析」按钮运行分析" />}
       </Modal>
 
       <Modal open={historyOpen} onClose={closeHistoryModal} title="回测历史" description={`共 ${history.length} 条记录。点击表头可排序，勾选后可批量删除。`} width="max-w-4xl">

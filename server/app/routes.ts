@@ -4,6 +4,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import type { AnalysisData } from '../../src/types.js';
 import { guardDetachedPromise, type AuditLevel, type AuditLoggerLike } from '../audit-log.js';
 import { MAX_FACTOR_WEIGHT_PCT, runPolarsBacktest, runRandomizedBacktest } from '../backtest-engine.js';
+import { runOverfitAnalysis } from '../backtest-overfit.js';
 import { optimizeStrategyParams } from '../backtest-param-optimizer.js';
 import { computeFactorIC } from '../factor-ic.js';
 import { fetchSohuIndexKlines, buildBenchmarkCurve } from '../benchmark.js';
@@ -621,6 +622,89 @@ export function registerRoutes(
     const forwardDays = numberParam(request.query.forward_days, 5, 1, 20);
     const rankingConfig = await store.getRankingConfig();
     response.json(computeFactorIC(history, days, forwardDays, rankingConfig?.scoring_config));
+  }));
+
+  // 过拟合分析：前/中/后 3 段窗口对比 + 最末窗口随机参数分布对照。
+  // 跑在异步任务里，因为最末窗口要再跑 N 次回测。
+  app.post('/api/backtest/overfit-analysis', asyncHandler(async (request, response) => {
+    const days = numberParam(request.query.days, 60, MIN_BACKTEST_DAYS, MAX_BACKTEST_DAYS);
+    const strategyCount = numberParam(request.query.strategy_count, 50, 20, 200);
+    const maxHoldDays = numberParam(request.query.max_hold_days, 5, 1, 60);
+    const maxPositions = numberParam(request.query.max_positions, 10, 1, 20);
+    const positionSizePct = numberParam(request.query.position_size_pct, 10, 1, 100);
+    const takeProfitPct = numberParam(request.query.take_profit_pct, 15, 1, 60);
+    const stopLossPct = numberParam(request.query.stop_loss_pct, 5, 1, 30);
+    const trendWeightPct = numberParam(request.query.trend_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
+    const volumePriceWeightPct = numberParam(request.query.volume_price_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
+    const distanceFromLowWeightPct = numberParam(request.query.distance_from_low_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
+    const volatilityWeightPct = numberParam(request.query.volatility_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
+    const relativeStrengthWeightPct = numberParam(request.query.relative_strength_weight_pct, 100, 1, MAX_FACTOR_WEIGHT_PCT);
+    const requestedDate = marketDateParam(request.query.date);
+    const scoringConfig = readScoringConfig(request);
+    const task = tasks.start('backtest_overfit', `过拟合分析（${days} 日窗口 + ${strategyCount} 组随机参数）`, async ({ progress, cancelled, traceId }) => {
+      const source = await store.getRankingUniverse();
+      if (!source.rankings.length) throw new Error('当前股票池为空，无法运行过拟合分析');
+      const prepared = await marketService.ensureHistoricalCoverage({
+        rankings: source.rankings,
+        days,
+        asOfDate: requestedDate,
+        traceId,
+        cancelled,
+        progress: (value, message) => progress(value * 0.5, message),
+      });
+      if (cancelled()) return null;
+      const history = prepared.history;
+      console.log('[backtest] /api/backtest/overfit-analysis', {
+        days,
+        strategy_count: strategyCount,
+        history_as_of_date: history.as_of_date,
+        stocks: history.stocks.length,
+      });
+      await audit.info('backtest', 'overfit_started', {
+        traceId,
+        data: { days, strategy_count: strategyCount, history_as_of_date: history.as_of_date, stocks: history.stocks.length },
+      });
+      const result = runOverfitAnalysis(history, {
+        days,
+        strategyCount,
+        base: {
+          maxHoldDays,
+          maxPositions,
+          positionSizePct,
+          takeProfitPct,
+          stopLossPct,
+          trendWeightPct,
+          volumePriceWeightPct,
+          distanceFromLowWeightPct,
+          volatilityTrendWeightPct: volatilityWeightPct,
+          relativeStrengthWeightPct,
+        },
+        scoringConfig,
+        onProgress: (stage, value, message) => {
+          if (stage === 'windows') progress(50 + value * 0.2, message);
+          else if (stage === 'random') progress(70 + value * 0.25, message);
+          else if (stage === 'summary') progress(95, message);
+        },
+      });
+      await audit.info('backtest', 'overfit_completed', {
+        traceId,
+        data: {
+          days,
+          strategy_count: strategyCount,
+          cv: result.cv,
+          cv_flag: result.cv_flag,
+          current_percentile: result.current_percentile,
+          verdict: result.verdict,
+        },
+      });
+      progress(100, '过拟合分析完成');
+      return {
+        ...result,
+        collected: prepared.collected,
+        message: `${prepared.collected ? '已补采行情并' : '行情覆盖已满足，'}完成过拟合分析（${result.windows.length} 段窗口 + ${result.random_sample_size} 组随机参数）`,
+      };
+    });
+    response.status(202).json({ task_id: task.id, status: 'started', message: '过拟合分析任务已启动' });
   }));
 
   app.get('/api/backtest/:runId', asyncHandler(async (request, response) => {

@@ -27,45 +27,76 @@ import {
 // in a single Polars pass, replacing the per-day per-stock scoreStock loop.
 // ---------------------------------------------------------------------------
 
-/** Pre-compute trend_strength and limit_up flag per stock in one O(n) pass. */
+/** Pre-compute trend_strength, limit_up flag, and bollinger trend score per stock in one O(n) pass. */
 function computeStockArrays(
   closes: Float64Array,
   dates: string[],
   limitUpDates: ReadonlySet<string> | undefined,
-): { strength: Float64Array; limitUp: Float64Array } {
+  bollingerWindow: number,
+): { strength: Float64Array; limitUp: Float64Array; bollinger: Float64Array } {
   const n = closes.length;
   const strength = new Float64Array(n);
   const limitUp = new Float64Array(n);
+  const bollinger = new Float64Array(n);
   const lookback = 20;
-  const sumX = (lookback - 1) * lookback / 2;
-  const sumX2 = (lookback - 1) * lookback * (2 * lookback - 1) / 6;
+
+  // Pre-compute MA5 for all positions (used by bollinger trend score endpoints)
+  const ma5 = new Float64Array(n);
+  for (let i = 0; i < n; i += 1) {
+    const start = Math.max(0, i - 4);
+    const len = i - start + 1;
+    let sum = 0;
+    for (let j = start; j <= i; j += 1) sum += closes[j];
+    ma5[i] = sum / len;
+  }
 
   for (let i = 0; i < n; i += 1) {
     // Limit-up flag
     if (limitUpDates?.has(dates[i])) limitUp[i] = 1;
+
     // Trend strength (rolling linear regression slope / mean)
-    const start = Math.max(0, i - lookback + 1);
-    const len = i - start + 1;
-    if (len < 5) continue;
-    let sy = 0;
-    let sxy = 0;
-    for (let j = start; j <= i; j += 1) {
-      const x = j - start;
-      sy += closes[j];
-      sxy += x * closes[j];
+    const tsStart = Math.max(0, i - lookback + 1);
+    const tsLen = i - tsStart + 1;
+    if (tsLen >= 5) {
+      let sy = 0;
+      let sxy = 0;
+      for (let j = tsStart; j <= i; j += 1) {
+        const x = j - tsStart;
+        sy += closes[j];
+        sxy += x * closes[j];
+      }
+      const actualSumX = (tsLen - 1) * tsLen / 2;
+      const actualSumX2 = (tsLen - 1) * tsLen * (2 * tsLen - 1) / 6;
+      const actualDenom = tsLen * actualSumX2 - actualSumX * actualSumX;
+      if (actualDenom) {
+        const slope = (tsLen * sxy - actualSumX * sy) / actualDenom;
+        const mean = sy / tsLen;
+        strength[i] = mean > 0 ? slope / mean : 0;
+      }
     }
-    const denom = len * sumX2 - sumX * sumX;
-    if (!denom) continue;
-    // For partial windows (len < 20), sumX/sumX2 differ from the full-window constants
-    const actualSumX = (len - 1) * len / 2;
-    const actualSumX2 = (len - 1) * len * (2 * len - 1) / 6;
-    const actualDenom = len * actualSumX2 - actualSumX * actualSumX;
-    if (!actualDenom) continue;
-    const slope = (len * sxy - actualSumX * sy) / actualDenom;
-    const mean = sy / len;
-    strength[i] = mean > 0 ? slope / mean : 0;
+
+    // Bollinger trend score
+    const bwStart = Math.max(0, i - bollingerWindow + 1);
+    const bwLen = i - bwStart + 1;
+    if (bwLen >= 2) {
+      const startMA = ma5[bwStart];
+      const endMA = ma5[i];
+      // Construct arithmetic sequence L and compute closes slice
+      let LSum = 0;
+      let maxDev = 0;
+      for (let j = bwStart; j <= i; j += 1) {
+        const t = j - bwStart;
+        const LVal = startMA + (endMA - startMA) * t / (bwLen - 1);
+        LSum += LVal;
+        maxDev = Math.max(maxDev, Math.abs(closes[j] - LVal));
+      }
+      const LMean = LSum / bwLen;
+      const ret = (closes[i] - closes[bwStart]) / closes[bwStart];
+      const relDev = LMean > 0 ? maxDev / LMean : 0;
+      bollinger[i] = relDev !== 0 ? ret / relDev : (ret > 0 ? Infinity : ret < 0 ? -Infinity : 0);
+    }
   }
-  return { strength, limitUp };
+  return { strength, limitUp, bollinger };
 }
 
 /**
@@ -213,6 +244,7 @@ export function computeBacktestScores(
   const amounts: number[] = [];
   const changePcts: number[] = [];
   const trendStrengths: number[] = [];
+  const bollingerScores: number[] = [];
   const limitUpFlags: number[] = [];
   const sectorStateIds: number[] = [];
   const sectorCodes: string[] = [];
@@ -247,10 +279,11 @@ export function computeBacktestScores(
     }
     const exactLimitUpDates = limitUpDatesByCode.get(stock.stock_code);
     const strategyLimitUpDates = exactLimitUpDates ?? new Set<string>();
-    const { strength, limitUp } = computeStockArrays(
+    const { strength, limitUp, bollinger } = computeStockArrays(
       closeArr,
       dateArr,
       exactLimitUpDates,
+      trend.bollingerWindow,
     );
     // Sector state for this stock on each date: walk forward through sector history
     // to find the most recent block_top record on or before the current bar date.
@@ -269,6 +302,7 @@ export function computeBacktestScores(
       amounts.push(Number(bars[i][6]));
       changePcts.push(Number(bars[i][7]));
       trendStrengths.push(strength[i]);
+      bollingerScores.push(bollinger[i]);
       limitUpFlags.push(limitUp[i]);
       // Advance cursor while records are on or before the current bar date
       while (sectorHistory && sectorCursor < sectorHistory.length && sectorHistory[sectorCursor].date <= dateArr[i]) {
@@ -315,6 +349,7 @@ export function computeBacktestScores(
     amount: amounts,
     change_pct: changePcts,
     trend_strength: trendStrengths,
+    bollinger_score: bollingerScores,
     limit_up_flag: limitUpFlags,
     sector_state_id: sectorStateIds,
     sector_code: sectorCodes,
@@ -370,38 +405,27 @@ export function computeBacktestScores(
       .alias('distance_from_low_pct'),
   );
 
-  // ---- 5. Alignment classification ----
+  // ---- 5. Bollinger-based alignment (for display only) ----
   frame = frame.withColumns(
-    pl.when(pl.col('ma5').isNull().or(pl.col('ma10').isNull()).or(pl.col('ma20').isNull()).or(pl.col('ma60').isNull()))
-      .then(pl.lit('tangled'))
-      .when(pl.col('ma5').gt(pl.col('ma10')).and(pl.col('ma10').gt(pl.col('ma20'))).and(pl.col('ma20').gt(pl.col('ma60'))))
-      .then(pl.lit('bullish'))
-      .when(pl.col('ma5').lt(pl.col('ma10')).and(pl.col('ma10').lt(pl.col('ma20'))).and(pl.col('ma20').lt(pl.col('ma60'))))
-      .then(pl.lit('bearish'))
+    pl.when(pl.col('bollinger_score').gt(0.3)).then(pl.lit('bullish'))
+      .when(pl.col('bollinger_score').lt(-0.3)).then(pl.lit('bearish'))
       .otherwise(pl.lit('tangled'))
       .alias('alignment'),
   );
 
   // ---- 6. Dimension 1: Trend score (0-40) ----
-  // trendBonus 必须与 scoring-engine.trendScoreFromParts 完全一致：|strength| 未超过
-  // trendStrengthThreshold 时为 0（死区）。缺了死区会让回测比实盘多给最多 ±threshold×
-  // multiplier 的分，且使 trendStrengthThreshold 这个可优化参数在向量化路径里形同虚设。
+  // 简化布林带趋势分数：tanh(bollingerScore * scale) 映射到 (0, 40)，再加板块加减分。
+  // 与 scoring-engine.trendScoreFromParts 完全一致。
   frame = frame.withColumns(
-    pl.when(pl.col('trend_strength').gt(trend.trendStrengthThreshold)
-      .or(pl.col('trend_strength').lt(-trend.trendStrengthThreshold)))
-      .then(pl.col('trend_strength').mul(trend.trendBonusMultiplier).clip(-trend.trendBonusCap, trend.trendBonusCap))
-      .otherwise(pl.lit(0))
-      .alias('trend_bonus'),
     pl.when(pl.col('sector_state_id').eq(pl.lit(8))
       .or(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3)))).then(pl.lit(trend.sectorUpBonus))
       .when(pl.col('sector_state_id').gtEq(6)).then(pl.lit(trend.sectorDownBonus))
       .otherwise(pl.lit(0))
       .alias('sector_bonus'),
   ).withColumns(
-    pl.when(pl.col('alignment').eq(pl.lit('bullish'))).then(pl.lit(trend.bullishAlignment))
-      .when(pl.col('alignment').eq(pl.lit('bearish'))).then(pl.lit(trend.bearishAlignment))
-      .otherwise(pl.lit(trend.tangledAlignment))
-      .add(pl.col('trend_bonus'))
+    // 裁剪极端值防止 tanh 溢出，然后映射到 [0, 40]
+    pl.col('bollinger_score').clip(-100, 100)
+      .mul(trend.bollingerScale).tanh().mul(20).add(20)
       .add(pl.col('sector_bonus'))
       .clip(0, 40)
       .alias('trend_score'),
@@ -472,7 +496,7 @@ export function computeBacktestScores(
   );
 
   // ---- 9. Dimension 4: Volatility-trend score (0-15) ----
-  // trend_axis: prefer sector state_id when available, fallback to alignment
+  // trend_axis: prefer sector state_id when available, fallback to bollinger_score
   frame = frame.withColumns(
     pl.when(pl.col('limit_up_count_20d').gtEq(volatilityTrend.limitUp.highMinLimitUps)).then(pl.lit('high'))
       .when(pl.col('limit_up_count_20d').gtEq(volatilityTrend.limitUp.mediumMinLimitUps)).then(pl.lit('medium'))
@@ -482,8 +506,8 @@ export function computeBacktestScores(
       .or(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3)))).then(pl.lit('up'))
       .when(pl.col('sector_state_id').gtEq(6)).then(pl.lit('down'))
       .when(pl.col('sector_state_id').gtEq(4).and(pl.col('sector_state_id').ltEq(5))).then(pl.lit('range'))
-      .when(pl.col('alignment').eq(pl.lit('bullish'))).then(pl.lit('up'))
-      .when(pl.col('alignment').eq(pl.lit('bearish'))).then(pl.lit('down'))
+      .when(pl.col('bollinger_score').gt(0.3)).then(pl.lit('up'))
+      .when(pl.col('bollinger_score').lt(-0.3)).then(pl.lit('down'))
       .otherwise(pl.lit('range'))
       .alias('trend_axis'),
   );
