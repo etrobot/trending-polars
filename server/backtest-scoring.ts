@@ -366,6 +366,7 @@ export function computeBacktestScores(
   // ---- 3. Rolling features (per stock) ----
   const g = 'stock_code';
   frame = frame.withColumns(
+    pl.col('close').rollingMean({ windowSize: 3 }).over(g).alias('ma3'),
     pl.col('close').rollingMean({ windowSize: 5 }).over(g).alias('ma5'),
     pl.col('close').rollingMean({ windowSize: 10 }).over(g).alias('ma10'),
     pl.col('close').rollingMean({ windowSize: 20 }).over(g).alias('ma20'),
@@ -626,6 +627,9 @@ export function computeBacktestScores(
       sector_trend_state_id: sectorStateId || undefined,
       latest_price: Number(row.close),
       latest_change_rate: Number(row.change_pct),
+      ma3: round(Number(row.ma3), 3),
+      ma5: round(Number(row.ma5), 3),
+      ma20: round(Number(row.ma20), 3),
     });
     byDate.set(date, list);
   }

@@ -8,6 +8,7 @@ import {
   LayoutDashboard,
   Radio,
   SquareTerminal,
+  TrendingUp,
   X,
 } from 'lucide-react';
 import { HeaderActionsProvider } from './HeaderActions';
@@ -19,6 +20,7 @@ const navItems = [
   { to: '/ranking', label: '量化排行', shortLabel: '截面', code: '02', icon: BarChart3 },
   { to: '/backtest', label: '策略回测', shortLabel: '策略', code: '03', icon: FlaskConical },
   { to: '/simulated-trading', label: '模拟交易', shortLabel: '交易', code: '04', icon: SquareTerminal },
+  { to: '/sector-rotation', label: '板块轮动', shortLabel: '轮动', code: '05', icon: TrendingUp },
 ];
 
 const statusLabel: Record<TaskSnapshot['status'], string> = {

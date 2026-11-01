@@ -154,6 +154,9 @@ function ranking(stockCode: string, stockName: string, score: number, latestPric
     strategy_position: '0.4',
     strategy_position_ratio: 0.4,
     latest_price: latestPrice,
+    ma3: latestPrice * 0.99,
+    ma5: latestPrice * 0.98,
+    ma20: latestPrice * 0.95,
   };
 }
 

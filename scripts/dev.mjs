@@ -22,8 +22,11 @@ function trackProcess(child, label) {
   return child;
 }
 
+// Windows 下 tsx / vite 是 .cmd 包装脚本，spawn 必须经由 shell 才能解析 PATH。
+const spawnOptions = { stdio: 'inherit', env: process.env, shell: process.platform === 'win32' };
+
 const watchServer = trackProcess(
-  spawn('tsx', ['watch', 'server/index.ts'], { stdio: 'inherit', env: process.env }),
+  spawn('tsx', ['watch', 'server/index.ts'], spawnOptions),
   'server',
 );
 
@@ -56,11 +59,14 @@ try {
   await waitForApi(Number(process.env.PORT ?? 8787));
   if (!shuttingDown) {
     // lifecycle 依赖 server 的自动化 API；API 就绪后再启动，避免首个 tick 因连接失败跳过。
-    trackProcess(
-      spawn('tsx', ['scripts/ths-lifecycle.mjs'], { stdio: 'inherit', env: process.env }),
-      'ths-lifecycle',
-    );
-    trackProcess(spawn('vite', [], { stdio: 'inherit', env: process.env }), 'vite');
+    // 该脚本用 AppleScript 操作同花顺，仅 macOS 可用。
+    if (process.platform === 'darwin') {
+      trackProcess(
+        spawn('tsx', ['scripts/ths-lifecycle.mjs'], spawnOptions),
+        'ths-lifecycle',
+      );
+    }
+    trackProcess(spawn('vite', [], spawnOptions), 'vite');
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));

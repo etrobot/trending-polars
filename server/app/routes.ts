@@ -9,7 +9,7 @@ import { optimizeStrategyParams } from '../backtest-param-optimizer.js';
 import { computeFactorIC } from '../factor-ic.js';
 import { fetchSohuIndexKlines, buildBenchmarkCurve } from '../benchmark.js';
 import { compactDate, formatDateTime, round } from '../format.js';
-import { fetchAdjustedKlines, fetchBlockKlines, MAX_BACKTEST_DAYS, MIN_BACKTEST_DAYS, type BlockKlinePeriod } from '../historical-market.js';
+import { fetchAdjustedKlines, fetchBlockKlines, fetchBlockYearKlines, MAX_BACKTEST_DAYS, MIN_BACKTEST_DAYS, type BlockKlinePeriod } from '../historical-market.js';
 import { queryRankings } from '../polars-engine.js';
 import { normalizeScoreStockConfig } from '../scoring-engine.js';
 import { rankingConfigFromBacktest, type RankingRuntimeConfig } from '../ranking-config.js';
@@ -19,6 +19,12 @@ import { MarketService, analysisWithStats, priceRows, averageRankingChange } fro
 import { resolveLatestTradingDate, loadTradingCalendar } from '../index-bootstrap.js';
 import { PAPER_ENGINE_VERSION, type PaperTradingService } from '../paper-trading.js';
 import { buildTradingSession, immediateAutoWindowRejection, resolveAutoTradingWindow, shanghaiClock } from '../paper-trading/helpers.js';
+import {
+  buildSectorRotation,
+  CONCEPT_BLOCK_PREFIXES,
+  isIndustryBlockCode,
+  RECENT_LIMIT_UP_DAYS,
+} from '../sector-rotation.js';
 
 // ---------------------------------------------------------------------------
 // Helper types and functions
@@ -38,6 +44,9 @@ function marketDateParam(value: unknown, fallback = compactDate().slice(0, 8)): 
   const normalized = String(value ?? '').replace(/\D/g, '').slice(0, 8);
   return /^\d{8}$/.test(normalized) ? normalized : fallback;
 }
+
+/** 板块轮动按年补采记录：同一进程内每个「年份+板块」只尝试一次，避免每次请求重复联网。 */
+const backfillAttempted = new Set<string>();
 
 function parseScoringConfig(value: unknown): ReturnType<typeof normalizeScoreStockConfig> | undefined {
   if (value == null) return undefined;
@@ -311,6 +320,62 @@ export function registerRoutes(
     response.json(priceRows(marketData.klines));
   }));
 
+  // 板块轮动：今年 YTD 涨跌幅曲线（来自 block_daily_price 日线）
+  //   basis=industry（默认）：行业板块 881xxx
+  //   basis=limit_up：以近 30 个交易日涨停个股所属概念板块（885/886xxx）为基准（全部纳入）
+  app.get('/api/sector-rotation', asyncHandler(async (request, response) => {
+    const currentYear = Number(formatDateTime().slice(0, 4));
+    const year = numberParam(request.query.year, currentYear, 2000, 2100);
+    const startDate = `${year}-01-01`;
+    const endDate = `${year + 1}-01-01`;
+    const limitUpBasis = String(request.query.basis ?? 'industry') === 'limit_up';
+    const yearWindow = String(request.query.window ?? 'recent') === 'year';
+    const hotSectors = limitUpBasis
+      ? yearWindow
+        ? await store.getLimitUpSectorsBetween(startDate, endDate, CONCEPT_BLOCK_PREFIXES)
+        : await store.getRecentLimitUpSectors(RECENT_LIMIT_UP_DAYS, CONCEPT_BLOCK_PREFIXES)
+      : [];
+    const codes = limitUpBasis ? new Set(hotSectors.map((sector) => sector.code)) : null;
+    const keep = (code: string) => (codes ? codes.has(code) : isIndustryBlockCode(code));
+
+    let rows = await store.getBlockPriceHistory(startDate, endDate);
+    rows = rows.filter((row) => keep(row.block_code));
+    // 同花顺 last.js 只回最近约 140 根日线，年初数据往往缺失；对缺失年初的板块按年补采一次，
+    // 结果落库后后续请求直接命中 SQLite，不再联网。
+    const names = new Map(rows.map((row) => [row.block_code, row.block_name]));
+    for (const sector of hotSectors) if (!names.has(sector.code)) names.set(sector.code, sector.name || sector.code);
+    // 无涨停基准时，今年涨停涉及的行业板块即使还没有任何日线，也要进入补采池。
+    if (!limitUpBasis) {
+      for (const sector of await store.getIndustryLimitUpSectors(startDate, endDate)) {
+        if (!names.has(sector.code)) names.set(sector.code, sector.name);
+      }
+    }
+    const firstDateByBlock = new Map<string, string>();
+    for (const row of rows) {
+      if (!firstDateByBlock.has(row.block_code)) firstDateByBlock.set(row.block_code, row.date);
+    }
+    const missing = [...names.keys()].filter((code) => {
+      if (backfillAttempted.has(`${year}:${code}`)) return false;
+      const first = firstDateByBlock.get(code);
+      return !first || first > `${year}-02-15`;
+    });
+    if (missing.length) {
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < missing.length) {
+          const code = missing[cursor];
+          cursor += 1;
+          backfillAttempted.add(`${year}:${code}`);
+          const { klines } = await fetchBlockYearKlines(code, year, '01');
+          if (klines.length) await store.upsertBlockPrices(code, names.get(code) ?? code, klines);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(6, missing.length) }, () => worker()));
+      rows = (await store.getBlockPriceHistory(startDate, endDate)).filter((row) => keep(row.block_code));
+    }
+    response.json(buildSectorRotation(rows, year, codes ?? undefined));
+  }));
+
   // Ranking
   app.get('/api/ranking', asyncHandler(async (request, response) => {
     const source = await store.getRanking();
@@ -327,7 +392,7 @@ export function registerRoutes(
 
   app.post('/api/ranking/compute', asyncHandler(async (request, response) => {
     const requestedDate = marketDateParam(request.query.date);
-    const days = numberParam(request.query.days, 20, 5, 60);
+    const days = numberParam(request.query.days, 20, 5, MAX_BACKTEST_DAYS);
     const task = startRankingTask(requestedDate, days);
     response.status(202).json({ task_id: task.id, status: 'started', message: '排行计算已启动' });
   }));

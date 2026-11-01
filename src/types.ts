@@ -160,6 +160,10 @@ export interface RankingRow {
   position_label?: string;
   latest_price?: number | null;
   latest_change_rate?: number | null;
+  /** 信号日均线（收盘价 SMA），买入信号要求 收盘 > MA3 > MA5 > MA20。 */
+  ma3?: number | null;
+  ma5?: number | null;
+  ma20?: number | null;
   /** 距60日低点涨幅(%) */
   distance_from_low_pct?: number;
   sector_code?: string;
@@ -435,6 +439,62 @@ export interface PaperStrategyConfigSnapshot {
   maxEntriesPerDay: number;
   positionSizePct: number;
   maxCandidates: number;
+}
+
+/** 资金关注度标记：由「近两月涨跌幅 / 今年涨跌幅」结合大方向（今年涨跌）决定。 */
+export type SectorMomentumTag =
+  | '资金正关注'
+  | '稳定'
+  | '阴跌'
+  | '加速下跌'
+  | '交易平稳'
+  | '反转发生中'
+  | '基数过小'
+  | '数据不足';
+
+/** 近一周蜡烛（含当日 MA5 / MA10，供迷你图叠加均线用）。 */
+export interface SectorCandle {
+  date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  ma5: number | null;
+  ma10: number | null;
+}
+
+/** 平稳介入评分档位。 */
+export type SectorEntryLevel = '平稳介入' | '可关注' | '观察' | '回避';
+
+export interface SectorRotationSector {
+  code: string;
+  name: string;
+  /** 年初至今涨跌幅（%）。 */
+  changePct: number;
+  /** 与 dates 对齐的年初至今涨跌幅曲线；缺失交易日为 null。 */
+  series: Array<number | null>;
+  /** 近两月（最近 40 个交易日）涨跌幅（%）；不足 41 根日线时为 null。 */
+  recentChangePct: number | null;
+  /** 近两月涨跌幅 / 今年涨跌幅；今年涨跌幅绝对值 < 1% 或数据不足时为 null。 */
+  momentumRatio: number | null;
+  /** 资金关注度标记。 */
+  tag: SectorMomentumTag;
+  /** 最近 5 个交易日蜡烛，按日期升序。 */
+  candles: SectorCandle[];
+  /** 最新交易日的收盘价均线；日线不足时为 null。 */
+  ma3: number | null;
+  ma5: number | null;
+  ma10: number | null;
+  ma20: number | null;
+  /** 近一周蜡烛 + 均线组合的平稳介入评分（0-100）。 */
+  entryScore: number;
+  entryLevel: SectorEntryLevel;
+}
+
+export interface SectorRotationResponse {
+  year: number;
+  dates: string[];
+  sectors: SectorRotationSector[];
 }
 
 export interface PaperTradingRuntimeState {

@@ -21,6 +21,7 @@ import type {
 } from './historical-market.js';
 import { formatDateTime, round } from './format.js';
 import type { SectorTrendLookup } from './backtest-engine.js';
+import type { BlockPricePoint } from './sector-rotation.js';
 import {
   analyzeBlockTrend,
   classifyMarketState,
@@ -481,6 +482,68 @@ export class SqliteStore {
       sector_change: numberValue(row.sector_change),
       latest: finiteNumber(row.latest),
       change_rate: finiteNumber(row.change_rate),
+    }));
+  }
+
+  /** 日期范围内涨停涉及的全部行业板块（881xxx），用于板块轮动补齐年线。 */
+  getIndustryLimitUpSectors(fromDate: string, toDate: string): Array<{ code: string; name: string }> {
+    const from = isoDate(fromDate);
+    const to = isoDate(toDate);
+    if (!from || !to) return [];
+    return this.database.prepare(`
+      SELECT r.sector_code AS code, MAX(si.name) AS name
+      FROM limit_up_record r
+      LEFT JOIN sector_info si ON si.code = r.sector_code
+      WHERE r.date >= ? AND r.date < ? AND substr(r.sector_code, 1, 3) = '881'
+      GROUP BY r.sector_code
+      ORDER BY r.sector_code ASC
+    `).all(from, to).map((row) => ({
+      code: String(row.code),
+      name: String(row.name ?? ''),
+    }));
+  }
+
+  /** 区间内涨停涉及的板块（按代码段过滤），按涨停个股家数降序。 */
+  getLimitUpSectorsBetween(startDate: string, endDate: string, prefixes: readonly string[]): Array<{ code: string; name: string; stockCount: number }> {
+    if (!prefixes.length) return [];
+    const from = startDate.replace(/\D/g, '');
+    const to = endDate.replace(/\D/g, '');
+    if (!from || !to) return [];
+    const prefixClause = prefixes.map(() => 'substr(r.sector_code, 1, 3) = ?').join(' OR ');
+    return this.database.prepare(`
+      SELECT r.sector_code AS code, MAX(si.name) AS name, COUNT(DISTINCT r.stock_code) AS stock_count
+      FROM limit_up_record r
+      LEFT JOIN sector_info si ON si.code = r.sector_code
+      WHERE r.date >= ? AND r.date < ? AND (${prefixClause})
+      GROUP BY r.sector_code
+      ORDER BY stock_count DESC, r.sector_code ASC
+    `).all(from, to, ...prefixes).map((row) => ({
+      code: String(row.code),
+      name: String(row.name ?? ''),
+      stockCount: Number(row.stock_count),
+    }));
+  }
+
+  /** 最近 N 个交易日涨停涉及的板块（按代码段过滤），按涨停个股家数降序，用于「涨停基准」聚类。 */
+  getRecentLimitUpSectors(tradingDays: number, prefixes: readonly string[]): Array<{ code: string; name: string; stockCount: number }> {
+    if (!prefixes.length) return [];
+    const days = this.database.prepare(`
+      SELECT DISTINCT date FROM limit_up_record ORDER BY date DESC LIMIT ?
+    `).all(Math.max(1, Math.trunc(tradingDays))) as Array<{ date: string }>;
+    if (!days.length) return [];
+    const from = days[days.length - 1].date;
+    const prefixClause = prefixes.map(() => 'substr(r.sector_code, 1, 3) = ?').join(' OR ');
+    return this.database.prepare(`
+      SELECT r.sector_code AS code, MAX(si.name) AS name, COUNT(DISTINCT r.stock_code) AS stock_count
+      FROM limit_up_record r
+      LEFT JOIN sector_info si ON si.code = r.sector_code
+      WHERE r.date >= ? AND (${prefixClause})
+      GROUP BY r.sector_code
+      ORDER BY stock_count DESC, r.sector_code ASC
+    `).all(from, ...prefixes).map((row) => ({
+      code: String(row.code),
+      name: String(row.name ?? ''),
+      stockCount: Number(row.stock_count),
     }));
   }
 
@@ -1078,6 +1141,30 @@ export class SqliteStore {
       )
       ORDER BY date ASC
     `).all(blockCode, period, boundedLimit).map((row) => rowToKline(row));
+  }
+
+  /**
+   * 读取指定日期之后所有板块的日线收盘价，供板块轮动页聚合 YTD 曲线。
+   * 返回行按板块、日期升序，调用方直接按 block_code 分组即可。
+   */
+  getBlockPriceHistorySince(startDate: string, endDate: string): BlockPricePoint[] {
+    const start = isoDate(startDate);
+    const end = isoDate(endDate);
+    if (!start || !end) return [];
+    return this.database.prepare(`
+      SELECT block_code, block_name, date, open, high, low, close
+      FROM block_daily_price
+      WHERE period = ? AND date >= ? AND date < ?
+      ORDER BY block_code ASC, date ASC
+    `).all(BLOCK_PERIOD_DAILY, start, end).map((row) => ({
+      block_code: String(row.block_code),
+      block_name: String(row.block_name),
+      date: String(row.date),
+      open: Number(row.open),
+      high: Number(row.high),
+      low: Number(row.low),
+      close: Number(row.close),
+    }));
   }
 
   /** 板块最新已存 K 线日期（按周期）；用于增量采集，避免重复请求。 */

@@ -5,6 +5,7 @@ import { DetailsPage } from './pages/DetailsPage';
 import { HomePage } from './pages/HomePage';
 import { NotFoundPage } from './pages/NotFoundPage';
 import { RankingPage } from './pages/RankingPage';
+import { SectorRotationPage } from './pages/SectorRotationPage';
 import { SimulatedTradingPage } from './pages/SimulatedTradingPage';
 
 export default function App() {
@@ -16,6 +17,7 @@ export default function App() {
         <Route path="ranking" element={<RankingPage />} />
         <Route path="backtest" element={<BacktestPage />} />
         <Route path="simulated-trading" element={<SimulatedTradingPage />} />
+        <Route path="sector-rotation" element={<SectorRotationPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Route>
     </Routes>

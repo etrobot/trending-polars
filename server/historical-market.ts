@@ -529,17 +529,10 @@ export function parseBlockKlines(payload: string | Record<string, unknown>, limi
   return bars.slice(-Math.max(1, Math.trunc(limit)));
 }
 
-export async function fetchBlockKlines(
-  code: string,
-  period: BlockKlinePeriod = '01',
-  limit = 120,
+async function fetchBlockKlineFromUrl(
+  url: string,
+  limit: number,
 ): Promise<{ klines: KLineData[]; source: BlockKlineSource; name?: string }> {
-  const normalizedCode = normalizeBlockCode(code);
-  if (!normalizedCode || !['01', '11', '21'].includes(period)) return { klines: [], source: 'none' };
-  const boundedLimit = Math.min(1000, Math.max(1, Math.trunc(limit)));
-  const url = BLOCK_KLINE_URL
-    .replace('{code}', normalizedCode)
-    .replace('{period}', period);
   try {
     const response = await fetch(url, {
       headers: {
@@ -554,7 +547,7 @@ export async function fetchBlockKlines(
     const end = text.lastIndexOf(')');
     const json = start >= 0 && end > start ? text.slice(start + 1, end) : '';
     const body = json ? JSON.parse(json) as Record<string, unknown> : null;
-    const klines = parseBlockKlines(body ?? text, boundedLimit);
+    const klines = parseBlockKlines(body ?? text, limit);
     return {
       klines,
       source: klines.length ? 'ths-block' : 'none',
@@ -563,6 +556,37 @@ export async function fetchBlockKlines(
   } catch {
     return { klines: [], source: 'none' };
   }
+}
+
+export async function fetchBlockKlines(
+  code: string,
+  period: BlockKlinePeriod = '01',
+  limit = 120,
+): Promise<{ klines: KLineData[]; source: BlockKlineSource; name?: string }> {
+  const normalizedCode = normalizeBlockCode(code);
+  if (!normalizedCode || !['01', '11', '21'].includes(period)) return { klines: [], source: 'none' };
+  const boundedLimit = Math.min(1000, Math.max(1, Math.trunc(limit)));
+  const url = BLOCK_KLINE_URL
+    .replace('{code}', normalizedCode)
+    .replace('{period}', period);
+  return fetchBlockKlineFromUrl(url, boundedLimit);
+}
+
+/**
+ * 同花顺按年日线：`/v4/line/bk_{code}/{period}/{year}.js` 返回该年全部交易日，
+ * 而 `last.js` 只回最近约 140 根 —— 板块轮动需要年初到现在的完整曲线，用这个入口补采。
+ */
+export async function fetchBlockYearKlines(
+  code: string,
+  year: number,
+  period: BlockKlinePeriod = '01',
+): Promise<{ klines: KLineData[]; source: BlockKlineSource; name?: string }> {
+  const normalizedCode = normalizeBlockCode(code);
+  const normalizedYear = Math.trunc(year);
+  if (!normalizedCode || !['01', '11', '21'].includes(period)) return { klines: [], source: 'none' };
+  if (!(normalizedYear >= 1990 && normalizedYear <= 2100)) return { klines: [], source: 'none' };
+  const url = `https://d.10jqka.com.cn/v4/line/bk_${normalizedCode}/${period}/${normalizedYear}.js`;
+  return fetchBlockKlineFromUrl(url, 1000);
 }
 
 // 明确别名，避免调用方把板块指数误接到个股/中证指数的多源接口。
@@ -824,29 +848,34 @@ export async function collectHistoricalMarketData(
   }
 
   // ---- 采集日期范围内每天的 block_top 涨停记录 ----
-  // 如果调用方已传入了现有记录（来自 SQLite），则跳过网络请求。
+  // 如果调用方已传入了现有记录（来自 SQLite），按日期增量补齐：已覆盖的日期复用，缺失的日期才联网。
   const limitUpDates = calendar.slice(-requestedDays);
   const limitUpRecords: HistoricalLimitUpRecord[] = [];
-  let limitUpDaysCollected = 0;
-  let limitUpDaysFailed = 0;
+  const coveredLimitUpDates = new Set<string>();
   if (options.existingLimitUpRecords?.length) {
-    // 过滤出属于回测日期范围的已有记录
     const dateSet = new Set(limitUpDates);
-    const sectorCodesSeen = new Set<string>();
     for (const record of options.existingLimitUpRecords) {
-      if (!dateSet.has(record.date)) continue;
-      if (record.sector_code && /^\d{6}$/.test(record.sector_code)) sectorCodesSeen.add(record.sector_code);
+      const date = compactDate(record.date);
+      if (!dateSet.has(date)) continue;
       limitUpRecords.push(record);
-      limitUpDaysCollected += 1;
+      coveredLimitUpDates.add(date);
     }
-    await audit.info('market_data', 'limit_up_skip_fetch', {
+  }
+  const missingLimitUpDates = limitUpDates.filter((date) => !coveredLimitUpDates.has(date));
+  let limitUpDaysCollected = coveredLimitUpDates.size;
+  let limitUpDaysFailed = 0;
+  if (missingLimitUpDates.length) {
+    await audit.info('market_data', 'limit_up_incremental_fetch', {
       traceId: options.traceId,
-      data: { dates_requested: limitUpDates.length, records_loaded: limitUpRecords.length, dates_with_data: limitUpDaysCollected },
+      data: {
+        dates_requested: limitUpDates.length,
+        dates_reused: coveredLimitUpDates.size,
+        dates_missing: missingLimitUpDates.length,
+      },
     });
-  } else {
-    for (let i = 0; i < limitUpDates.length; i += 1) {
+    for (let i = 0; i < missingLimitUpDates.length; i += 1) {
       if (options.cancelled?.()) break;
-      const date = limitUpDates[i];
+      const date = missingLimitUpDates[i];
       try {
         const { blocks } = await fetchBlockTop(date);
         if (blocks.length) {
@@ -874,8 +903,13 @@ export async function collectHistoricalMarketData(
       } catch {
         limitUpDaysFailed += 1;
       }
-      options.progress?.(universe.length + i + 1, universe.length + limitUpDates.length, `采集涨停记录 ${i + 1}/${limitUpDates.length}`);
+      options.progress?.(universe.length + i + 1, universe.length + missingLimitUpDates.length, `采集涨停记录 ${i + 1}/${missingLimitUpDates.length}（${date}）`);
     }
+  } else if (options.existingLimitUpRecords?.length) {
+    await audit.info('market_data', 'limit_up_skip_fetch', {
+      traceId: options.traceId,
+      data: { dates_requested: limitUpDates.length, records_loaded: limitUpRecords.length },
+    });
   }
   await audit.info('market_data', 'limit_up_collection_done', {
     traceId: options.traceId,
@@ -883,27 +917,27 @@ export async function collectHistoricalMarketData(
   });
 
   // ---- 采集出现过的板块指数日/周/月线（用于回测滚动计算板块趋势） ----
-  // 如果调用方已传入了现有板块 K 线，则跳过网络请求。
+  // 如果调用方已传入了现有板块 K 线，只复用已覆盖的板块，新出现的板块仍会联网补齐。
   const sectorCodes = limitUpRecords.length
     ? [...new Map(limitUpRecords.map((r) => [r.sector_code, r.sector_name])).entries()]
       .filter(([code]) => code && /^\d{6}$/.test(code)) as Array<[string, string | undefined]>
     : [];
   const blockSeries: HistoricalBlockSeries[] = [];
   let blocksCollected = 0;
-  if (options.existingBlockSeries?.length) {
-    const existingByCode = new Map(options.existingBlockSeries.map((b) => [b.block_code, b]));
-    for (const [code] of sectorCodes) {
-      const existing = existingByCode.get(code);
-      if (existing) {
-        blockSeries.push(existing);
-        blocksCollected += 1;
-      }
+  const existingByCode = new Map((options.existingBlockSeries ?? []).map((block) => [block.block_code, block]));
+  const pendingSectors = sectorCodes.filter(([code]) => !existingByCode.has(code));
+  for (const [code] of sectorCodes) {
+    const existing = existingByCode.get(code);
+    if (existing) {
+      blockSeries.push(existing);
+      blocksCollected += 1;
     }
-    await audit.info('market_data', 'block_kline_skip_fetch', {
+  }
+  if (pendingSectors.length) {
+    await audit.info('market_data', 'block_kline_incremental_fetch', {
       traceId: options.traceId,
-      data: { sectors_total: sectorCodes.length, blocks_loaded: blocksCollected },
+      data: { sectors_total: sectorCodes.length, blocks_reused: blocksCollected, blocks_missing: pendingSectors.length },
     });
-  } else {
     const toBars = (klines: KLineData[]): HistoricalBar[] => klines.map((k): HistoricalBar => [
       compactDate(k.date),
       k.open,
@@ -914,9 +948,9 @@ export async function collectHistoricalMarketData(
       k.amount,
       k.changeRate ?? 0,
     ]);
-    for (let i = 0; i < sectorCodes.length; i += 1) {
+    for (let i = 0; i < pendingSectors.length; i += 1) {
       if (options.cancelled?.()) break;
-      const [code, name] = sectorCodes[i];
+      const [code, name] = pendingSectors[i];
       try {
         // 周/月线拉少量即可（趋势判断只需要 14 根以上的预热）。
         const [dailyRes, weeklyRes, monthlyRes] = await Promise.all([
@@ -937,8 +971,13 @@ export async function collectHistoricalMarketData(
       } catch {
         // 单个板块失败不影响整体
       }
-      options.progress?.(universe.length + limitUpDates.length + i + 1, universe.length + limitUpDates.length + sectorCodes.length, `采集板块K线 ${i + 1}/${sectorCodes.length}`);
+      options.progress?.(universe.length + limitUpDates.length + i + 1, universe.length + limitUpDates.length + pendingSectors.length, `采集板块K线 ${i + 1}/${pendingSectors.length}`);
     }
+  } else if (options.existingBlockSeries?.length) {
+    await audit.info('market_data', 'block_kline_skip_fetch', {
+      traceId: options.traceId,
+      data: { sectors_total: sectorCodes.length, blocks_loaded: blocksCollected },
+    });
   }
   await audit.info('market_data', 'block_kline_collection_done', {
     traceId: options.traceId,

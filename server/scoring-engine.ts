@@ -1186,6 +1186,11 @@ export function scoreStock(
     sector_trend_state_id: sector?.stateId,
     latest_price: latest.close,
     latest_change_rate: latest.changePct,
+    // 买入信号过滤（trading-strategy.rankEntryCandidates）依赖这些字段：
+    // 只保留 收盘 > MA3 > MA5 > MA20 的多头排列。
+    ma3: movingAverage(series.bars, endIndex, 3),
+    ma5: movingAverage(series.bars, endIndex, 5),
+    ma20: movingAverage(series.bars, endIndex, 20),
   };
 }
 

@@ -295,6 +295,26 @@ export class DataStore {
     return this.sqlite.getBlockPrices(blockCode, limit, period);
   }
 
+  /** 指定年份区间内全部板块的日线收盘价，用于板块轮动 YTD 曲线。 */
+  async getBlockPriceHistory(startDate: string, endDate: string) {
+    return this.sqlite.getBlockPriceHistorySince(startDate, endDate);
+  }
+
+  /** 区间内涨停涉及的行业板块，用于板块轮动补齐年线。 */
+  async getIndustryLimitUpSectors(startDate: string, endDate: string) {
+    return this.sqlite.getIndustryLimitUpSectors(startDate, endDate);
+  }
+
+  /** 最近 N 个交易日涨停涉及的板块（按代码段过滤），用于「涨停基准」聚类与补采。 */
+  async getRecentLimitUpSectors(tradingDays: number, prefixes: readonly string[]) {
+    return this.sqlite.getRecentLimitUpSectors(tradingDays, prefixes);
+  }
+
+  /** 区间内涨停涉及的板块（按代码段过滤），用于「今年全年涨停基准」。 */
+  async getLimitUpSectorsBetween(startDate: string, endDate: string, prefixes: readonly string[]) {
+    return this.sqlite.getLimitUpSectorsBetween(startDate, endDate, prefixes);
+  }
+
   async upsertBlockPrices(blockCode: string, blockName: string, klines: KLineData[], period: BlockPeriod = BLOCK_PERIOD_DAILY): Promise<number> {
     return this.sqlite.upsertBlockPrices(blockCode, blockName, klines, period);
   }
