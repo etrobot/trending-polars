@@ -2,9 +2,10 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express, { type NextFunction, type Request, type Response } from 'express';
-import { AuditLogger } from './audit-log.js';
+import { AuditLogger, type AuditLoggerLike } from './audit-log.js';
 import { DataStore } from './data-store.js';
-import { ThsSimulatedBroker, ThsSimulatedBrokerError } from './ths-simulated-broker.js';
+import { ThsSimulatedBroker, ThsSimulatedBrokerError, type SimulatedBroker } from './ths-simulated-broker.js';
+import { ThsWebSimulatedBroker } from './ths-web-broker.js';
 import { ThsLifecycle } from './ths-lifecycle.js';
 import { PaperTradingService } from './paper-trading.js';
 import { refreshTradingCalendar } from './index-bootstrap.js';
@@ -21,11 +22,16 @@ export interface AppServices {
   audit: AuditLogger;
 }
 
+function createBroker(audit: AuditLoggerLike): SimulatedBroker {
+  if (process.env.THS_BROKER_MODE === 'web') return new ThsWebSimulatedBroker({ audit });
+  return new ThsSimulatedBroker({ audit });
+}
+
 export function createApp(services: Partial<AppServices> = {}) {
   const store = services.store ?? new DataStore();
   const audit = services.audit ?? new AuditLogger(path.join(store.runtime, 'logs'));
   const tasks = services.tasks ?? new TaskRegistry(audit);
-  const paper = services.paper ?? new PaperTradingService(new ThsSimulatedBroker({ audit }), {
+  const paper = services.paper ?? new PaperTradingService(createBroker(audit), {
     stateStore: {
       load: () => store.getPaperTradingState(),
       save: (state) => store.savePaperTradingState(state),
