@@ -212,6 +212,21 @@
 
 `data/runtime/optimize-result.json` 保存最近一次参数优化完整结果（`ParamOptimizeResult`），可通过 `GET /api/backtest/optimize-result` 读取。内容包含阶段 1 评分配置、阶段 2 交易参数、验证指标、基线对比等（详见 `logic.md` §3.4 输出结构）。
 
+### 3.3 挖掘产物落库（P4/P5）—— `server/pipeline/store.ts`
+
+策略挖掘产物以**文件**形式落在独立目录 `server/data/mining/`（gitignore，不进 SQLite、不进交易链路），凭 `runId` 可复现：
+
+| 路径 | 内容 |
+|------|------|
+| `runs/<runId>.json` | `MiningRun`：创建时间、`codeVersion`（git commit hash）、`dataVersion`（最后交易日 + 校验摘要）、标的池、启用子策略、完整配置、status（success/failed + error）、数据质量报告 |
+| `results/<runId>.json` | `MiningResult[]`：参数组合、样本内/样本外指标（P1 统一口径）、稳定性得分、样本外交易笔数与区间、排名、unstable 标记 |
+| `reports/<runId>.html` / `.json` | `MiningReport`：质量报告、warnings、验证段拼接的整体指标、候选列表、摩擦校准（如有） |
+| `calibration/<runId>.json` | P5 摩擦校准：实测不利滑点率、未成交率、撤单率，下一轮挖掘读取最新一条覆盖回测默认滑点 |
+| `instances/<instanceId>.json` | P5 下发实例配置：来源 `runId + rank`、操作人、参数、标的池、资金上限、`channel: 'simulated'` |
+| `instances/<instanceId>/state.json` | 实例独立运行状态（含指令），与生产 `paper_trading` 状态完全分离 |
+
+**数据质量门槛**（`quality.ts`，开跑前校验，未通过则运行失败而非带病继续）：行情连续性覆盖率 ≥ 80%、涨停记录覆盖率 ≥ 60%、行情必须为前复权；缺口明细（缺失交易日、除权问题、涨停缺失日）写入 `DataQualityReport.gaps`，不静默跳过。
+
 ---
 
 ## 4. SQLite 运维

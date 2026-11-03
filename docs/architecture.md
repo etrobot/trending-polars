@@ -34,11 +34,29 @@
                             止盈止损 & 计划刷新
 ```
 
+**策略挖掘闭环（P1–P5）**：
+
+```
+统一绩效指标(P1) + 买入子策略注册表(P2)
+        │
+        ▼
+walk-forward 滚动参数搜索 + 稳定性分析(P3)
+        │
+        ▼
+挖掘流水线「补数→搜索→验证→报告」落库(P4)
+        │  一键下发（runId + 排名，显式确认）
+        ▼
+独立模拟交易实例执行(P5，仅模拟通道)
+        │  成交/撤单回写 → 滑点/未成交率/撤单率
+        ▼
+摩擦校准数据回馈下一轮挖掘（P3/P4 读取）
+```
+
 **核心逻辑**：指数定仓位 → 情绪定买卖 → 个股定标的 → 回测定参数 → 计划定执行
 
 **技术栈**：TypeScript + Node.js 22.13+ · Express 5 · React 19 · Tailwind CSS 4 · nodejs-polars · `node:sqlite` · WebSocket (ws) · AppleScript 桥接
 
-**数据库版本**：v18（`block_daily_price`、`paper_instruction` 表，`limit_up_record` 去冗余列，`sector_trend_daily.state_id` 允许 0/state_id=8「筑底成功」合法）
+**数据库版本**：`SCHEMA_VERSION=20`（`block_daily_price`、`paper_instruction` 表，`limit_up_record` 去冗余列，`sector_trend_daily.state_id` 允许 0/state_id=8「筑底成功」合法）。策略挖掘产物（P4/P5）以文件形式落 `server/data/mining/`，SQLite 未新增表。
 
 ---
 
@@ -62,7 +80,19 @@
 | 排行配置 | `server/ranking-config.ts` | `RankingRuntimeConfig`（因子权重 + 评分配置 + 回测来源）；从回测结果提取配置、默认配置生成 |
 | 向量化回测评分 | `server/backtest-scoring.ts` | 单次 Polars 遍历计算全量股票×日期评分矩阵，替代逐日逐股 `scoreStock` 循环 |
 | 基准指数对照 | `server/benchmark.ts` | 从搜狐获取指数日线，归一化生成与回测叠加的 benchmark 净值曲线 |
-| 交易策略 | `server/trading-strategy.ts` | 参数配置、选股过滤、仓位计算、止盈止损；不负责涨停判定 |
+| 交易策略 | `server/trading-strategy.ts` | 参数配置、选股过滤、仓位计算、止盈止损；`rankEntryCandidates()` 经 P2 子策略注册表聚合候选；不负责涨停判定 |
+| 统一绩效指标 | `server/metrics/performance.ts` | P1 `computeMetrics()`/`splitSample()`；回测/参数优化/模拟交易共用同一口径；年化系数 252、`minTradeCount=20` 统计门槛 |
+| 指标适配层 | `server/metrics/adapters.ts` | P1 把回测成交、模拟指令统一转成 `PerformanceTrade`；含 FIFO 成本还原卖出已实现盈亏 |
+| 子策略注册表 | `server/strategies/registry.ts` | P2 `registerStrategy()/listStrategies()`；内置 `ma-trend`、`breakout-20d`；候选合并（max/weighted）与板块轮动加权 |
+| 入场规则 | `server/strategies/entry-rules.ts` | P2 子策略评估实现（多头排列 / 20 日新高突破） |
+| Walk-forward | `server/optimize/walkforward.ts` | P3 滚动窗口参数搜索 + 邻域稳定性得分；窗口 250 / 步长 60 / 训练段 70% |
+| Walk-forward 执行器 | `server/optimize/walkforward-runner.ts` | P3 在真实回测上下文上执行；默认网格 maxHoldDays × 止盈 × 止损 |
+| 挖掘流水线 | `server/pipeline/mine.ts` | P4 「质量检查→walk-forward→报告→落库」一键编排；CLI `tsx server/pipeline/mine.ts [days]` |
+| 挖掘落库 | `server/pipeline/store.ts` | P4 `server/data/mining/` 下 runs/results/reports/calibration 文件存储 |
+| 数据质量 | `server/pipeline/quality.ts` | P4 开跑前校验：行情连续性 ≥80%、涨停覆盖 ≥60%、必须前复权 |
+| 候选下发 | `server/pipeline/deploy.ts` + `instance.ts` | P5 `runId + rank` → 独立模拟交易实例（显式确认、仅模拟通道、状态/审计/队列隔离） |
+| 摩擦校准 | `server/pipeline/friction.ts` | P5 实测滑点/未成交率/撤单率统计，回写为下一轮挖掘的校准输入 |
+| 验证报告 | `server/pipeline/validation.ts` + `report.ts` + `replay.ts` | P5 样本外预测 vs 模拟实盘对比（偏差 >30% 标记）；P4 HTML/JSON 报告；按 runId 复现 |
 | 回测引擎 | `server/backtest-engine.ts` | `runPolarsBacktest`/`runRandomizedBacktest`；导出 `prepareBacktestContext` / `quickSimulateBacktest` 供参数优化复用 |
 | 参数优化 | `server/backtest-param-optimizer.ts` | 两阶段优化：先校准 `scoreStock` 评分参数，再网格搜索回测交易参数，目标为完整回测收益 |
 | 模拟交易 | `server/paper-trading.ts` | 交易计划、执行、调度、监控；`applyBacktestStrategy()` 从回测结果应用策略参数 |
@@ -113,6 +143,7 @@ const closes = bars.slice(0, barIndex + 1).map((bar) => bar.close);
 | 排行配置 | `ranking-config.json` | 因子权重 + 评分配置 + 回测来源，可从优化结果回填 |
 | 优化结果 | `optimize-result.json` | 最近一次参数优化完整结果 |
 | 状态文件 | 自动化状态、交易日志 | 持久化，跨重启 |
+| 挖掘产物 | `server/data/mining/`：runs / results / reports / calibration / instances | 文件落库，不进交易链路，凭 runId 可复现 |
 | 内存字典 | 回测预加载 | 回测期间 |
 
 ### 3.4 限流保护

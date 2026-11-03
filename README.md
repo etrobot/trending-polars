@@ -14,7 +14,7 @@
 |------|------|
 | [架构设计](docs/architecture.md) | 流程总览、模块一览、设计原则 |
 | [数据层](docs/data.md) | 数据采集、因子存储、SQLite 运维、审计日志 |
-| [业务逻辑](docs/logic.md) | 趋势分析、多因子评分、策略回测、交易计划、自动化调度 |
+| [业务逻辑](docs/logic.md) | 趋势分析、多因子评分、策略回测、交易计划、自动化调度、策略挖掘流水线（P1–P5） |
 | [交互层](docs/interaction.md) | 同花顺执行、持仓监控、API 速查、WebSocket、问题排查 |
 | [数据表结构](ref-data-structure.md) | SQLite 表设计、关系、迁移、缓存策略 |
 
@@ -62,9 +62,14 @@ trending-polars/
 │   ├── benchmark.ts             # 基准指数对照曲线（搜狐数据源）
 │   ├── paper-trading.ts         # 模拟交易：计划 / 执行 / 调度 / 监控 / applyBacktestStrategy
 │   ├── paper-trading/helpers.ts # 时钟、判断、状态机纯函数
-│   ├── trading-strategy.ts      # 选股 / 仓位 / 止盈止损
+│   ├── trading-strategy.ts      # 选股 / 仓位 / 止盈止损；rankEntryCandidates 经子策略注册表聚合候选
+│   ├── metrics/                 # P1 统一绩效指标：computeMetrics / splitSample / 三路径成交适配
+│   ├── strategies/              # P2 买入子策略注册表（ma-trend / breakout-20d）+ 板块轮动加权
+│   ├── optimize/                # P3 walk-forward 滚动参数搜索 + 邻域稳定性分析
+│   ├── pipeline/                # P4/P5 挖掘流水线：质量检查 / 落库 / 复现 / 下发 / 摩擦校准 / 验证报告
 │   ├── historical-market.ts     # 行情采集
 │   ├── ths-simulated-broker.ts  # 同花顺 AppleScript 桥接（含 K 线报价回退）
+│   ├── ths-web-broker.ts        # 同花顺 Web 模拟盘 broker（cgiwt 接口，串行队列 + 重试回查）
 │   ├── audit-log.ts             # JSONL 审计日志
 │   ├── tasks.ts                 # 异步任务管理 / WebSocket 广播
 │   ├── format.ts                # 日期 / 数字工具函数

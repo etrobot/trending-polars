@@ -992,3 +992,105 @@ ThsLifecycle.ensureReady(reason, { timeoutMs })
 - `completed_windows` 记录已触发窗口，防重启重复触发
 - `paused_today` 暂停当天剩余窗口
 - 服务重启时，`submitting` 状态的指令自动标记为 `uncertain`，需人工核对
+
+---
+
+## 6. 策略挖掘流水线（P1–P5）
+
+> 目标：把「参数优化」从全区间网格搜索升级为**统一指标口径 + 样本外验证 + 稳定性分析 + 落库复现 + 模拟盘联动校准**的完整闭环。
+> 相关模块：`server/metrics/`、`server/strategies/`、`server/optimize/`、`server/pipeline/`。
+
+### 6.1 P1 统一绩效指标 —— `server/metrics/performance.ts` + `adapters.ts`
+
+回测、参数优化、模拟交易三条路径此前各自计算收益/回撤，口径漂移。现统一由 `computeMetrics()` 输出：
+
+```typescript
+interface PerformanceMetrics {
+  annualReturn; maxDrawdown; sharpe; winRate;
+  profitFactor; tradeCount; turnover; // 夏普为日频年化，系数 TRADING_DAYS_PER_YEAR=252
+}
+```
+
+- **样本内外切分**：`splitSample(range, inRatio = 0.7)` 按时间轴前 70% 样本内、后 30% 样本外，`evaluatePerformance()` 对每个参数组合并列输出两套指标
+- **统计门槛**：`DEFAULT_MIN_TRADE_COUNT = 20`，样本外交易笔数不足的组合标记 `insufficient: true`，不参与排名
+- **适配层**（`adapters.ts`）：回测成交与模拟交易指令（仅 `filled`）统一转成 `PerformanceTrade`；`paperPnlBySellInstruction()` 用 FIFO 成本还原卖出已实现盈亏
+
+### 6.2 P2 买入子策略注册表 —— `server/strategies/`
+
+`rankEntryCandidates()` 仍是**唯一买入信号入口**，内部改为经注册表聚合：
+
+1. 遍历启用的子策略收集候选（`EntrySubStrategy { id, name, weight, evaluate(ctx) }`，纯函数、异常隔离）
+2. 合并去重：同股多策略命中按 `max` / `weighted` 规则合分（`mergeCandidates()`）
+3. 全局硬过滤（涨跌停校验、流动性下限等）
+4. 可选板块轮动加权：`applySectorRotationWeight()` 按 `sectorScore − 50` 调整分数，`enabledSectorRotationWeightPct` 开关，关闭时不影响排序
+5. 排序输出，并回填 `entry_strategy_id` / `entry_reasons` 审计字段（与模拟交易下单链路贯通）
+
+**内置子策略**（模块加载时自动注册）：
+
+| id | 规则 | 说明 |
+|----|------|------|
+| `ma-trend` | 收盘 > MA3 > MA5 > MA20 | 多头排列，与迁移前行为一致（回归单测锁定）；默认仅启用它 |
+| `breakout-20d` | 收盘创 20 日新高 | 示例子策略，验证插件化接入 |
+
+新增策略只需 `registerStrategy()`，无需改任何调用方。
+
+### 6.3 P3 walk-forward 参数搜索 + 稳定性分析 —— `server/optimize/`
+
+`walkforward.ts` 为纯框架（求值器注入），`walkforward-runner.ts` 接到真实回测上下文：
+
+- **滚动窗口**：`windowSize=250`、`stepSize=60`、`trainRatio=0.7`（交易日）；每窗口训练段网格搜索取最优，验证段记录样本外表现
+- **默认网格**（48 组合）：`maxHoldDays [3,5,7,10] × takeProfitPct [10,15,20,25] × stopLossPct [-5,-8,-12]`
+- **稳定性得分**：`stabilityScore = 邻域样本外夏普均值 / (1 + 邻域标准差)`（邻域 = 每维 ±1 步）
+- **悬崖判定**：自身夏普高出邻域均值 `cliffThreshold=0.5` **且** 达到邻域均值 `cliffRatio=2` 倍 → 标记 `unstable`，排序分降权取邻域均值
+- **排序**：主键样本外夏普（各窗口验证段拼接），次键稳定性得分；窗口数 < 4 时报告提示统计意义有限
+- **可复现**：固定随机源 `randomSeed=20240101` 仅用于并列 tie-break
+
+### 6.4 P4 挖掘流水线与落库 —— `server/pipeline/`
+
+`runMiningPipeline()` 按序执行，任一环节失败即中止并把 `status='failed'` + 错误原因落库：
+
+```
+1. 数据质量检查（quality.ts）
+   ├─ 行情连续性覆盖率 ≥ 80%、涨停记录覆盖率 ≥ 60%、必须前复权
+   └─ 缺口明细写入 DataQualityReport（priceGaps / adjustmentIssues / limitUpMissingDates），不静默跳过
+2. walk-forward 参数搜索（复用 P3 + P1 指标）
+3. 样本外验证汇总（aggregate = 各窗口验证段拼接）
+4. 报告生成（report.ts 渲染 HTML + JSON）并落库
+```
+
+**落库结构**（文件存储，独立目录 `server/data/mining/`，不进交易链路）：
+
+| 路径 | 内容 |
+|------|------|
+| `runs/<runId>.json` | `MiningRun`：runId、`codeVersion`（git commit）、`dataVersion`（最后交易日+校验摘要）、universe、strategies、完整 config、status、quality |
+| `results/<runId>.json` | `MiningResult[]`：params、inSample/outOfSample 指标、stabilityScore、tradeCount、rank、unstable、outOfSampleDays/Range |
+| `reports/<runId>.html/.json` | `MiningReport`：含 warnings、aggregate、calibration |
+| `calibration/*.json` | P5 摩擦校准数据 |
+| `instances/<instanceId>/` | P5 下发实例配置与 state.json |
+
+**触发方式**：
+
+- CLI 一键挖掘：`tsx server/pipeline/mine.ts [days]`（days 默认 250；股票池取当前排行截面）
+- API：`GET /api/mining/runs`、`GET /api/mining/runs/:runId`、`GET /api/mining/runs/:runId/report.html`
+- 复现：`POST /api/mining/runs/:runId/replay`（异步任务；按原配置重跑，行情覆盖不足时自动补采）
+
+`runId` 贯穿「挖掘 → 报告 → 下发 → 验证 → 审计日志」，是同一标识体系。
+
+### 6.5 P5 模拟交易联动验证闭环 —— `deploy.ts` / `instance.ts` / `friction.ts` / `validation.ts`
+
+**下发**（`POST /api/mining/deploy`）：以 `runId + rank` 选定候选参数，创建**独立**模拟交易实例。硬约束：
+
+- 必须带 `operator`（操作人）与 `confirmation`（必须等于 runId），防误点下发
+- `channel` 写死 `'simulated'`，只接受 THS 模拟 broker，杜绝真实资金接入
+- 实例与生产模拟交易完全隔离：独立状态文件（`instances/<instanceId>/state.json`）、独立审计 component（`mining_instance:<id>`）、独立串行队列
+- 可选覆盖 universe / capitalLimit（默认 100,000 元）/ strategyIds；信号链路仍走 `rankEntryCandidates`，仅注入下发参数与策略集，审计追加 `applied_mining_run_id`
+
+**摩擦统计**（`friction.ts`）：从实例委托记录还原三类实测摩擦 ——
+
+- 不利滑点率：买入 `(成交价−信号价)/信号价`、卖出反向，正数表示吃亏（`avgSlippagePct` / `maxSlippagePct`）
+- 未成交率（expired/failed ÷ 已提交）、撤单率；pending/skipped 从未出手不计入分母
+- 回写为 `FrictionCalibration`，供下一轮挖掘（P3/P4）读取计入实测滑点
+
+**验证报告**（`GET /api/mining/instances/:instanceId/validation`）：样本外预测 vs 模拟实盘实测，对比收益、回撤、胜率、交易频率（笔/日）；偏差 `> DEFAULT_DEVIATION_THRESHOLD = 0.3` 标记超标并列出可能原因（滑点/流动性/信号延迟）；实测样本 < `MIN_MEANINGFUL_TRADE_COUNT = 20` 笔时提示统计意义有限。
+
+**THS Web 通道**（`server/ths-web-broker.ts`）：委托/成交/撤单结果按既有解析逻辑落库（`d_2105` 状态字段、收盘后「未成交」语义、撤单「全部撤单」语义）；cookie 失效时实例进入暂停态并告警，不自动重试登录。

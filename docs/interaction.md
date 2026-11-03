@@ -353,6 +353,21 @@ POST /api/simulated-trading/strategy/apply-backtest  # 从回测结果应用策�
                                                      # body: { run_id: string }
                                                      # 返回: { ok, run_id, strategy, plan, ranking, ranking_recomputed, ranking_message }
 
+# ==== 策略挖掘（P4/P5）====
+# CLI 一键挖掘：补数 → walk-forward → 报告 → 落库（days 默认 250）
+#   tsx server/pipeline/mine.ts [days]
+GET /api/mining/runs                       # 挖掘批次列表（run_id/code_version/data_version/状态/候选数）
+GET /api/mining/runs/:runId                # 批次详情：run + results + report
+GET /api/mining/runs/:runId/report.html    # HTML 挖掘报告
+POST /api/mining/runs/:runId/replay        # 按原配置复现（202 异步任务；body: { days? }）
+GET /api/mining/calibration                # 摩擦校准列表（latest = 最近一轮实测滑点/未成交率/撤单率）
+POST /api/mining/deploy                    # 下发候选为独立模拟交易实例（201）
+                                           # body: { runId, rank, operator, confirmation: <必须等于 runId>,
+                                           #        universe?, capitalLimit?, strategyIds? }
+GET /api/mining/instances                  # 下发实例列表
+GET /api/mining/instances/:instanceId      # 实例配置 + 运行状态
+GET /api/mining/instances/:instanceId/validation  # 验证报告：样本外预测 vs 模拟实盘 + 摩擦统计
+
 # ==== 审计日志 ====
 GET /api/audit/logs?level=error&component=paper_trading
 GET /api/audit/files
