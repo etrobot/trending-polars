@@ -170,6 +170,12 @@ export interface RankingRow {
   sector_name?: string;
   sector_trend_name?: string;
   sector_trend_state_id?: number;
+  /** 板块轮动评分（0-100，越高越强势）；供 P2 板块轮动加权层使用。 */
+  sector_rotation_score?: number;
+  /** P2：命中买入信号的子策略 id。 */
+  entry_strategy_id?: string;
+  /** P2：命中买入信号的原因列表。 */
+  entry_reasons?: string[];
   continue_num?: number;
   reason_type?: string;
   [key: string]: unknown;
@@ -229,6 +235,27 @@ export interface EquityPoint {
   positions_value?: number;
 }
 
+/**
+ * 统一指标模块输出（P1）。
+ * 回测、参数优化、模拟交易共用同一口径。
+ */
+export interface BacktestMetrics {
+  /** 年化收益率（%）。 */
+  annualReturn: number;
+  /** 最大回撤（%，负数）。 */
+  maxDrawdown: number;
+  /** 夏普比率（日频年化，系数 252）。 */
+  sharpe: number;
+  /** 胜率（%，0-100）。 */
+  winRate: number;
+  /** 盈亏比。 */
+  profitFactor: number;
+  /** 已平仓交易笔数。 */
+  tradeCount: number;
+  /** 换手率（倍）。 */
+  turnover: number;
+}
+
 export interface BacktestResult {
   run_id: string;
   timestamp: string;
@@ -251,6 +278,7 @@ export interface BacktestResult {
     expire_count: number;
     max_holdings: number;
     max_drawdown_pct?: number;
+    metrics?: BacktestMetrics;
   };
   config: Record<string, number | string | null>;
   trades: BacktestTrade[];
@@ -334,6 +362,8 @@ export interface PaperOverview {
     positions: PaperPosition[];
     orders: PaperOrder[];
     pnl_summary: { amount: number; pct: number };
+    /** 统一指标模块输出（P1），口径与回测一致。 */
+    metrics?: BacktestMetrics;
   };
   plan: {
     target_position_pct: number;
@@ -387,6 +417,12 @@ export interface PaperStrategyInstruction {
   rank?: number;
   /** 信号日总分（100 分制）；执行时按同一评分缩放仓位，避免计划与成交口径不一致。 */
   signal_score?: number;
+  /** 命中该信号的子策略 id（P2 子策略注册机制），多策略命中时以 `+` 连接。 */
+  entry_strategy_id?: string;
+  /** 命中原因说明（P2），用于审计与前端展示。 */
+  entry_reasons?: string[];
+  /** 来源挖掘批次 id（P5），把模拟交易指令与挖掘 runId 关联起来。 */
+  run_id?: string;
   reason: string;
   execution_window?: PlanExecutionWindow;
   status: StrategyInstructionStatus;
@@ -511,5 +547,9 @@ export interface PaperTradingRuntimeState {
   last_signal_date?: string;
   strategy_config?: PaperStrategyConfigSnapshot;
   applied_backtest_run_id?: string;
+  /** P5：当前生效的挖掘批次 id（下发候选参数后写入）。 */
+  applied_mining_run_id?: string;
+  /** P5：下发实例指定的启用子策略集合。 */
+  entry_strategy_ids?: string[];
   updated_at: string;
 }

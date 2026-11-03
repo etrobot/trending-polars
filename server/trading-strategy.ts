@@ -2,6 +2,17 @@ import pl from 'nodejs-polars';
 import type { RankingRow } from '../src/types.js';
 import { round } from './format.js';
 import { positionRatioForScore } from './scoring-engine.js';
+import {
+  applySectorRotationWeight,
+  enabledSectorRotationWeightPct,
+  enabledStrategyIds,
+  mergeCandidates,
+  resolveStrategies,
+  sectorRotationWeightingFromRows,
+  type EntryCandidate,
+  type EntrySubStrategy,
+  type StrategyContext,
+} from './strategies/registry.js';
 
 export interface T1StrategyConfig {
   maxHoldDays: number;
@@ -80,6 +91,38 @@ export function strategyFromBacktestConfig(
   return overrides;
 }
 
+/**
+ * 挖掘参数（camelCase，来自 P4 的 MiningResult.params）→ T1StrategyConfig 覆盖项。
+ *
+ * 与 `strategyFromBacktestConfig` 并列：后者吃回测库里的 snake_case 配置，
+ * 这里吃挖掘流水线产出的候选参数。未知键与非有限值一律忽略。
+ */
+export function miningParamsToStrategyConfig(
+  params: Record<string, number>,
+): Partial<T1StrategyConfig> {
+  const overrides: Partial<T1StrategyConfig> = {};
+  const maxHoldDays = Number(params.maxHoldDays);
+  const maxPositions = Number(params.maxPositions);
+  const positionSizePct = Number(params.positionSizePct);
+  const takeProfitPct = Number(params.takeProfitPct);
+  const stopLossRaw = Number(params.stopLossPct);
+  const minEntryScore = Number(params.minEntryScore);
+  const maxCandidates = Number(params.maxCandidates);
+  const maxEntriesPerDay = Number(params.maxEntriesPerDay);
+
+  if (Number.isFinite(maxHoldDays) && maxHoldDays > 0) overrides.maxHoldDays = Math.trunc(maxHoldDays);
+  if (Number.isFinite(maxPositions) && maxPositions > 0) overrides.maxPositions = Math.trunc(maxPositions);
+  if (Number.isFinite(positionSizePct) && positionSizePct > 0) overrides.positionSizePct = Math.trunc(positionSizePct);
+  if (Number.isFinite(takeProfitPct) && takeProfitPct > 0) overrides.takeProfitPct = Math.trunc(takeProfitPct);
+  if (Number.isFinite(stopLossRaw) && stopLossRaw !== 0) {
+    overrides.stopLossPct = stopLossRaw > 0 ? -Math.abs(Math.trunc(stopLossRaw)) : Math.trunc(stopLossRaw);
+  }
+  if (Number.isFinite(minEntryScore) && minEntryScore >= 0) overrides.minEntryScore = Math.trunc(minEntryScore);
+  if (Number.isFinite(maxCandidates) && maxCandidates > 0) overrides.maxCandidates = Math.trunc(maxCandidates);
+  if (Number.isFinite(maxEntriesPerDay) && maxEntriesPerDay > 0) overrides.maxEntriesPerDay = Math.trunc(maxEntriesPerDay);
+  return overrides;
+}
+
 export function serializeStrategyConfig(config: T1StrategyConfig) {
   return {
     maxHoldDays: config.maxHoldDays,
@@ -97,44 +140,107 @@ export function serializeStrategyConfig(config: T1StrategyConfig) {
  *
  *   收盘价 > MA3 > MA5 > MA20
  *
- * 即价格站在 MA3 之上、且短中周期均线依次上抬；不满足该排列的买入信号一律排除。
- * 任一均线缺失（例如旧排行快照没有 ma5/ma20）时无法确认排列，按不通过处理。
+ * 实现位于 strategies/entry-rules.ts，这里重新导出以保持既有对外 API 不变。
  */
-export function passesMaAlignmentEntryRule(
-  signalPrice: number | null | undefined,
-  ma3: number | null | undefined,
-  ma5: number | null | undefined,
-  ma20: number | null | undefined,
-): boolean {
-  const price = Number(signalPrice);
-  const ma3Value = Number(ma3);
-  const ma5Value = Number(ma5);
-  const ma20Value = Number(ma20);
-  if (![price, ma3Value, ma5Value, ma20Value].every(Number.isFinite)) return false;
-  if (price <= 0 || ma3Value <= 0 || ma5Value <= 0 || ma20Value <= 0) return false;
-  return price > ma3Value && ma3Value > ma5Value && ma5Value > ma20Value;
+export { passesMaAlignmentEntryRule } from './strategies/entry-rules.js';
+
+/** rankEntryCandidates 的可选扩展参数。 */
+export interface EntryCandidateOptions {
+  /** 启用的子策略 id 列表；缺省读取环境变量（默认仅 ma-trend）。 */
+  strategyIds?: string[];
+  /** 分数合成规则，默认 max。 */
+  scoreMergeRule?: 'max' | 'weighted';
+  /** 板块轮动加权层，缺省关闭。 */
+  sectorRotation?: import('./strategies/registry.js').SectorRotationWeighting | null;
 }
 
+/**
+ * 买入信号生成的**唯一入口**（所有回测 / 参数优化 / 模拟交易路径都必须经过这里）。
+ *
+ * 内部流程（P2 子策略注册机制）：
+ * 1. 遍历启用的子策略收集候选（单策略异常隔离，不影响整体信号生成）；
+ * 2. 合并去重（同股多策略命中时按配置规则合成分数）；
+ * 3. 应用全局硬过滤（入场总分下限）；
+ * 4. 应用可选的板块轮动加权（关闭时不影响排序结果）；
+ * 5. 按分数排序输出前 N。
+ *
+ * 未配置 `ENTRY_STRATEGIES` 时仅启用 `ma-trend`，其判定与得分完全沿用改动前口径，
+ * 因此输出与改动前逐条一致。
+ */
 export function rankEntryCandidates(
   rows: RankingRow[],
   excludedCodes: ReadonlySet<string> = new Set(),
   limit = DEFAULT_T1_STRATEGY.maxCandidates,
   minEntryScore = DEFAULT_T1_STRATEGY.minEntryScore,
+  options: EntryCandidateOptions = {},
 ): RankingRow[] {
-  const eligible = rows
-    .filter((row) => !excludedCodes.has(String(row.stock_code ?? '')))
-    // 信号层统一收敛：只保留 收盘 > MA3 > MA5 > MA20 的买入信号，再按分数排序取前 N。
-    .filter((row) => passesMaAlignmentEntryRule(row.latest_price, row.ma3, row.ma5, row.ma20));
+  const strategyIds = options.strategyIds ?? enabledStrategyIds();
+  const strategies = resolveStrategies(strategyIds);
+  if (!strategies.length) return [];
+
+  const ctx: StrategyContext = {
+    rows,
+    excludedCodes,
+    minEntryScore,
+    sectorRotation: options.sectorRotation ?? null,
+  };
+
+  const collected: EntryCandidate[] = [];
+  for (const strategy of strategies) {
+    try {
+      collected.push(...strategy.evaluate(ctx));
+    } catch (error) {
+      // 异常隔离：单个子策略失败不影响其余策略的信号产出。
+      console.error(`[rankEntryCandidates] 子策略 ${strategy.id} 执行失败，已跳过`, error);
+    }
+  }
+  if (!collected.length) return [];
+
+  const merged = mergeCandidates(collected, options.scoreMergeRule ?? 'max', weightMap(strategies));
+  const rowByCode = new Map<string, RankingRow>();
+  for (const row of rows) {
+    const code = String(row.stock_code ?? '');
+    if (code && !rowByCode.has(code)) rowByCode.set(code, row);
+  }
+
+  // 流程顺序：合并去重 → 板块轮动加权 → 全局硬过滤（入场总分下限）→ 排序输出。
+  // 板块轮动加权是可选层：未显式传入时按环境变量开关推导，关闭时不影响排序结果。
+  const sectorRotation = options.sectorRotation
+    ?? sectorRotationWeightingFromRows(rows, enabledSectorRotationWeightPct());
+  const weighted = applySectorRotationWeight([...merged.values()], rowByCode, sectorRotation);
+  const eligible = weighted.filter((candidate) => candidate.score >= minEntryScore);
   if (!eligible.length) return [];
-  return pl.DataFrame(eligible.map((row) => ({
-    ...row,
-    stock_code: String(row.stock_code ?? ''),
-    total_score: Number(row.total_score ?? 0),
-  })))
-    .filter(pl.col('total_score').gtEq(minEntryScore))
+  // 排序在 Polars 侧完成，且保持与改动前完全一致的帧结构与排序语义
+  // （同分股票的相对次序因此也与改动前一致）。命中原因在排序后按代码回填，
+  // 避免把字符串数组塞进 DataFrame 列。
+  const frameRows = eligible.map((candidate) => {
+    const row = rowByCode.get(candidate.code);
+    return {
+      ...(row ?? {}),
+      stock_code: candidate.code,
+      total_score: Number(candidate.score),
+    };
+  });
+  const selected = pl.DataFrame(frameRows)
     .sort('total_score', true, true)
     .head(Math.max(0, Math.trunc(limit)))
     .toRecords() as unknown as RankingRow[];
+
+  const candidateByCode = new Map(weighted.map((candidate) => [candidate.code, candidate]));
+  return selected.map((row) => {
+    const candidate = candidateByCode.get(String(row.stock_code ?? ''));
+    return {
+      ...row,
+      entry_strategy_id: candidate?.strategyId ?? '',
+      entry_reasons: candidate?.reasons ?? [],
+    } as RankingRow;
+  });
+}
+
+function weightMap(strategies: readonly EntrySubStrategy[]): Map<string, number> {
+  const weights = new Map<string, number>();
+  for (const strategy of strategies) weights.set(strategy.id, strategy.weight ?? 1);
+  return weights;
 }
 
 export function commission(grossAmount: number, config: T1StrategyConfig = DEFAULT_T1_STRATEGY): number {

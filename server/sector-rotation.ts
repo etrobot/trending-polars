@@ -140,6 +140,143 @@ export function scoreSectorEntry(input: {
   return Math.round(trendPoints + TAG_POINTS[tag] + alignmentPoints + slopePoints + stabilityPoints);
 }
 
+/** 板块轮动评分驱动的三态趋势轴（与 scoring-engine.TrendAxis 同构）。 */
+export type SectorTrendAxis = 'up' | 'range' | 'down';
+
+/**
+ * 轮动分 → 趋势轴：≥60（平稳介入/可关注）视为上升，≥45（观察）视为震荡，
+ * <45（回避）视为下跌。策略评分链路用它替代旧的八态 state_id 趋势轴。
+ */
+export function trendAxisFromEntryScore(score: number): SectorTrendAxis {
+  if (score >= 60) return 'up';
+  if (score >= 45) return 'range';
+  return 'down';
+}
+
+export interface SectorEntryMetrics {
+  changePct: number;
+  recentChangePct: number | null;
+  momentumRatio: number | null;
+  tag: SectorMomentumTag;
+  ma3: number | null;
+  ma5: number | null;
+  ma10: number | null;
+  ma5SlopePct: number | null;
+  avgAmplitudePct: number | null;
+  entryScore: number;
+}
+
+/**
+ * 按截止下标复算某板块的平稳介入指标与评分。
+ * 与 buildSectorRotation 的末根口径完全一致，供回测 / 截面在任意历史日重算使用。
+ * points 必须按日期升序；changePct 以 points[0] 为基准（调用方负责按年过滤）。
+ */
+export function computeEntryMetrics(
+  points: BlockPricePoint[],
+  endIndex: number,
+): SectorEntryMetrics | null {
+  if (points.length < 2 || endIndex < 0 || endIndex >= points.length) return null;
+  const base = points[0].close;
+  const last = points[endIndex].close;
+  const changePct = fixed((last / base - 1) * 100);
+
+  // 近两月：截止根往前数第 40 根收盘价作为基准
+  const recentBase = endIndex >= RECENT_TWO_MONTH_BARS
+    ? points[endIndex - RECENT_TWO_MONTH_BARS].close
+    : null;
+  const recentChangePct = recentBase == null ? null : fixed((last / recentBase - 1) * 100);
+  const momentumRatio = recentChangePct == null || Math.abs(changePct) < MOMENTUM_MIN_YTD_PCT
+    ? null
+    : fixed(recentChangePct / changePct, 3);
+  const tag = momentumTagOf(momentumRatio, recentChangePct, changePct);
+
+  const closes = points.slice(0, endIndex + 1).map((point) => point.close);
+  const ma3 = sma(closes, 3);
+  const ma5 = sma(closes, 5);
+  const ma10 = sma(closes, 10);
+  const ma5Prev = sma(closes, 5, Math.max(0, closes.length - 3));
+  const ma5SlopePct = ma5 == null || ma5Prev == null || ma5Prev === 0
+    ? null
+    : fixed(((ma5 - ma5Prev) / ma5Prev) * 100, 3);
+
+  // 平稳度：近一周平均振幅（(高-低)/收盘），缺失高低价时退化为收盘
+  const weekPoints = points.slice(Math.max(0, endIndex + 1 - RECENT_WEEK_BARS), endIndex + 1);
+  const amplitudes = weekPoints.map((point) => {
+    const high = Number.isFinite(point.high) && point.high > 0 ? point.high : point.close;
+    const low = Number.isFinite(point.low) && point.low > 0 ? point.low : point.close;
+    return ((high - low) / point.close) * 100;
+  });
+  const avgAmplitudePct = amplitudes.length ? fixed(average(amplitudes), 3) : null;
+
+  const entryScore = scoreSectorEntry({
+    changePct,
+    tag,
+    close: last,
+    ma3,
+    ma5,
+    ma10,
+    ma5SlopePct,
+    avgAmplitudePct,
+  });
+  return {
+    changePct,
+    recentChangePct,
+    momentumRatio,
+    tag,
+    ma3,
+    ma5,
+    ma10,
+    ma5SlopePct,
+    avgAmplitudePct,
+    entryScore,
+  };
+}
+
+/**
+ * 批量计算各板块在指定交易日（compact YYYYMMDD）的轮动评分。
+ * 每个日期只使用该「日期所在年份且 <= 该日期」的点位，YTD 基准与实盘轮动页一致。
+ * 返回 Map<block_code, Map<compactDate, entryScore>>；无有效评分的日期不写入。
+ */
+export function buildRotationScoreMap(
+  rows: BlockPricePoint[],
+  dates: string[],
+): Map<string, Map<string, number>> {
+  const compact = (value: string) => String(value ?? '').replaceAll('-', '').slice(0, 8);
+  const targets = [...new Set(dates.map(compact).filter(Boolean))].sort();
+  const result = new Map<string, Map<string, number>>();
+  if (!targets.length) return result;
+  const byCode = new Map<string, BlockPricePoint[]>();
+  for (const row of rows) {
+    const code = String(row.block_code ?? '').trim();
+    const date = compact(row.date);
+    const close = Number(row.close);
+    if (!code || !date || !Number.isFinite(close) || close <= 0) continue;
+    const list = byCode.get(code) ?? [];
+    list.push({
+      block_code: code,
+      block_name: row.block_name,
+      date,
+      open: Number(row.open),
+      high: Number(row.high),
+      low: Number(row.low),
+      close,
+    });
+    byCode.set(code, list);
+  }
+  for (const [code, points] of byCode) {
+    points.sort((left, right) => left.date.localeCompare(right.date));
+    const scoreMap = new Map<string, number>();
+    for (const target of targets) {
+      const year = target.slice(0, 4);
+      const yearPoints = points.filter((point) => point.date.slice(0, 4) === year && point.date <= target);
+      const metrics = computeEntryMetrics(yearPoints, yearPoints.length - 1);
+      if (metrics) scoreMap.set(target, metrics.entryScore);
+    }
+    if (scoreMap.size) result.set(code, scoreMap);
+  }
+  return result;
+}
+
 /**
  * 把 block_daily_price 的日线收盘价聚合成「年初至今涨跌幅」曲线，并给出资金关注度标记与平稳介入评分。
  *
@@ -183,28 +320,14 @@ export function buildSectorRotation(rows: BlockPricePoint[], year: number, codes
       return close == null ? null : fixed((close / base - 1) * 100);
     });
     const last = points[points.length - 1].close;
-    const changePct = fixed((last / base - 1) * 100);
+    // 评分指标统一走 computeEntryMetrics，与回测 / 截面路径共用同一口径。
+    const metrics = computeEntryMetrics(points, points.length - 1);
+    if (!metrics) continue;
+    const { changePct, recentChangePct, momentumRatio, tag, ma3, ma5, ma10, entryScore } = metrics;
 
-    // 近两月：最后一根往前数第 40 根收盘价作为基准
-    const recentBase = points.length > RECENT_TWO_MONTH_BARS
-      ? points[points.length - 1 - RECENT_TWO_MONTH_BARS].close
-      : null;
-    const recentChangePct = recentBase == null ? null : fixed((last / recentBase - 1) * 100);
-    const momentumRatio = recentChangePct == null || Math.abs(changePct) < MOMENTUM_MIN_YTD_PCT
-      ? null
-      : fixed(recentChangePct / changePct, 3);
-    const tag = momentumTagOf(momentumRatio, recentChangePct, changePct);
-
-    // 均线
+    // 均线（展示用）
     const closes = points.map((point) => point.close);
-    const ma3 = sma(closes, 3);
-    const ma5 = sma(closes, 5);
-    const ma10 = sma(closes, 10);
     const ma20 = sma(closes, 20);
-    const ma5Prev = sma(closes, 5, Math.max(0, closes.length - 3));
-    const ma5SlopePct = ma5 == null || ma5Prev == null || ma5Prev === 0
-      ? null
-      : fixed(((ma5 - ma5Prev) / ma5Prev) * 100, 3);
 
     // 近一周蜡烛（带当日 MA5 / MA10，方便前端叠加均线）
     const weekPoints = points.slice(-RECENT_WEEK_BARS);
@@ -220,21 +343,6 @@ export function buildSectorRotation(rows: BlockPricePoint[], year: number, codes
         ma5: sma(closes, 5, end),
         ma10: sma(closes, 10, end),
       };
-    });
-
-    // 平稳度：近一周平均振幅（(高-低)/收盘）
-    const amplitudes = candles.map((candle) => ((candle.high - candle.low) / candle.close) * 100);
-    const avgAmplitudePct = amplitudes.length ? fixed(average(amplitudes), 3) : null;
-
-    const entryScore = scoreSectorEntry({
-      changePct,
-      tag,
-      close: last,
-      ma3,
-      ma5,
-      ma10,
-      ma5SlopePct,
-      avgAmplitudePct,
     });
 
     sectors.push({

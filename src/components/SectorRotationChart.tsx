@@ -3,6 +3,8 @@ import type { SectorRotationSector } from '../types';
 interface Line extends Pick<SectorRotationSector, 'code' | 'name' | 'series'> {
   color: string;
   opacity?: number;
+  /** 隐藏的折线仍参与坐标轴计算，只是以透明度 0 渲染，保证切换显隐时坐标不变。 */
+  hidden?: boolean;
 }
 
 function axisTicks(min: number, max: number, count = 6): number[] {
@@ -57,7 +59,7 @@ export function SectorRotationChart({ dates, lines, emptyText }: { dates: string
     ? [0, Math.floor((dates.length - 1) / 2), dates.length - 1]
     : dates.length === 1 ? [0] : [];
 
-  if (!dates.length || !lines.length) {
+  if (!dates.length || lines.every((line) => line.hidden)) {
     return <div className="flex h-64 items-center justify-center text-[11px] text-muted">{emptyText ?? '今年还没有可用于对比的板块日线数据'}</div>;
   }
 
@@ -96,7 +98,7 @@ export function SectorRotationChart({ dates, lines, emptyText }: { dates: string
           strokeWidth="1.3"
           strokeLinejoin="round"
           strokeLinecap="round"
-          opacity={line.opacity ?? 0.9}
+          opacity={line.hidden ? 0 : (line.opacity ?? 0.9)}
         />
       )))}
     </svg>

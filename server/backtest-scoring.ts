@@ -21,6 +21,12 @@ import {
   type TrendAxis,
   type VolatilityClass,
 } from './scoring-engine.js';
+import {
+  buildRotationScoreMap,
+  entryLevelOf,
+  trendAxisFromEntryScore,
+  type BlockPricePoint,
+} from './sector-rotation.js';
 
 // ---------------------------------------------------------------------------
 // Vectorized backtest scoring: computes the full (stock × date) score matrix
@@ -176,6 +182,25 @@ function computeSectorStates(
   return result;
 }
 
+/** 把 HistoricalBlockSeries 的日线元组转成轮动评分所需的 BlockPricePoint 行。 */
+function blockPricePoints(blocks: HistoricalBlockSeries[]): BlockPricePoint[] {
+  const rows: BlockPricePoint[] = [];
+  for (const block of blocks) {
+    for (const bar of block.bars) {
+      rows.push({
+        block_code: block.block_code,
+        block_name: block.block_name,
+        date: String(bar[0]),
+        open: Number(bar[1]),
+        high: Number(bar[3]),
+        low: Number(bar[4]),
+        close: Number(bar[2]),
+      });
+    }
+  }
+  return rows;
+}
+
 /** 基准指数代码：与实盘 MarketService 取同一条曲线（上证指数）。 */
 export const BENCHMARK_SYMBOL = 'sh000001';
 
@@ -215,7 +240,10 @@ export function computeBacktestScores(
   const distanceTiers = [...distanceFromLow.tiers].sort((left, right) => left.maxPct - right.maxPct);
 
   // ---- 0. Pre-compute rolling sector trend states ----
+  // 主口径：板块轮动评分（entryScore，0-100，按回测区间逐年重算）；
+  // 旧的八态 state_id 仅在轮动评分缺失（block_daily_price 无数据）时兜底。
   const sectorStateByDate = computeSectorStates(history.blocks ?? [], dates, scoringConfig.marketState);
+  const sectorRotationByDate = buildRotationScoreMap(blockPricePoints(history.blocks ?? []), dates);
   // 基准（上证指数）在 relativeStrength.lookback 窗口上的收益率，按日期查表。
   // 与实盘 scoreStock 用同一个基准，否则维度 5 会成为新的回测/实盘分歧来源。
   const benchmarkReturnByDate = benchmarkReturns(history, relativeStrength.lookback);
@@ -247,6 +275,7 @@ export function computeBacktestScores(
   const bollingerScores: number[] = [];
   const limitUpFlags: number[] = [];
   const sectorStateIds: number[] = [];
+  const sectorRotationScores: number[] = [];
   const sectorCodes: string[] = [];
   const sectorNames: string[] = [];
   const sectorStrategyScores: number[] = [];
@@ -311,15 +340,22 @@ export function computeBacktestScores(
       }
       const stateMap = currentSector ? sectorStateByDate.get(currentSector) : undefined;
       const stateId = stateMap?.get(dateArr[i]) ?? 0;
+      const rotationMap = currentSector ? sectorRotationByDate.get(currentSector) : undefined;
+      const rotationScore = rotationMap?.get(dateArr[i]) ?? 0;
       sectorStateIds.push(stateId);
+      sectorRotationScores.push(rotationScore);
       sectorCodes.push(currentSector ?? '');
       sectorNames.push(currentSector ? blockNameByCode.get(currentSector) ?? currentSector : '');
-      // sectorStateByDate 只包含请求的回测日期；没有板块状态时情境分必为 0，
+      // 轮动 / 状态表只包含请求的回测日期；两者都缺失时情境分必为 0，
       // 不必为全部预热 K 线重复计算 60 日形态窗口。
-      const strategy = stateId
+      // 轮动分命中时按三态轴分类（不传 stateId），与截面路径口径一致；
+      // 仅 state_id 存在时维持旧的八态情境修正兜底。
+      const strategy = rotationScore || stateId
         ? sectorStrategyAdjustment(
             sectorStrategyFeatures(normalizedBars, i, strategyLimitUpDates, scoringConfig),
-            { stateId },
+            rotationScore
+              ? { trend: trendAxisFromEntryScore(rotationScore) }
+              : { stateId },
             scoringConfig,
           )
         : { score: 0, riskPenalty: 0, opportunityBonus: 0, label: '无情境修正', reason: '' };
@@ -352,6 +388,7 @@ export function computeBacktestScores(
     bollinger_score: bollingerScores,
     limit_up_flag: limitUpFlags,
     sector_state_id: sectorStateIds,
+    sector_rotation_score: sectorRotationScores,
     sector_code: sectorCodes,
     sector_name: sectorNames,
     sector_strategy_score: sectorStrategyScores,
@@ -417,9 +454,14 @@ export function computeBacktestScores(
   // ---- 6. Dimension 1: Trend score (0-40) ----
   // 简化布林带趋势分数：tanh(bollingerScore * scale) 映射到 (0, 40)，再加板块加减分。
   // 与 scoring-engine.trendScoreFromParts 完全一致。
+  // 板块轴优先用轮动分（≥60→up、<45→down、45-59→0），轮动分缺失（=0）时回退旧 state_id。
   frame = frame.withColumns(
-    pl.when(pl.col('sector_state_id').eq(pl.lit(8))
-      .or(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3)))).then(pl.lit(trend.sectorUpBonus))
+    pl.when(pl.col('sector_rotation_score').gt(0))
+      .then(pl.when(pl.col('sector_rotation_score').gtEq(60)).then(pl.lit(trend.sectorUpBonus))
+        .when(pl.col('sector_rotation_score').lt(45)).then(pl.lit(trend.sectorDownBonus))
+        .otherwise(pl.lit(0)))
+      .when(pl.col('sector_state_id').eq(pl.lit(8))
+        .or(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3)))).then(pl.lit(trend.sectorUpBonus))
       .when(pl.col('sector_state_id').gtEq(6)).then(pl.lit(trend.sectorDownBonus))
       .otherwise(pl.lit(0))
       .alias('sector_bonus'),
@@ -497,14 +539,19 @@ export function computeBacktestScores(
   );
 
   // ---- 9. Dimension 4: Volatility-trend score (0-15) ----
-  // trend_axis: prefer sector state_id when available, fallback to bollinger_score
+  // trend_axis: 优先板块轮动分（≥60→up、≥45→range、<45→down），
+  // 轮动分缺失时回退旧 state_id，再回退 bollinger_score。
   frame = frame.withColumns(
     pl.when(pl.col('limit_up_count_20d').gtEq(volatilityTrend.limitUp.highMinLimitUps)).then(pl.lit('high'))
       .when(pl.col('limit_up_count_20d').gtEq(volatilityTrend.limitUp.mediumMinLimitUps)).then(pl.lit('medium'))
       .otherwise(pl.lit('low'))
       .alias('volatility_class'),
-    pl.when(pl.col('sector_state_id').eq(pl.lit(8))
-      .or(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3)))).then(pl.lit('up'))
+    pl.when(pl.col('sector_rotation_score').gt(0))
+      .then(pl.when(pl.col('sector_rotation_score').gtEq(60)).then(pl.lit('up'))
+        .when(pl.col('sector_rotation_score').gtEq(45)).then(pl.lit('range'))
+        .otherwise(pl.lit('down')))
+      .when(pl.col('sector_state_id').eq(pl.lit(8))
+        .or(pl.col('sector_state_id').gtEq(1).and(pl.col('sector_state_id').ltEq(3)))).then(pl.lit('up'))
       .when(pl.col('sector_state_id').gtEq(6)).then(pl.lit('down'))
       .when(pl.col('sector_state_id').gtEq(4).and(pl.col('sector_state_id').ltEq(5))).then(pl.lit('range'))
       .when(pl.col('bollinger_score').gt(0.3)).then(pl.lit('up'))
@@ -591,6 +638,7 @@ export function computeBacktestScores(
     const relativeStrengthScore = round(Number(row.relative_strength_score), 1);
     const sectorStrategyScore = Number(row.sector_strategy_score ?? 0);
     const sectorStateId = Number(row.sector_state_id ?? 0);
+    const sectorRotationScore = Number(row.sector_rotation_score ?? 0);
     list.push({
       rank: 0,
       stock_code: String(row.stock_code),
@@ -623,8 +671,9 @@ export function computeBacktestScores(
       distance_from_low_pct: round(Number(row.distance_from_low_pct), 2),
       sector_code: String(row.sector_code ?? '') || undefined,
       sector_name: String(row.sector_name ?? '') || undefined,
-      sector_trend_name: marketStateName(sectorStateId),
-      sector_trend_state_id: sectorStateId || undefined,
+      sector_rotation_score: sectorRotationScore || undefined,
+      sector_trend_name: sectorRotationScore ? entryLevelOf(sectorRotationScore) : marketStateName(sectorStateId),
+      sector_trend_state_id: sectorRotationScore ? undefined : sectorStateId || undefined,
       latest_price: Number(row.close),
       latest_change_rate: Number(row.change_pct),
       ma3: round(Number(row.ma3), 3),

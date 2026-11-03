@@ -77,7 +77,7 @@ describe('simulated-trading background tasks', () => {
       trading_date: '20260729',
       status: 'completed',
       results: [],
-      message: '2026-07-29 立即执行完成，处理 1 笔策略指令',
+      message: '2026-07-29 马上下单完成，处理 1 笔策略指令',
     }));
     const app = express();
 
@@ -112,7 +112,7 @@ describe('simulated-trading background tasks', () => {
     const task = await waitForTask(client, started.body.task_id);
     expect(task).toMatchObject({
       status: 'completed',
-      message: '2026-07-29 立即执行完成，处理 1 笔策略指令',
+      message: '2026-07-29 马上下单完成，处理 1 笔策略指令',
       result: { window: 'open', status: 'completed' },
     });
     expect(loadPaperContext).toHaveBeenCalledWith(false, started.body.task_id);

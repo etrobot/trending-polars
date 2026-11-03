@@ -1111,6 +1111,8 @@ export interface SectorContext {
   limitUpDates?: ReadonlySet<string>;
   /** 基准（上证指数）在同一窗口的收益率(%)，用于维度 5 相对强度。缺失时该维度给中性分。 */
   benchmarkReturnPct?: number | null;
+  /** 板块轮动评分（0-100，越高越强势）；供 P2 的板块轮动加权层使用。 */
+  rotationScore?: number;
 }
 
 /**
@@ -1184,6 +1186,7 @@ export function scoreStock(
     sector_name: sector?.name,
     sector_trend_name: sector?.trendName,
     sector_trend_state_id: sector?.stateId,
+    sector_rotation_score: sector?.rotationScore,
     latest_price: latest.close,
     latest_change_rate: latest.changePct,
     // 买入信号过滤（trading-strategy.rankEntryCandidates）依赖这些字段：

@@ -5,6 +5,7 @@ import {
   CirclePause,
   CirclePlay,
   ClipboardCheck,
+  ExternalLink,
   RefreshCw,
   ShieldCheck,
   SlidersHorizontal,
@@ -349,7 +350,7 @@ export function SimulatedTradingPage() {
         return;
       }
       if (tradingSession && !tradingSession.immediate_execute_allowed) {
-        const reason = tradingSession.immediate_execute_reason ?? '当前不在交易时段，无法立即执行';
+        const reason = tradingSession.immediate_execute_reason ?? '当前不在交易时段，无法马上下单';
         console.log('[simulated-trading] immediate execute rejected (server session)', reason);
         setNotice('');
         setError(reason);
@@ -395,7 +396,7 @@ export function SimulatedTradingPage() {
         <Button variant="ghost" className="shrink-0 whitespace-nowrap" disabled={busy} onClick={openBacktestHistory}><SlidersHorizontal className="h-3.5 w-3.5" />加载回测参数</Button>
         <Button variant="ghost" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} onClick={() => confirmWindow('post_close')}>盘后核对</Button>
         <Button variant="secondary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} title="随时刷新行情并生成交易计划" onClick={() => confirmWindow('close')}><ClipboardCheck className="h-3.5 w-3.5" />决策</Button>
-        <Button variant="primary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} title="根据当前时间自动判断并执行对应窗口" onClick={() => confirmWindow('auto')}><ClipboardCheck className="h-3.5 w-3.5" />立即执行</Button>
+        <Button variant="primary" className="shrink-0 whitespace-nowrap" disabled={tradingDisabled} title="忽略排期窗口，立即提交所有待执行策略指令" onClick={() => confirmWindow('auto')}><ClipboardCheck className="h-3.5 w-3.5" />马上下单</Button>
       </PageHeaderActions>
       <div className="terminal-page">
       {error && <div className="border border-accent-red-soft bg-accent-red-soft px-3 py-2 text-[11px] leading-4 text-trading-up">{error}</div>}
@@ -444,7 +445,7 @@ export function SimulatedTradingPage() {
         </div>
 
         <aside className="space-y-3">
-          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base text-ink">账户</h2><span className={`font-mono text-sm font-semibold ${hasAccountSnapshot ? 'text-ink' : 'text-muted'}`}>{hasAccountSnapshot ? formatMoney(account.total_assets) : '—'}</span></div><div className="border-b border-line-soft px-3 pb-2.5 pt-3"><MiniEquityChart points={overview.asset_history ?? []} /></div><div className="divide-y divide-line-soft">{[
+          <section className="panel overflow-hidden"><div className="module-header"><h2 className="font-display text-base text-ink">账户</h2><a href="http://mncg.10jqka.com.cn/cgiwt/index/index" target="_blank" rel="noreferrer" title="在新窗口打开同花顺网页版模拟交易" className="inline-flex shrink-0 items-center gap-1 font-mono text-[11px] text-muted transition-colors hover:text-primary-active"><ExternalLink className="h-3.5 w-3.5" />同花顺</a><span className={`ml-auto font-mono text-sm font-semibold ${hasAccountSnapshot ? 'text-ink' : 'text-muted'}`}>{hasAccountSnapshot ? formatMoney(account.total_assets) : '—'}</span></div><div className="border-b border-line-soft px-3 pb-2.5 pt-3"><MiniEquityChart points={overview.asset_history ?? []} /></div><div className="divide-y divide-line-soft">{[
             ['可用资金', hasAccountSnapshot ? formatMoney(account.available_cash) : '—', 'text-ink'],
             ['持仓盈亏', hasAccountSnapshot ? formatMoney(account.pnl_summary.amount) : '—', hasAccountSnapshot ? pctColor(account.pnl_summary.amount) : 'text-muted'],
             ['盈亏率', hasAccountSnapshot ? `${account.pnl_summary.pct >= 0 ? '+' : ''}${account.pnl_summary.pct.toFixed(2)}%` : '—', hasAccountSnapshot ? pctColor(account.pnl_summary.pct) : 'text-muted'],
@@ -464,7 +465,7 @@ export function SimulatedTradingPage() {
       </section>
       )}
 
-      <Modal open={executeOpen} onClose={() => setExecuteOpen(false)} title={selectedWindow === 'auto' ? '确认立即执行' : selectedWindow === 'close' ? '确认运行决策' : '确认运行盘后核对'} description={selectedWindow === 'auto' ? '系统将根据当前时间自动判断并执行对应窗口（开盘/临收盘/收盘决策/盘后核对）。' : selectedWindow === 'close' ? '系统将刷新最新行情并生成交易计划，可随时运行；收盘后的自动决策机制仍会按原计划执行。' : 'Node.js 交易核心会运行所选策略窗口；AppleScript 仅查询和操作同花顺"模拟练习"。'}>
+      <Modal open={executeOpen} onClose={() => setExecuteOpen(false)} title={selectedWindow === 'auto' ? '确认马上下单' : selectedWindow === 'close' ? '确认运行决策' : '确认运行盘后核对'} description={selectedWindow === 'auto' ? '将忽略排期窗口，立即向同花顺模拟盘提交所有待执行策略指令（含卖出止损与买入建仓）。' : selectedWindow === 'close' ? '系统将刷新最新行情并生成交易计划，可随时运行；收盘后的自动决策机制仍会按原计划执行。' : 'Node.js 交易核心会运行所选策略窗口；下单通过同花顺 Web 模拟盘通道执行。'}>
         <div className="space-y-3"><div className="flex justify-end gap-2"><Button variant="secondary" onClick={() => setExecuteOpen(false)}>取消</Button><Button variant="danger" disabled={busy} onClick={() => void execute()}>确认执行</Button></div></div>
       </Modal>
 

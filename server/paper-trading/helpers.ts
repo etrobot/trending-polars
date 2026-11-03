@@ -80,6 +80,13 @@ export interface PaperTradingServiceOptions {
    */
   thsReadiness?: ThsReadinessProvider;
   strategy?: Partial<T1StrategyConfig>;
+  /**
+   * P5：启用子策略 id 列表。缺省 undefined → 读取环境变量，行为与改动前一致。
+   * 下发实例（`applyMiningInstance`）会用它覆盖此处的默认值。
+   */
+  entryStrategyIds?: string[];
+  /** P5：买入分数合成规则，缺省 max。 */
+  scoreMergeRule?: 'max' | 'weighted';
   now?: () => Date;
   schedulerIntervalMs?: number;
   accountMonitorIntervalMs?: number;

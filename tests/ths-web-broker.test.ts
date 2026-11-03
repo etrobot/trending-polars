@@ -136,7 +136,7 @@ function makeOrder(overrides: Partial<PaperOrder> = {}): PaperOrder {
 }
 
 function createBroker(mock: ScriptedMock) {
-  return new ThsWebSimulatedBroker({ cookie: COOKIE, fetchImpl: mock.fetchImpl });
+  return new ThsWebSimulatedBroker({ cookie: COOKIE, fetchImpl: mock.fetchImpl, interactiveLogin: false });
 }
 
 describe('ThsWebSimulatedBroker', () => {

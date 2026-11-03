@@ -86,15 +86,15 @@ export function SectorRotationPage() {
     });
   }, [groups]);
 
-  const lines = clustered
-    .filter((item) => !hiddenGroups.has(item.cluster))
-    .map((item) => ({
-      code: item.sector.code,
-      name: item.sector.name,
-      series: item.sector.series,
-      color: item.color,
-      opacity: item.opacity,
-    }));
+  // 全部走势组都传给图表（坐标轴按全量数据计算），隐藏的组以透明度 0 渲染，切换显隐时坐标不变。
+  const lines = clustered.map((item) => ({
+    code: item.sector.code,
+    name: item.sector.name,
+    series: item.sector.series,
+    color: item.color,
+    opacity: item.opacity,
+    hidden: hiddenGroups.has(item.cluster),
+  }));
 
   // 排行榜按平稳介入评分降序，且只展示当前勾选（未隐藏）走势组的板块。
   const ranked = useMemo(() => {

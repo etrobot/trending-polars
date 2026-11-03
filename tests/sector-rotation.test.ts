@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildRotationScoreMap,
   buildSectorRotation,
+  computeEntryMetrics,
   entryLevelOf,
   momentumTagOf,
   scoreSectorEntry,
+  trendAxisFromEntryScore,
   type BlockPricePoint,
 } from '../server/sector-rotation.js';
 
@@ -98,5 +101,79 @@ describe('buildSectorRotation', () => {
     expect(sector.ma10).toBeNull();
     expect(sector.recentChangePct).toBeNull();
     expect(sector.tag).toBe('数据不足');
+  });
+});
+
+describe('trendAxisFromEntryScore', () => {
+  it('按 60 / 45 阈值映射三态趋势轴', () => {
+    expect(trendAxisFromEntryScore(100)).toBe('up');
+    expect(trendAxisFromEntryScore(60)).toBe('up');
+    expect(trendAxisFromEntryScore(59)).toBe('range');
+    expect(trendAxisFromEntryScore(45)).toBe('range');
+    expect(trendAxisFromEntryScore(44)).toBe('down');
+    expect(trendAxisFromEntryScore(0)).toBe('down');
+  });
+});
+
+describe('computeEntryMetrics', () => {
+  /** 45 根温和上涨、振幅约 1% 的日线（覆盖「近两月」所需的 41 根）。 */
+  function risingPoints(code = '881001'): BlockPricePoint[] {
+    return Array.from({ length: 45 }, (_, index) => {
+      const close = 10 + index * 0.1;
+      const date = `2026-01-${String(index + 1).padStart(2, '0')}`;
+      return point(code, date, Number(close.toFixed(2)), Number((close * 1.005).toFixed(3)), Number((close * 0.995).toFixed(3)));
+    });
+  }
+
+  it('末根口径与 buildSectorRotation 的 entryScore 一致', () => {
+    const points = risingPoints();
+    const metrics = computeEntryMetrics(points, points.length - 1);
+    expect(metrics).not.toBeNull();
+    const [sector] = buildSectorRotation(points, 2026).sectors;
+    expect(metrics!.entryScore).toBe(sector.entryScore);
+    expect(metrics!.changePct).toBe(sector.changePct);
+    expect(metrics!.tag).toBe(sector.tag);
+    expect(metrics!.recentChangePct).toBe(sector.recentChangePct);
+  });
+
+  it('可截断到任意历史日复算；数据不足时返回 null', () => {
+    const points = risingPoints();
+    const mid = computeEntryMetrics(points, 30);
+    expect(mid).not.toBeNull();
+    // 截断到第 31 根：不足 41 根，近两月基准缺失 → tag 数据不足。
+    expect(mid!.recentChangePct).toBeNull();
+    expect(mid!.tag).toBe('数据不足');
+    expect(computeEntryMetrics(points.slice(0, 1), 0)).toBeNull();
+    expect(computeEntryMetrics(points, points.length)).toBeNull();
+  });
+});
+
+describe('buildRotationScoreMap', () => {
+  it('按目标日期所在年份过滤点位（YTD 基准 = 当年第一根）', () => {
+    const prevYear: BlockPricePoint[] = [
+      point('881001', '2025-12-29', 100),
+      point('881001', '2025-12-30', 110),
+    ];
+    const currentYear: BlockPricePoint[] = [
+      point('881001', '2026-01-05', 10),
+      point('881001', '2026-01-06', 11),
+      point('881001', '2026-01-07', 12),
+    ];
+    const map = buildRotationScoreMap([...prevYear, ...currentYear], ['2026-01-06']);
+    const score = map.get('881001')?.get('20260106');
+    expect(score).toBeTypeOf('number');
+    // 与只用当年点位、截断到 1 月 6 日复算的结果一致（不含 2025 年高价基准）。
+    expect(score).toBe(computeEntryMetrics(currentYear.slice(0, 2), 1)?.entryScore);
+  });
+
+  it('当年点位不足两根的日期不写入结果', () => {
+    const rows = [
+      point('881001', '2025-12-29', 100),
+      point('881001', '2025-12-30', 110),
+      point('881001', '2026-01-05', 10),
+    ];
+    const map = buildRotationScoreMap(rows, ['20260105', '20251230']);
+    expect(map.get('881001')?.has('20260105')).toBe(false);
+    expect(map.get('881001')?.has('20251230')).toBe(true);
   });
 });

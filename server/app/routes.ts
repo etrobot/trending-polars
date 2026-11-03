@@ -16,6 +16,12 @@ import { rankingConfigFromBacktest, type RankingRuntimeConfig } from '../ranking
 import type { TaskRegistry } from '../tasks.js';
 import { ThsSimulatedBrokerError } from '../ths-simulated-broker.js';
 import { MarketService, analysisWithStats, priceRows, averageRankingChange } from './market-service.js';
+import { buildInstanceConfig, MiningInstanceStore, type MiningDeployRequest } from '../pipeline/deploy.js';
+import { readInstanceState } from '../pipeline/instance.js';
+import { computeFrictionStats } from '../pipeline/friction.js';
+import { replayMiningRun } from '../pipeline/replay.js';
+import { MiningStore } from '../pipeline/store.js';
+import { buildValidationReport, computeActualMetrics } from '../pipeline/validation.js';
 import { resolveLatestTradingDate, loadTradingCalendar } from '../index-bootstrap.js';
 import { PAPER_ENGINE_VERSION, type PaperTradingService } from '../paper-trading.js';
 import { buildTradingSession, immediateAutoWindowRejection, resolveAutoTradingWindow, shanghaiClock } from '../paper-trading/helpers.js';
@@ -1032,6 +1038,210 @@ export function registerRoutes(
       run_id: runId,
       message: '回测策略应用任务已启动，排行将在策略应用后后台重算',
     });
+  }));
+
+  // Mining（P4 挖掘流水线 + P5 下发与验证）
+  app.use('/api/mining', (_request, response, next) => {
+    response.setHeader('cache-control', 'no-store');
+    next();
+  });
+
+  // 挖掘产物落在数据目录下（server/data/mining），与运行期状态分离。
+  // 部分测试用替身 store 注册路由，没有 root 时退回默认数据目录。
+  const miningRoot = path.join(store.root ?? path.join(MODULE_DIR, 'data'), 'mining');
+  const miningStore = new MiningStore(miningRoot);
+  const instanceStore = new MiningInstanceStore(miningRoot);
+
+  app.get('/api/mining/runs', asyncHandler(async (_request, response) => {
+    const runs = await miningStore.listRuns();
+    response.json({
+      total: runs.length,
+      runs: await Promise.all(runs.map(async (run) => ({
+        run_id: run.runId,
+        created_at: run.createdAt,
+        code_version: run.codeVersion,
+        data_version: run.dataVersion,
+        status: run.status,
+        error: run.error,
+        strategies: run.strategies,
+        universe_size: run.universe.length,
+        candidate_count: (await miningStore.getResults(run.runId)).length,
+      }))),
+    });
+  }));
+
+  app.get('/api/mining/runs/:runId', asyncHandler(async (request, response) => {
+    const runId = String(request.params.runId);
+    const run = await miningStore.getRun(runId);
+    if (!run) {
+      response.status(404).json({ error: '挖掘批次不存在', run_id: runId });
+      return;
+    }
+    response.json({
+      run,
+      results: await miningStore.getResults(runId),
+      report: await miningStore.getReport(runId),
+    });
+  }));
+
+  app.get('/api/mining/runs/:runId/report.html', asyncHandler(async (request, response) => {
+    const runId = String(request.params.runId);
+    const html = await miningStore.getReportHtml(runId);
+    if (!html) {
+      response.status(404).json({ error: '报告不存在', run_id: runId });
+      return;
+    }
+    response.type('html').send(html);
+  }));
+
+  app.post('/api/mining/runs/:runId/replay', asyncHandler(async (request, response) => {
+    const runId = String(request.params.runId);
+    const traceId = String(response.locals.traceId);
+    const run = await miningStore.getRun(runId);
+    if (!run) {
+      response.status(404).json({ error: '挖掘批次不存在', run_id: runId });
+      return;
+    }
+    const days = Number((request.body as { days?: number } | undefined)?.days ?? run.config.days ?? 250);
+    const task = tasks.start('mining_replay', `复现挖掘批次 ${runId}`, async ({ progress, traceId: taskTraceId }) => {
+      const universeSource = await store.getRankingUniverse();
+      progress(10, '准备历史行情快照');
+      const outcome = await replayMiningRun(runId, {
+        store: miningStore,
+        prepareData: async () => {
+          const prepared = await marketService.ensureHistoricalCoverage({
+            rankings: universeSource.rankings,
+            days,
+            asOfDate: universeSource.date,
+            traceId: taskTraceId,
+          });
+          return prepared.history;
+        },
+      });
+      progress(100, outcome.message);
+      return outcome;
+    });
+    response.status(202).json({ task_id: task.id, status: 'started', trace_id: traceId });
+  }));
+
+  app.get('/api/mining/calibration', asyncHandler(async (_request, response) => {
+    const calibrations = await miningStore.listCalibrations();
+    response.json({
+      total: calibrations.length,
+      calibrations,
+      latest: calibrations[0] ?? null,
+    });
+  }));
+
+  app.post('/api/mining/deploy', asyncHandler(async (request, response) => {
+    const body = (request.body ?? {}) as Partial<MiningDeployRequest> & Record<string, unknown>;
+    const runId = String(body.runId ?? body.run_id ?? '').trim();
+    const operator = String(body.operator ?? '').trim();
+    const confirmation = String(body.confirmation ?? '').trim();
+    const rank = Number(body.rank);
+    if (!runId) {
+      response.status(400).json({ error: 'run_id 不能为空' });
+      return;
+    }
+    if (!operator) {
+      response.status(400).json({ error: '下发必须记录操作人' });
+      return;
+    }
+    if (!confirmation) {
+      response.status(400).json({ error: '下发需显式确认：请把 runId 原样填入 confirmation' });
+      return;
+    }
+    if (!Number.isFinite(rank)) {
+      response.status(400).json({ error: 'rank 必须是数字' });
+      return;
+    }
+    const run = await miningStore.getRun(runId);
+    if (!run) {
+      response.status(404).json({ error: '挖掘批次不存在', run_id: runId });
+      return;
+    }
+    const results = await miningStore.getResults(runId);
+    const result = results.find((item) => item.rank === rank);
+    if (!result) {
+      response.status(404).json({ error: '该批次没有对应排名的候选参数', run_id: runId, rank });
+      return;
+    }
+    let config;
+    try {
+      config = buildInstanceConfig(
+        {
+          runId,
+          rank,
+          operator,
+          confirmation,
+          universe: body.universe as string[] | undefined,
+          capitalLimit: (body.capitalLimit ?? body.capital_limit) as number | undefined,
+          strategyIds: (body.strategyIds ?? body.strategy_ids) as string[] | undefined,
+        },
+        run,
+        result,
+      );
+    } catch (error) {
+      response.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+    await instanceStore.save(config);
+    await audit.info('mining', 'candidate_deployed', {
+      traceId: String(response.locals.traceId),
+      data: {
+        run_id: config.sourceRunId,
+        rank: config.sourceRank,
+        instance_id: config.instanceId,
+        operator: config.operator,
+        channel: config.channel,
+        params: config.params,
+      },
+    });
+    response.status(201).json({ ok: true, instance: config });
+  }));
+
+  app.get('/api/mining/instances', asyncHandler(async (_request, response) => {
+    const instances = await instanceStore.list();
+    response.json({ total: instances.length, instances });
+  }));
+
+  app.get('/api/mining/instances/:instanceId', asyncHandler(async (request, response) => {
+    const instanceId = String(request.params.instanceId);
+    const config = await instanceStore.get(instanceId);
+    if (!config) {
+      response.status(404).json({ error: '实例不存在', instance_id: instanceId });
+      return;
+    }
+    const state = await readInstanceState(miningStore.root, instanceId);
+    response.json({ instance: config, state });
+  }));
+
+  app.get('/api/mining/instances/:instanceId/validation', asyncHandler(async (request, response) => {
+    const instanceId = String(request.params.instanceId);
+    const config = await instanceStore.get(instanceId);
+    if (!config) {
+      response.status(404).json({ error: '实例不存在', instance_id: instanceId });
+      return;
+    }
+    const results = await miningStore.getResults(config.sourceRunId);
+    const result = results.find((item) => item.rank === config.sourceRank);
+    if (!result) {
+      response.status(404).json({ error: '找不到该实例对应的挖掘结果', run_id: config.sourceRunId });
+      return;
+    }
+    const state = await readInstanceState(miningStore.root, instanceId);
+    const instructions = state?.instructions ?? [];
+    const friction = computeFrictionStats(instructions);
+    const tradingDays = new Set(instructions.map((instruction) => instruction.signal_date)).size;
+    const report = buildValidationReport({
+      config,
+      predicted: result.outOfSample,
+      predictedOutOfSampleDays: result.outOfSampleDays,
+      actual: computeActualMetrics(instructions, tradingDays),
+      actualTradingDays: tradingDays,
+      friction,
+    });
+    response.json(report);
   }));
 
   // Audit

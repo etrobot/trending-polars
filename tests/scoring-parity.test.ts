@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { benchmarkReturns, computeBacktestScores } from '../server/backtest-scoring.js';
 import {
-  analyzeBlockTrend,
   computeADX,
   classifyMarketState,
   compareByScore,
@@ -13,6 +12,12 @@ import {
   MIN_HIGHER_TIMEFRAME_BARS,
   type Bar,
 } from '../server/scoring-engine.js';
+import {
+  buildRotationScoreMap,
+  entryLevelOf,
+  trendAxisFromEntryScore,
+  type BlockPricePoint,
+} from '../server/sector-rotation.js';
 import type { RankingRow } from '../src/types.js';
 import { historicalFixture } from './historical-fixture.js';
 
@@ -103,7 +108,7 @@ describe('实盘 scoreStock 与向量化 computeBacktestScores 口径一致', ()
     expect(vector.trend_score).toBe(live.trend_score);
   });
 
-  it('keeps contextual sector-strategy adjustments identical when a sector state is available', () => {
+  it('keeps contextual sector-strategy adjustments identical when a sector rotation score is available', () => {
     const history = historicalFixture();
     const targetDate = history.calendar.at(-1)!;
     const sectorBars = history.stocks.find((stock) => stock.stock_code === '600004')!.bars;
@@ -123,26 +128,35 @@ describe('实盘 scoreStock 与向量化 computeBacktestScores 口径一致', ()
     const exactLimitUps = new Map([['600001', new Set([sectorDate])]]);
     const vector = (computeBacktestScores(scoped, [targetDate], exactLimitUps).get(targetDate) ?? [])
       .find((row) => row.stock_code === '600001')!;
-    const blockBars: Bar[] = sectorBars.map((bar) => ({
-      date: bar[0], open: bar[1], close: bar[2], high: bar[3], low: bar[4],
-      volume: bar[5], amount: bar[6], changePct: bar[7],
+    // 主口径：板块轮动评分。与向量化路径同源复算 entryScore，映射三态轴后传入实盘路径。
+    const rows: BlockPricePoint[] = sectorBars.map((bar) => ({
+      block_code: sectorCode,
+      block_name: '下跌样本板块',
+      date: String(bar[0]),
+      open: Number(bar[1]),
+      high: Number(bar[3]),
+      low: Number(bar[4]),
+      close: Number(bar[2]),
     }));
-    const state = analyzeBlockTrend(blockBars);
-    expect(state.state_id).toBe(6);
+    const score = buildRotationScoreMap(rows, [targetDate]).get(sectorCode)?.get(targetDate);
+    expect(score).toBeTypeOf('number');
+    // 持续阴跌样本应落在「回避」档，映射为 down 轴。
+    expect(score! < 45).toBe(true);
+    expect(trendAxisFromEntryScore(score!)).toBe('down');
     const live = scoreStock(
       prepareSeries(scoped.stocks.find((stock) => stock.stock_code === '600001')!),
       targetDate,
       {
-        stateId: state.state_id,
-        trend: 'down',
-        trendName: state.state_name,
+        trend: trendAxisFromEntryScore(score!),
+        trendName: entryLevelOf(score!),
         code: sectorCode,
         name: '下跌样本板块',
         limitUpDates: exactLimitUps.get('600001'),
         benchmarkReturnPct: benchmarkReturns(scoped, DEFAULT_SCORE_STOCK_CONFIG.relativeStrength.lookback).get(targetDate),
       },
     )!;
-    expect(vector.sector_strategy_score).toBe(8);
+    expect(vector.sector_trend_name).toBe(entryLevelOf(score!));
+    expect(vector.sector_trend_state_id).toBeUndefined();
     expect(vector.sector_strategy_score).toBe(live.sector_strategy_score);
     expect(vector.sector_strategy_label).toBe(live.sector_strategy_label);
     expect(vector.sector_strategy_reason).toBe(live.sector_strategy_reason);

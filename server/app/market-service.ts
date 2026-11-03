@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { AnalysisData, BlockAnalysis, IndexAnalysis, LimitUpStock, RankingRow } from '../../src/types.js';
 import type { AuditLoggerLike } from '../audit-log.js';
-import { historicalCrossSectionRankings, sectorTrendLookupMap, type SectorTrendLookup } from '../backtest-engine.js';
+import { historicalCrossSectionRankings, sectorTrendLookupMap, type SectorRotationLookup, type SectorTrendLookup } from '../backtest-engine.js';
 import { compactDate, formatDateTime, round } from '../format.js';
 import {
   assessHistoricalMarketCoverage,
@@ -20,6 +20,7 @@ import {
 import { resolveLatestTradingDate } from '../index-bootstrap.js';
 import { queryRankings, refreshAnalysis } from '../polars-engine.js';
 import { analyzeBlockTrend, blockStrategy, classifyMarketState, klinesToBars, DEFAULT_SCORE_STOCK_CONFIG, type MarketStateThresholds } from '../scoring-engine.js';
+import { buildRotationScoreMap, entryLevelOf, isIndustryBlockCode } from '../sector-rotation.js';
 import type { DataStore } from '../data-store.js';
 import {
   BLOCK_PERIOD_DAILY,
@@ -588,6 +589,26 @@ export class MarketService {
     return sectorTrendsByCode;
   }
 
+  /**
+   * 板块轮动评分（策略主口径）：取今年 block_daily_price 日线并截断到 asOfDate，
+   * 只算行业板块（881xxx，个股 sector_code 即此段），返回 Map<sector_code, {score, level}>。
+   * 数据缺失时返回空表，截面评分自动回退旧的 state_id 趋势轴。
+   */
+  async buildSectorRotationByCode(asOfDate: string): Promise<Map<string, SectorRotationLookup>> {
+    const compact = asOfDate.replaceAll('-', '').slice(0, 8);
+    const year = Number(compact.slice(0, 4));
+    if (!Number.isFinite(year)) return new Map();
+    const rows = await this.store.getBlockPriceHistory(`${year}-01-01`, `${year + 1}-01-01`);
+    const scoreMap = buildRotationScoreMap(rows.filter((row) => isIndustryBlockCode(row.block_code)), [compact]);
+    const result = new Map<string, SectorRotationLookup>();
+    for (const [code, byDate] of scoreMap) {
+      const score = byDate.get(compact);
+      if (score == null) continue;
+      result.set(code, { score, level: entryLevelOf(score) });
+    }
+    return result;
+  }
+
   async computeAndSaveRanking(options: {
     requestedDate: string;
     days?: number;
@@ -633,6 +654,7 @@ export class MarketService {
       source.rankings,
       prepared.history.as_of_date,
     );
+    const sectorRotationByCode = await this.buildSectorRotationByCode(prepared.history.as_of_date);
     const rankings = historicalCrossSectionRankings(
       prepared.history,
       prepared.history.as_of_date,
@@ -641,6 +663,7 @@ export class MarketService {
       {
         scoringConfig: rankingConfig.scoring_config,
         factorWeights: rankingConfig.factor_weights,
+        sectorRotationByCode,
       },
     );
     if (!rankings.length) throw new Error(`${prepared.history.as_of_date} 行情不足，无法生成截面排行`);
@@ -734,7 +757,8 @@ export class MarketService {
       ranking.rankings,
       strategyDate,
     );
-    const strategyRankings = historicalCrossSectionRankings(history, strategyDate, ranking.rankings, sectorTrendsByCode);
+    const sectorRotationByCode = await this.buildSectorRotationByCode(strategyDate);
+    const strategyRankings = historicalCrossSectionRankings(history, strategyDate, ranking.rankings, sectorTrendsByCode, { sectorRotationByCode });
     if (!strategyRankings.length) throw new Error(`行情已准备，但 ${strategyDate} 无法生成截面排行`);
     if (refreshForClose || ranking.date !== strategyDate) {
       await this.store.saveRanking({

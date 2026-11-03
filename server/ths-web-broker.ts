@@ -1,4 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { PaperOrder, PaperPosition } from '../src/types.js';
@@ -20,6 +21,16 @@ const MONI_BASE_URL = 'http://moni.10jqka.com.cn';
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36 Edg/131.0';
 const DEFAULT_COOKIE_FILE = path.resolve(MODULE_DIR, '..', '..', '.tools', 'ths-cookie-bound.txt');
 
+const LOGIN_PAGE_URL = `https://upass.10jqka.com.cn/login?redir=${encodeURIComponent('http://moni.10jqka.com.cn/moni/')}`;
+const EDGE_CANDIDATES = [
+  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+];
+const LOGIN_PROFILE_DIR = path.resolve(MODULE_DIR, '..', '..', '.tools', 'edge-login-popup');
+const LOGIN_CDP_PORT = Number(process.env.THS_WEB_LOGIN_CDP_PORT ?? 9336);
+const LOGIN_TIMEOUT_MS = Number(process.env.THS_WEB_LOGIN_TIMEOUT_MS ?? 300_000);
+const LOGIN_POLL_MS = 3_000;
+
 const NOT_LOGGED_IN_CODE = -999999;
 const CANCELABLE_STATUS = ['未报', '待报', '已报', '部成', '未成交'];
 const CANCELLED_MARKERS = ['已撤', '全部撤单', '部撤'];
@@ -32,6 +43,8 @@ export interface ThsWebBrokerOptions {
   baseUrl?: string;
   timeoutMs?: number;
   fetchImpl?: typeof fetch;
+  /** 会话失效时是否弹出浏览器窗口让用户登录（默认开启，THS_WEB_INTERACTIVE_LOGIN=0 可关闭）。 */
+  interactiveLogin?: boolean;
 }
 
 type JsonObject = Record<string, any>;
@@ -72,6 +85,8 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
   private readonly fetchImpl: typeof fetch;
   private readonly jar = new Map<string, string>();
   private readonly gdzhByMkcode = new Map<string, string>();
+  private readonly interactiveLoginEnabled: boolean;
+  private readonly cookieFilePath: string | null = null;
   private operationQueue: Promise<void> = Promise.resolve();
   private sessionChecked = false;
 
@@ -80,14 +95,17 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
     this.baseUrl = (options.baseUrl ?? process.env.THS_WEB_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/$/, '');
     this.timeoutMs = options.timeoutMs ?? 20_000;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.interactiveLoginEnabled = options.interactiveLogin ?? process.env.THS_WEB_INTERACTIVE_LOGIN !== '0';
+    const cookieFile = options.cookieFile ?? process.env.THS_WEB_COOKIE_FILE ?? DEFAULT_COOKIE_FILE;
     const raw = options.cookie
       ?? process.env.THS_WEB_COOKIE
-      ?? this.readCookieFile(options.cookieFile ?? process.env.THS_WEB_COOKIE_FILE ?? DEFAULT_COOKIE_FILE);
+      ?? this.readCookieFile(cookieFile);
     if (!raw) {
       throw new ThsSimulatedBrokerError(
         `缺少同花顺 Web 模拟盘 Cookie：请设置 THS_WEB_COOKIE 或提供 Cookie 文件（默认 ${DEFAULT_COOKIE_FILE}）`,
       );
     }
+    if (!options.cookie && !process.env.THS_WEB_COOKIE) this.cookieFilePath = cookieFile;
     Object.entries(parseCookieHeader(raw.trim())).forEach(([key, value]) => this.jar.set(key, value));
   }
 
@@ -139,17 +157,14 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
     return uname.length > 0;
   }
 
-  private async rebind(context: BrokerCallContext): Promise<void> {
-    const started = Date.now();
+  private async runRebindChain(context: BrokerCallContext): Promise<{ loggedIn: boolean; detail: string }> {
     const cjdbs = await this.rawFetch(`${MONI_BASE_URL}/mncg/index/getcjdbs/`, {
       headers: { Referer: `${MONI_BASE_URL}/mncg/` },
     });
     const cjdbsJson = (await cjdbs.json().catch(() => null)) as JsonObject | null;
     const jyUrl = cjdbsJson?.result?.data?.[0]?.jyUrlOl as string | undefined;
     if (!jyUrl) {
-      throw new ThsSimulatedBrokerError(
-        `同花顺模拟盘绑定失败：getcjdbs 未返回交易入口（passport 会话可能已过期）：${JSON.stringify(cjdbsJson ?? {}).slice(0, 300)}`,
-      );
+      return { loggedIn: false, detail: `getcjdbs 未返回交易入口（passport 会话可能已过期）：${JSON.stringify(cjdbsJson ?? {}).slice(0, 300)}` };
     }
     let url = jyUrl;
     for (let hop = 0; hop <= 6; hop += 1) {
@@ -162,13 +177,129 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
       break;
     }
     const loggedIn = await this.checkLogin();
+    return { loggedIn, detail: loggedIn ? '绑定链成功' : '绑定链走完后仍未登录' };
+  }
+
+  private async rebind(context: BrokerCallContext): Promise<void> {
+    const started = Date.now();
+    let { loggedIn, detail } = await this.runRebindChain(context);
+    if (!loggedIn && this.interactiveLoginEnabled) {
+      await this.audit.warn('ths_web_broker', 'login_popup_opened', {
+        traceId: context.traceId,
+        data: { reason: detail.slice(0, 300) },
+      });
+      loggedIn = await this.interactiveLogin(context);
+      detail = loggedIn ? '用户登录成功' : detail;
+    }
     await this.audit.info('ths_web_broker', 'rebind_completed', {
       traceId: context.traceId,
       durationMs: Date.now() - started,
       data: { logged_in: loggedIn },
     });
-    if (!loggedIn) throw new ThsSimulatedBrokerError('同花顺 Web 模拟盘重新绑定后仍未登录，请更新 Cookie');
+    if (!loggedIn) throw new ThsSimulatedBrokerError(`同花顺 Web 模拟盘未登录：${detail}。请完成登录后重试`);
     this.sessionChecked = true;
+    this.persistCookies();
+  }
+
+  private persistCookies(): void {
+    if (!this.cookieFilePath) return;
+    try {
+      writeFileSync(this.cookieFilePath, this.cookieHeader(), 'utf8');
+    } catch {
+      // Cookie 文件写回失败不影响当前会话
+    }
+  }
+
+  /** 弹出可见 Edge 窗口（独立 profile + CDP 端口）等待用户登录，登录成功后把浏览器 Cookie 合入会话 jar。 */
+  private async interactiveLogin(context: BrokerCallContext): Promise<boolean> {
+    const edge = EDGE_CANDIDATES.find((candidate) => existsSync(candidate));
+    if (!edge) {
+      await this.audit.warn('ths_web_broker', 'login_edge_not_found', { traceId: context.traceId, data: { candidates: EDGE_CANDIDATES } });
+      return false;
+    }
+    let spawned: ChildProcess | null = null;
+    let cdpUp = (await this.cdpVersion()) != null;
+    if (!cdpUp) {
+      mkdirSync(LOGIN_PROFILE_DIR, { recursive: true });
+      spawned = spawn(edge, [
+        `--user-data-dir=${LOGIN_PROFILE_DIR}`,
+        `--remote-debugging-port=${LOGIN_CDP_PORT}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+        LOGIN_PAGE_URL,
+      ], { stdio: 'ignore' });
+      for (let attempt = 0; attempt < 40 && !cdpUp; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        cdpUp = (await this.cdpVersion()) != null;
+      }
+      if (!cdpUp) {
+        spawned.kill();
+        await this.audit.warn('ths_web_broker', 'login_cdp_unreachable', { traceId: context.traceId, data: { port: LOGIN_CDP_PORT } });
+        return false;
+      }
+    } else {
+      // 已有登录窗口在跑：新开一个标签页指向登录页
+      await fetch(`http://127.0.0.1:${LOGIN_CDP_PORT}/json/new?${LOGIN_PAGE_URL}`, { method: 'PUT', signal: AbortSignal.timeout(3_000) }).catch(() => undefined);
+    }
+    const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, LOGIN_POLL_MS));
+      const browserCookies = await this.readBrowserCookies();
+      if (browserCookies) {
+        for (const [key, value] of Object.entries(browserCookies)) {
+          if (value && value !== 'deleted') this.jar.set(key, value);
+        }
+      }
+      const { loggedIn } = await this.runRebindChain(context).catch(() => ({ loggedIn: false, detail: 'rebind 轮询异常' }));
+      if (loggedIn) {
+        spawned?.kill();
+        await this.audit.info('ths_web_broker', 'login_popup_completed', { traceId: context.traceId, data: { waited_ms: Date.now() - (deadline - LOGIN_TIMEOUT_MS) } });
+        return true;
+      }
+    }
+    spawned?.kill();
+    await this.audit.warn('ths_web_broker', 'login_popup_timeout', { traceId: context.traceId, data: { timeout_ms: LOGIN_TIMEOUT_MS } });
+    return false;
+  }
+
+  private async cdpVersion(): Promise<{ webSocketDebuggerUrl?: string } | null> {
+    try {
+      const response = await fetch(`http://127.0.0.1:${LOGIN_CDP_PORT}/json/version`, { signal: AbortSignal.timeout(1_500) });
+      if (!response.ok) return null;
+      return (await response.json()) as { webSocketDebuggerUrl?: string };
+    } catch {
+      return null;
+    }
+  }
+
+  private async readBrowserCookies(): Promise<Record<string, string> | null> {
+    const version = await this.cdpVersion();
+    if (!version?.webSocketDebuggerUrl) return null;
+    const ws = new globalThis.WebSocket(version.webSocketDebuggerUrl);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        ws.onopen = () => resolve();
+        ws.onerror = () => reject(new Error('cdp ws connect failed'));
+        setTimeout(() => reject(new Error('cdp ws connect timeout')), 5_000);
+      });
+      const result = await new Promise<any>((resolve, reject) => {
+        ws.onmessage = (event: MessageEvent) => {
+          const message = JSON.parse(String(event.data));
+          if (message.id === 1) resolve(message.result);
+        };
+        ws.send(JSON.stringify({ id: 1, method: 'Storage.getCookies' }));
+        setTimeout(() => reject(new Error('cdp get cookies timeout')), 8_000);
+      });
+      const out: Record<string, string> = {};
+      for (const cookie of (result?.cookies ?? []) as { name: string; value: string; domain: string }[]) {
+        if (/10jqka|thsi|hexin/.test(String(cookie.domain))) out[cookie.name] = cookie.value;
+      }
+      return Object.keys(out).length > 0 ? out : null;
+    } catch {
+      return null;
+    } finally {
+      try { ws.close(); } catch { /* ignore */ }
+    }
   }
 
   private async ensureSession(context: BrokerCallContext): Promise<void> {

@@ -18,6 +18,9 @@ import {
   normalizeScoreStockConfig,
 } from './scoring-engine.js';
 import { benchmarkReturns } from './backtest-scoring.js';
+import { fromBacktestEquity, fromBacktestTrades } from './metrics/adapters.js';
+import { computeMetrics, type PerformanceMetrics } from './metrics/performance.js';
+import { trendAxisFromEntryScore } from './sector-rotation.js';
 import {
   calculateEntrySize,
   commission,
@@ -74,6 +77,8 @@ interface BacktestSummarySnapshot {
   expireCount: number;
   maxHoldings: number;
   maxDrawdownPct: number;
+  /** 统一指标模块的完整输出。 */
+  metrics: PerformanceMetrics;
 }
 
 interface FactorWeights {
@@ -251,13 +256,34 @@ export function sectorTrendLookupMap(
   return new Map(records.map((record) => [record.sector_code, record]));
 }
 
+/** 板块轮动评分查询项：entryScore（0-100）与对应档位名。 */
+export interface SectorRotationLookup {
+  score: number;
+  level: string;
+}
+
 function sectorContextForRanking(
   previous: RankingRow | undefined,
   sectorTrendsByCode: Map<string, SectorTrendLookup>,
+  sectorRotationByCode: Map<string, SectorRotationLookup>,
   limitUpDates: ReadonlySet<string> | undefined,
   benchmarkReturnPct: number | null | undefined,
 ): SectorContext {
   const sectorCode = String(previous?.sector_code ?? '').trim();
+  // 主口径：板块轮动评分 → 三态趋势轴；情境修正按轴分类（不传 stateId），
+  // 与向量化回测路径（sector_rotation_score 优先）保持一致。
+  const rotation = sectorCode ? sectorRotationByCode.get(sectorCode) : undefined;
+  if (rotation) {
+    return {
+      trend: trendAxisFromEntryScore(rotation.score),
+      trendName: rotation.level,
+      code: sectorCode,
+      name: previous?.sector_name,
+      limitUpDates,
+      benchmarkReturnPct,
+      rotationScore: rotation.score,
+    };
+  }
   const trend = sectorCode ? sectorTrendsByCode.get(sectorCode) : undefined;
   if (trend) {
     return {
@@ -285,6 +311,8 @@ function sectorContextForRanking(
 export interface CrossSectionRankingOptions {
   scoringConfig?: ScoreStockConfig;
   factorWeights?: FactorWeights;
+  /** 板块轮动评分（主口径）；缺失的板块回退 sectorTrendsByCode 的 state_id。 */
+  sectorRotationByCode?: Map<string, SectorRotationLookup>;
 }
 
 export function historicalCrossSectionRankings(
@@ -303,6 +331,7 @@ export function historicalCrossSectionRankings(
   const targetDate = date.replaceAll('-', '').slice(0, 8);
   const previousByCode = new Map(previousRows.map((row) => [row.stock_code, row]));
   const exactLimitUpDates = limitUpDatesByCode(history);
+  const sectorRotationByCode = options.sectorRotationByCode ?? new Map<string, SectorRotationLookup>();
   // 维度 5 的基准：与向量化回测取同一条上证指数曲线、同一 lookback。
   const benchmarkReturnPct = benchmarkReturns(history, scoringConfig.relativeStrength.lookback).get(targetDate);
   const scored = history.stocks.flatMap((stock): RankingRow[] => {
@@ -310,7 +339,7 @@ export function historicalCrossSectionRankings(
     const row = scoreStock(
       prepareSeries(stock),
       targetDate,
-      sectorContextForRanking(previous, sectorTrendsByCode, exactLimitUpDates.get(stock.stock_code), benchmarkReturnPct),
+      sectorContextForRanking(previous, sectorTrendsByCode, sectorRotationByCode, exactLimitUpDates.get(stock.stock_code), benchmarkReturnPct),
       scoringConfig,
     );
     if (!row) return [];
@@ -332,26 +361,17 @@ export function historicalStrategyCandidates(history: HistoricalMarketData, date
     .map((row, index) => ({ ...row, rank: index + 1 }));
 }
 
-function drawdownPercent(values: number[]): number {
-  let peak = values[0] ?? 0;
-  let maxDrawdown = 0;
-  for (const value of values) {
-    peak = Math.max(peak, value);
-    if (peak > 0) maxDrawdown = Math.min(maxDrawdown, (value - peak) / peak);
-  }
-  return round(maxDrawdown * 100, 2);
-}
-
 function sellPosition(
   position: Position,
   rawPrice: number,
   date: string,
   dateIndex: number,
   reason: string,
+  strategy: ReturnType<typeof createT1StrategyConfig>,
 ): { trade: BacktestTrade; cashProceeds: number } {
-  const fillPrice = round(rawPrice * (1 - DEFAULT_T1_STRATEGY.slippageRate), 3);
+  const fillPrice = round(rawPrice * (1 - strategy.slippageRate), 3);
   const grossAmount = round(fillPrice * position.shares, 2);
-  const fees = commission(grossAmount) + round(grossAmount * DEFAULT_T1_STRATEGY.stampTaxRate, 2);
+  const fees = commission(grossAmount) + round(grossAmount * strategy.stampTaxRate, 2);
   const cashProceeds = round(grossAmount - fees, 2);
   const pnlAmount = round(cashProceeds - position.totalCost, 2);
   const pnlPct = position.totalCost > 0 ? round(pnlAmount / position.totalCost * 100, 2) : 0;
@@ -420,7 +440,7 @@ function simulateBacktest(
         continue;
       }
       if (!bar?.open || bar.open <= 0) continue;
-      const sold = sellPosition(position, bar.open, date, dateIndex, reason);
+      const sold = sellPosition(position, bar.open, date, dateIndex, reason, strategy);
       cash = round(cash + sold.cashProceeds, 2);
       trades.push(sold.trade);
       positions.delete(code);
@@ -516,7 +536,7 @@ function simulateBacktest(
   const finalDateIndex = dates.length - 1;
   for (const position of [...positions.values()]) {
     const finalPrice = lastKnownClose.get(position.stockCode) ?? position.buyPrice;
-    const sold = sellPosition(position, finalPrice, finalDate, finalDateIndex, '回测结束按收盘清仓');
+    const sold = sellPosition(position, finalPrice, finalDate, finalDateIndex, '回测结束按收盘清仓', strategy);
     cash = round(cash + sold.cashProceeds, 2);
     trades.push(sold.trade);
     positions.delete(position.stockCode);
@@ -533,13 +553,14 @@ function simulateBacktest(
 
 function summarizeSimulation(simulation: SimulatedBacktest): BacktestSummarySnapshot {
   const sellTrades = simulation.trades.filter((trade) => trade.action === '卖出');
-  const sellFrame = pl.DataFrame(sellTrades.map((trade) => ({
-    pnl_pct: Number(trade.pnl_pct),
-    pnl_amount: Number(trade.pnl_amount ?? 0),
-    hold_days: Number(trade.hold_days),
-  })));
   const totalReturn = round(simulation.cash - INITIAL_CAPITAL, 2);
-  const winCount = sellFrame.height ? sellFrame.filter(pl.col('pnl_amount').gt(0)).height : 0;
+  const winCount = sellTrades.filter((trade) => Number(trade.pnl_amount ?? 0) > 0).length;
+  // 指标统一走 metrics/performance.ts，回测不再自行计算胜率/回撤等派生指标。
+  const metrics = computeMetrics({
+    trades: fromBacktestTrades(simulation.trades),
+    equityCurve: fromBacktestEquity(simulation.equityCurve),
+    initialCapital: INITIAL_CAPITAL,
+  });
   return {
     finalCapital: round(simulation.cash, 2),
     totalReturn,
@@ -548,16 +569,23 @@ function summarizeSimulation(simulation: SimulatedBacktest): BacktestSummarySnap
     buyCount: simulation.trades.length - sellTrades.length,
     sellCount: sellTrades.length,
     winCount,
-    winRate: sellTrades.length ? round(winCount / sellTrades.length * 100, 1) : 0,
+    winRate: metrics.winRate,
     expireCount: sellTrades.filter((trade) => trade.reason.startsWith('持仓满')).length,
     maxHoldings: simulation.maxHoldings,
-    maxDrawdownPct: drawdownPercent(simulation.equityCurve.map((point) => point.total)),
+    maxDrawdownPct: metrics.maxDrawdown,
+    metrics,
   };
 }
 
 function normalizeStopLossPct(value: number | undefined): number {
   const raw = value ?? DEFAULT_T1_STRATEGY.stopLossPct;
   return -Math.max(1, Math.abs(Math.trunc(raw)));
+}
+
+/** P5：滑点率归一化（0-1）；非法值退回默认，负值取绝对值。 */
+function normalizeSlippageRate(value: number | undefined): number {
+  if (value == null || !Number.isFinite(value)) return DEFAULT_T1_STRATEGY.slippageRate;
+  return Math.abs(value);
 }
 
 function buildResult(
@@ -623,6 +651,7 @@ function buildResult(
       expire_count: summary.expireCount,
       max_holdings: summary.maxHoldings,
       max_drawdown_pct: summary.maxDrawdownPct,
+      metrics: summary.metrics,
     },
     config: {
       mode,
@@ -847,6 +876,8 @@ export interface BacktestQuickSummary {
   winRate: number;
   maxDrawdownPct: number;
   totalTrades: number;
+  /** 统一指标模块输出（P1）。 */
+  metrics: PerformanceMetrics;
 }
 
 /** 构建可复用的回测上下文（评分矩阵 + 日历），供参数优化等批量模拟使用。 */
@@ -856,6 +887,66 @@ export function prepareBacktestContext(
   scoringConfig: ScoreStockConfig = DEFAULT_SCORE_STOCK_CONFIG,
 ) {
   return buildBacktestContext(history, days, scoringConfig);
+}
+
+/**
+ * 把已有 context 裁剪到指定日期区间，用于 walk-forward 的样本内/样本外分段回测。
+ *
+ * 注意：裁剪后独立运行，仓位从空仓开始，因此分段结果不可直接与整段结果相加；
+ * 需要连续资金曲线的场景应改用 metrics 模块对全段成交记录切分。
+ */
+export function sliceBacktestContext(
+  context: BacktestContext,
+  range: { start: string; end: string },
+): BacktestContext {
+  const dates = context.dates.filter((date) => date >= range.start && date <= range.end);
+  const scoreMap = new Map<string, RankingRow[]>();
+  for (const date of dates) {
+    const rows = context.scoreMap.get(date);
+    if (rows) scoreMap.set(date, rows);
+  }
+  return { ...context, dates, scoreMap };
+}
+
+/**
+ * 在已有 context 上快速模拟一组参数，并返回完整成交记录与净值曲线。
+ *
+ * walk-forward 需要拿到逐笔成交与净值曲线，才能用 metrics 模块按样本内/外区间
+ * 切分计算统一指标，因此这里在 quickSimulateBacktest 之外再暴露一份完整结果。
+ */
+export function quickSimulateBacktestFull(
+  context: BacktestContext,
+  options: Parameters<typeof quickSimulateBacktest>[1],
+): { summary: BacktestQuickSummary; trades: BacktestTrade[]; equityCurve: EquityPoint[] } {
+  const strategy = createT1StrategyConfig({
+    maxHoldDays: Math.max(1, Math.trunc(options.maxHoldDays)),
+    maxPositions: Math.max(1, Math.trunc(options.maxPositions ?? DEFAULT_T1_STRATEGY.maxPositions)),
+    stopLossPct: normalizeStopLossPct(options.stopLossPct),
+    takeProfitPct: Math.max(1, Math.trunc(options.takeProfitPct ?? DEFAULT_T1_STRATEGY.takeProfitPct)),
+    positionSizePct: Math.max(1, Math.trunc(options.positionSizePct ?? DEFAULT_T1_STRATEGY.positionSizePct)),
+    // P5：实测滑点校准（缺省仍是 0.0005，行为不变）。
+    slippageRate: normalizeSlippageRate(options.slippageRate),
+  });
+  const factorWeights = normalizeFactorWeights({
+    trendWeightPct: options.trendWeightPct,
+    volumePriceWeightPct: options.volumePriceWeightPct,
+    distanceFromLowWeightPct: options.distanceFromLowWeightPct,
+    volatilityTrendWeightPct: options.volatilityTrendWeightPct ?? options.volatilityWeightPct,
+    relativeStrengthWeightPct: options.relativeStrengthWeightPct,
+  });
+  const simulation = simulateBacktest(context, strategy, factorWeights);
+  const summary = summarizeSimulation(simulation);
+  return {
+    summary: {
+      totalReturnPct: summary.totalReturnPct,
+      winRate: summary.winRate,
+      maxDrawdownPct: summary.maxDrawdownPct,
+      totalTrades: summary.totalTrades,
+      metrics: summary.metrics,
+    },
+    trades: simulation.trades,
+    equityCurve: simulation.equityCurve,
+  };
 }
 
 /** 在已有 context 上快速模拟一组参数，避免重复构建评分矩阵。 */
@@ -874,6 +965,8 @@ export function quickSimulateBacktest(
     /** backtest-param-optimizer 的 OptimizedStrategyParams 用的是这个短名。 */
     volatilityWeightPct?: number;
     relativeStrengthWeightPct?: number;
+    /** P5：实测滑点率（0-1），缺省用 DEFAULT_T1_STRATEGY.slippageRate。 */
+    slippageRate?: number;
   },
 ): BacktestQuickSummary {
   const strategy = createT1StrategyConfig({
@@ -882,6 +975,8 @@ export function quickSimulateBacktest(
     stopLossPct: normalizeStopLossPct(options.stopLossPct),
     takeProfitPct: Math.max(1, Math.trunc(options.takeProfitPct ?? DEFAULT_T1_STRATEGY.takeProfitPct)),
     positionSizePct: Math.max(1, Math.trunc(options.positionSizePct ?? DEFAULT_T1_STRATEGY.positionSizePct)),
+    // P5：实测滑点校准（缺省仍是 0.0005，行为不变）。
+    slippageRate: normalizeSlippageRate(options.slippageRate),
   });
   const factorWeights = normalizeFactorWeights({
     trendWeightPct: options.trendWeightPct,
@@ -899,5 +994,6 @@ export function quickSimulateBacktest(
     winRate: summary.winRate,
     maxDrawdownPct: summary.maxDrawdownPct,
     totalTrades: summary.totalTrades,
+    metrics: summary.metrics,
   };
 }

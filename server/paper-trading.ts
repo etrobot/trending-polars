@@ -16,17 +16,21 @@ import type {
 } from '../src/types.js';
 import { guardDetachedPromise, NOOP_AUDIT_LOGGER, type AuditLoggerLike } from './audit-log.js';
 import { round } from './format.js';
+import { fromPaperInstructions, paperPnlBySellInstruction } from './metrics/adapters.js';
+import { computeMetrics } from './metrics/performance.js';
 import {
   calculateEntrySize,
   createT1StrategyConfig,
   DEFAULT_T1_STRATEGY,
   exitSignalReason,
+  miningParamsToStrategyConfig,
   rankEntryCandidates,
   serializeStrategyConfig,
   strategyFromBacktestConfig,
   tradingDayDistance,
   type T1StrategyConfig,
 } from './trading-strategy.js';
+import type { MiningInstanceConfig } from './pipeline/deploy.js';
 import {
   ThsSimulatedBroker,
   type BrokerActionResult,
@@ -113,6 +117,10 @@ export class PaperTradingService extends EventEmitter {
   private readonly stateStore: PaperTradingStateStore;
   private strategy: T1StrategyConfig;
   private strategyHydratedFromState = false;
+  /** P5：启用子策略 id（undefined → 读环境变量）。 */
+  private entryStrategyIds?: string[];
+  /** P5：买入分数合成规则。 */
+  private readonly scoreMergeRule?: 'max' | 'weighted';
   private readonly now: () => Date;
   private readonly schedulerIntervalMs: number;
   private readonly accountMonitorIntervalMs: number;
@@ -147,6 +155,8 @@ export class PaperTradingService extends EventEmitter {
         : Math.max(DEFAULT_T1_STRATEGY.maxCandidates, requestedMaxPositions * 3),
     });
     this.now = options.now ?? (() => new Date());
+    this.entryStrategyIds = options.entryStrategyIds;
+    this.scoreMergeRule = options.scoreMergeRule;
     this.schedulerIntervalMs = Math.max(5_000, options.schedulerIntervalMs ?? 15_000);
     this.accountMonitorIntervalMs = Math.max(30_000, options.accountMonitorIntervalMs ?? 60_000);
     this.enforceTradingWindows = options.enforceTradingWindows ?? true;
@@ -218,6 +228,63 @@ export class PaperTradingService extends EventEmitter {
         run_id: runId,
         strategy: state.strategy_config,
         plan,
+      };
+      this.broadcast('status', payload);
+      return payload;
+    });
+  }
+
+  /**
+   * 应用下发实例的候选参数（P5）。
+   *
+   * 只覆盖「阈值 / 仓位 / 止盈止损 / 启用子策略」这些参数，
+   * 买入判定规则（MA 多头排列）不受影响 —— 信号仍由 rankEntryCandidates 唯一产出。
+   */
+  applyMiningInstance(config: MiningInstanceConfig, traceId: string = randomUUID()) {
+    return this.exclusive(async () => {
+      const overrides = miningParamsToStrategyConfig(config.params);
+      if (!Object.keys(overrides).length) {
+        throw new Error('挖掘结果中没有可应用的策略参数');
+      }
+      const maxPositions = Math.max(1, Math.trunc(overrides.maxPositions ?? this.strategy.maxPositions));
+      this.strategy = createT1StrategyConfig({
+        ...this.strategy,
+        ...overrides,
+        maxEntriesPerDay: overrides.maxEntriesPerDay
+          ?? Math.max(DEFAULT_T1_STRATEGY.maxEntriesPerDay, maxPositions),
+        maxCandidates: Math.max(this.strategy.maxCandidates, maxPositions * 3),
+      });
+      this.entryStrategyIds = [...config.strategyIds];
+      const state = await this.getState();
+      state.strategy_config = serializeStrategyConfig(this.strategy);
+      state.applied_mining_run_id = config.sourceRunId;
+      state.entry_strategy_ids = [...config.strategyIds];
+      this.recordEvent(
+        state,
+        'system',
+        'mining_instance_applied',
+        `已应用挖掘候选参数 ${config.sourceRunId} #${config.sourceRank}`,
+      );
+      await this.persist(state);
+      await this.audit.info('paper_trading', 'mining_instance_applied', {
+        traceId,
+        data: {
+          run_id: config.sourceRunId,
+          rank: config.sourceRank,
+          instance_id: config.instanceId,
+          operator: config.operator,
+          channel: config.channel,
+          strategy: state.strategy_config,
+          strategy_ids: config.strategyIds,
+        },
+      });
+      const payload = {
+        ok: true,
+        run_id: config.sourceRunId,
+        instance_id: config.instanceId,
+        operator: config.operator,
+        strategy: state.strategy_config,
+        strategy_ids: config.strategyIds,
       };
       this.broadcast('status', payload);
       return payload;
@@ -441,7 +508,7 @@ export class PaperTradingService extends EventEmitter {
         last_error: undefined,
       };
       await this.persist(state);
-      const runLabel = options.trigger === 'immediate' ? '立即执行' : `${window} 窗口`;
+      const runLabel = options.trigger === 'immediate' ? '马上下单' : `${window} 窗口`;
       const message = `${displayDate(clock.date)} ${runLabel}完成，处理 ${results.length} 笔策略指令`;
       await this.audit.info('paper_trading', 'window_completed', {
         traceId,
@@ -677,6 +744,7 @@ export class PaperTradingService extends EventEmitter {
         }),
         orders: snapshot.orders.map((order) => ({ ...order })),
         pnl_summary: { amount: pnlAmount, pct: costBasis ? round(pnlAmount / costBasis * 100, 2) : 0 },
+        metrics: this.computePaperMetrics(state),
       },
       plan: {
         ...this.planStrategyFields(strategy),
@@ -690,6 +758,28 @@ export class PaperTradingService extends EventEmitter {
         skipped,
       },
     };
+  }
+
+  /**
+   * 模拟交易侧的统一指标（P1）。
+   *
+   * 与回测共用 metrics/performance.ts 的口径：成交来自已成交指令，
+   * 净值曲线来自账户资产快照（asset_history）。
+   */
+  private computePaperMetrics(state: PaperTradingRuntimeState) {
+    const pnlBySell = paperPnlBySellInstruction(state.instructions);
+    const trades = fromPaperInstructions(
+      state.instructions,
+      (instruction) => pnlBySell.get(instruction.id),
+    );
+    const equityCurve = (state.asset_history ?? [])
+      .map((point) => ({
+        date: point.observed_at.slice(0, 10).replaceAll('-', ''),
+        total: Number(point.total_assets),
+      }))
+      .filter((point) => point.date.length === 8 && Number.isFinite(point.total));
+    const initialCapital = equityCurve[0]?.total ?? 0;
+    return computeMetrics({ trades, equityCurve, initialCapital });
   }
 
   /**
@@ -972,6 +1062,11 @@ export class PaperTradingService extends EventEmitter {
       excludedCodes,
       Math.max(this.strategy.maxCandidates, planCount),
       this.strategy.minEntryScore,
+      // P5：下发实例可指定启用子策略与分数合成规则；缺省保持既有行为。
+      {
+        strategyIds: this.entryStrategyIds,
+        scoreMergeRule: this.scoreMergeRule,
+      },
     )
       .map((candidate, index) => ({
         ...candidate,
@@ -1002,6 +1097,10 @@ export class PaperTradingService extends EventEmitter {
         quantity: sizing?.shares ?? 0,
         rank: candidate.rank,
         signal_score: signalScore,
+        entry_strategy_id: String(candidate.entry_strategy_id ?? ''),
+        entry_reasons: Array.isArray(candidate.entry_reasons) ? [...candidate.entry_reasons] : [],
+        // P5：指令与挖掘批次关联，审计/验证报告据此回溯。
+        run_id: state.applied_mining_run_id,
         reason,
         execution_window: executionWindow,
         status,
@@ -1023,6 +1122,11 @@ export class PaperTradingService extends EventEmitter {
             sizing,
             decision: status,
             reason,
+            // P2 审计要求：命中策略与命中原因随信号一起落审计日志。
+            strategy_id: candidate.entry_strategy_id ?? '',
+            entry_reasons: candidate.entry_reasons ?? [],
+            // P5 审计要求：runId 贯穿「挖掘 → 模拟交易」全链路。
+            run_id: state.applied_mining_run_id ?? null,
           },
         });
       }
@@ -1053,11 +1157,11 @@ export class PaperTradingService extends EventEmitter {
     const executionCalendar = this.effectiveTradingCalendar(context.calendar ?? []);
     const eligible = (instruction: PaperStrategyInstruction) => {
       if (instruction.status !== 'pending') return false;
+      // 立即执行=马上下单：忽略排期执行日与窗口，所有 pending 指令当场提交；
+      // 普通定时窗口仍严格只处理当天到期且窗口匹配的计划。
+      if (immediate) return true;
       const executionDate = nextTradingDateAfter(instruction.signal_date, executionCalendar);
-      // 立即执行用于恢复“曾提交但同花顺没有对应委托”的历史指令；
-      // 普通定时窗口仍严格只处理当天到期的计划。
-      const dateMatches = executionDate != null && (immediate ? executionDate <= tradingDate : executionDate === tradingDate);
-      return dateMatches && (immediate || (instruction.execution_window ?? 'open') === executionWindow);
+      return executionDate != null && executionDate === tradingDate && (instruction.execution_window ?? 'open') === executionWindow;
     };
     const sells = state.instructions.filter((instruction) => instruction.side === 'sell' && eligible(instruction));
     const buys = state.instructions.filter((instruction) => instruction.side === 'buy' && eligible(instruction));
