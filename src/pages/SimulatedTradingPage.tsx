@@ -218,7 +218,7 @@ export function SimulatedTradingPage() {
     void loadBootstrap().finally(() => refreshAccount());
   }, [loadBootstrap, refreshAccount]);
 
-  /** 未登录时启动本机浏览器（Chrome/Edge）登录窗口，并轮询登录态直到成功或失败。 */
+  /** 未登录时启动本机浏览器（Chrome/Brave/Edge）登录窗口，并轮询登录态直到成功或失败。 */
   const startLoginFlow = useCallback(async () => {
     if (loginPollRef.current) clearTimeout(loginPollRef.current);
     setLoginPhase('waiting_login');

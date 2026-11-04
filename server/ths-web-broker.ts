@@ -22,11 +22,13 @@ const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const DEFAULT_COOKIE_FILE = path.resolve(MODULE_DIR, '..', '..', '.tools', 'ths-cookie-bound.txt');
 
 const LOGIN_PAGE_URL = `https://upass.10jqka.com.cn/login?redir=${encodeURIComponent('http://moni.10jqka.com.cn/moni/')}`;
-/** 本机浏览器候选：优先 Chrome，回退 Edge（均支持相同的 CDP 调试参数）。 */
+/** 本机浏览器候选：优先 Chrome，其次 Brave，回退 Edge（均为 Chromium 内核，支持相同的 CDP 调试参数）。 */
 const BROWSER_CANDIDATES = [
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
+  'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+  'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
   'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
 ].filter((candidate): candidate is string => Boolean(candidate));
@@ -262,11 +264,11 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
     }
   }
 
-  /** 弹出可见的本机浏览器窗口（Chrome 优先、Edge 兜底；独立 profile + CDP 端口）等待用户登录，成功后把浏览器 Cookie 合入会话 jar。 */
+  /** 弹出可见的本机浏览器窗口（Chrome 优先、Brave 次之、Edge 兜底；独立 profile + CDP 端口）等待用户登录，成功后把浏览器 Cookie 合入会话 jar。 */
   private async runInteractiveLogin(context: BrokerCallContext): Promise<boolean> {
     const browser = BROWSER_CANDIDATES.find((candidate) => existsSync(candidate));
     if (!browser) {
-      this.lastLoginError = '未在本机找到 Chrome/Edge 浏览器，请安装 Chrome 或 Edge 后重试';
+      this.lastLoginError = '未在本机找到 Chrome/Brave/Edge 浏览器，请安装其中之一后重试';
       await this.audit.warn('ths_web_broker', 'login_browser_not_found', { traceId: context.traceId, data: { candidates: BROWSER_CANDIDATES } });
       return false;
     }

@@ -819,7 +819,7 @@ export function registerRoutes(
     response.json(await paper.getLoginStatus());
   }));
 
-  // 未登录时启动本机浏览器（Chrome/Edge）登录窗口，非阻塞；前端轮询 login-status
+  // 未登录时启动本机浏览器（Chrome/Brave/Edge）登录窗口，非阻塞；前端轮询 login-status
   app.post('/api/simulated-trading/login', asyncHandler(async (_request, response) => {
     const traceId = String(response.locals.traceId);
     response.json(paper.requestInteractiveLogin(traceId));
