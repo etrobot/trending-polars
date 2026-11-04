@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { PaperOrder } from '../src/types.js';
 import { ThsWebSimulatedBroker } from '../server/ths-web-broker.js';
-import { ThsSimulatedBrokerError } from '../server/ths-simulated-broker.js';
 
 const COOKIE = 'user=abc; ticket=t1; PHPSESSID=s1';
 
@@ -140,14 +139,44 @@ function createBroker(mock: ScriptedMock) {
 }
 
 describe('ThsWebSimulatedBroker', () => {
-  it('缺少 cookie 时构造报错', () => {
+  it('缺少 cookie 时构造不报错，登录态检测为未登录', async () => {
     const saved = process.env.THS_WEB_COOKIE;
     delete process.env.THS_WEB_COOKIE;
     try {
-      expect(() => new ThsWebSimulatedBroker({ cookieFile: 'X:\\不存在\\cookie.txt' })).toThrow(ThsSimulatedBrokerError);
+      const mock = baseMock();
+      mock.set(/cgiwt\/index\/index/, [htmlResponse(INDEX_HTML_LOGGED_OUT)]);
+      mock.set(/getcjdbs/, [{ errorcode: 0, result: { data: [] } }]);
+      const broker = new ThsWebSimulatedBroker({
+        cookieFile: 'X:\\不存在\\cookie.txt',
+        fetchImpl: mock.fetchImpl,
+        interactiveLogin: false,
+      });
+      expect(await broker.checkLoginStatus()).toBe(false);
+      // 交互登录被禁用时不启动浏览器，回报禁用原因
+      const request = broker.requestInteractiveLogin({ stage: 'login', source: 'test' });
+      expect(request.started).toBe(false);
+      expect(request.reason).toContain('THS_WEB_INTERACTIVE_LOGIN');
     } finally {
       if (saved !== undefined) process.env.THS_WEB_COOKIE = saved;
     }
+  });
+
+  it('checkLoginStatus 已登录时返回 true', async () => {
+    const mock = baseMock();
+    const broker = createBroker(mock);
+    expect(await broker.checkLoginStatus()).toBe(true);
+    expect(broker.getLoginState()).toEqual({ in_progress: false, error: null });
+  });
+
+  it('checkLoginStatus 会话失效但绑定链可恢复时静默重登', async () => {
+    const mock = baseMock();
+    mock.set(/cgiwt\/index\/index/, [htmlResponse(INDEX_HTML_LOGGED_OUT), htmlResponse(INDEX_HTML)]);
+    mock.set(/getcjdbs/, [CJDBS]);
+    mock.set(/trade\.php/, [new Response(null, { status: 302, headers: { location: '/cgiwt/index/doths?type=auto' } })]);
+    mock.set(/doths/, [new Response(null, { status: 302, headers: { location: 'https://mncg.10jqka.com.cn/cgiwt/index/index' } })]);
+    const broker = createBroker(mock);
+    expect(await broker.checkLoginStatus()).toBe(true);
+    expect(mock.calls.some((call) => call.url.includes('getcjdbs'))).toBe(true);
   });
 
   it('snapshot 解析资金/持仓/委托', async () => {

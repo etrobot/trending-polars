@@ -21,6 +21,16 @@ import type { AutomationState, BacktestListItem, PaperOverview, PaperPlanHistory
 
 const HISTORY_PAGE_SIZE = 15;
 const BACKTEST_HISTORY_PAGE_SIZE = 15;
+const LOGIN_POLL_INTERVAL_MS = 3_000;
+
+type LoginPhase = 'checking' | 'ready' | 'waiting_login' | 'login_failed';
+
+interface BrokerLoginStatus {
+  mode: 'web' | 'applescript';
+  logged_in: boolean;
+  login_in_progress: boolean;
+  login_error: string | null;
+}
 
 interface BacktestApplyTaskResult {
   ranking_task_id?: string | null;
@@ -112,7 +122,11 @@ export function SimulatedTradingPage() {
   const [backtestRankingTaskId, setBacktestRankingTaskId] = useState<string | null>(null);
   const [windowTaskId, setWindowTaskId] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
+  const [loginPhase, setLoginPhase] = useState<LoginPhase>('checking');
+  const [loginMessage, setLoginMessage] = useState('');
   const refreshInFlight = useRef<Promise<void> | null>(null);
+  const loginPollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mountedRef = useRef(true);
 
   const loadBootstrap = useCallback(async () => {
     try {
@@ -198,9 +212,79 @@ export function SimulatedTradingPage() {
     return operation;
   }, []);
 
-  useEffect(() => {
+  const enterTrading = useCallback(() => {
+    if (!mountedRef.current) return;
+    setLoginPhase('ready');
     void loadBootstrap().finally(() => refreshAccount());
   }, [loadBootstrap, refreshAccount]);
+
+  /** 未登录时启动本机浏览器（Chrome/Edge）登录窗口，并轮询登录态直到成功或失败。 */
+  const startLoginFlow = useCallback(async () => {
+    if (loginPollRef.current) clearTimeout(loginPollRef.current);
+    setLoginPhase('waiting_login');
+    setLoginMessage('');
+    const poll = async () => {
+      let status: BrokerLoginStatus | null = null;
+      try {
+        status = await api<BrokerLoginStatus>('/api/simulated-trading/login-status');
+      } catch {
+        status = null; // 状态接口抖动：继续等待
+      }
+      if (!mountedRef.current) return;
+      if (status && (status.logged_in || status.mode !== 'web')) {
+        enterTrading();
+        return;
+      }
+      if (status && !status.login_in_progress) {
+        setLoginPhase('login_failed');
+        setLoginMessage(status.login_error ?? '登录未完成，请重试');
+        return;
+      }
+      loginPollRef.current = setTimeout(() => void poll(), LOGIN_POLL_INTERVAL_MS);
+    };
+    try {
+      const result = await api<{ started: boolean; in_progress: boolean; reason?: string }>(
+        '/api/simulated-trading/login',
+        { method: 'POST' },
+      );
+      if (!mountedRef.current) return;
+      if (!result.started && !result.in_progress) {
+        setLoginPhase('login_failed');
+        setLoginMessage(result.reason ?? '无法启动浏览器登录窗口');
+        return;
+      }
+    } catch (loginError) {
+      if (!mountedRef.current) return;
+      setLoginPhase('login_failed');
+      setLoginMessage(loginError instanceof Error ? loginError.message : String(loginError));
+      return;
+    }
+    loginPollRef.current = setTimeout(() => void poll(), LOGIN_POLL_INTERVAL_MS);
+  }, [enterTrading]);
+
+  // 进入交易页面：先检测同花顺 Web 模拟盘登录态；未登录则自动拉起本机浏览器登录。
+  useEffect(() => {
+    mountedRef.current = true;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const status = await api<BrokerLoginStatus>('/api/simulated-trading/login-status');
+        if (cancelled) return;
+        if (status.logged_in || status.mode !== 'web') {
+          enterTrading();
+          return;
+        }
+        await startLoginFlow();
+      } catch {
+        if (!cancelled) enterTrading(); // 检测接口异常时退回原有加载流程
+      }
+    })();
+    return () => {
+      cancelled = true;
+      mountedRef.current = false;
+      if (loginPollRef.current) clearTimeout(loginPollRef.current);
+    };
+  }, [enterTrading, startLoginFlow]);
 
   const loadBacktestHistory = useCallback(async () => {
     setBacktestHistoryLoading(true);
@@ -401,7 +485,27 @@ export function SimulatedTradingPage() {
       <div className="terminal-page">
       {error && <div className="border border-accent-red-soft bg-accent-red-soft px-3 py-2 text-[11px] leading-4 text-trading-up">{error}</div>}
       {notice && <div className="border border-line bg-surface-elevated px-3 py-2 text-[11px] leading-4 text-ink">{notice}</div>}
-      {!overview && <LoadingPanel label="页面已就绪，正在后台连接同花顺模拟账户…" />}
+      {(loginPhase === 'waiting_login' || loginPhase === 'login_failed') && (
+        <section className="panel px-6 py-10 text-center">
+          <ShieldCheck className="mx-auto h-8 w-8 text-primary-active" />
+          <h2 className="mt-3 font-display text-lg text-ink">同花顺 Web 模拟盘未登录</h2>
+          {loginPhase === 'waiting_login' ? (
+            <p className="mx-auto mt-2 max-w-md text-[12px] leading-5 text-muted">
+              已自动启动本机浏览器登录窗口，请在窗口中完成同花顺登录；登录成功后页面将自动继续加载账户数据。
+            </p>
+          ) : (
+            <>
+              <p className="mx-auto mt-2 max-w-md text-[12px] leading-5 text-trading-up">{loginMessage || '登录未完成'}</p>
+              <div className="mt-4">
+                <Button variant="primary" onClick={() => void startLoginFlow()}>重新打开浏览器登录</Button>
+              </div>
+            </>
+          )}
+        </section>
+      )}
+      {loginPhase !== 'waiting_login' && loginPhase !== 'login_failed' && !overview && (
+        <LoadingPanel label={loginPhase === 'checking' ? '正在检测同花顺 Web 模拟盘登录状态…' : '页面已就绪，正在后台连接同花顺模拟账户…'} />
+      )}
       {overview && account && plan && (
       <section className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_300px]">
         <div className="min-w-0 space-y-3">

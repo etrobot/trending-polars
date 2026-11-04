@@ -38,6 +38,7 @@ import {
   type SimulatedAccountSnapshot,
   type SimulatedBroker,
 } from './ths-simulated-broker.js';
+import { ThsWebSimulatedBroker } from './ths-web-broker.js';
 import {
   adjustOrderPrice,
   assessMarketTiming,
@@ -165,6 +166,34 @@ export class PaperTradingService extends EventEmitter {
     this.calendarRefreshIntervalMs = Math.max(60_000, options.calendarRefreshIntervalMs ?? TRADING_CALENDAR_REFRESH_INTERVAL_MS);
     this.marketDataProvider = options.marketDataProvider;
     this.thsReadiness = options.thsReadiness;
+  }
+
+  /** 当前模拟交易通道：web（同花顺 Web 模拟盘）或 applescript（macOS GUI 桥接）。 */
+  getBrokerMode(): 'web' | 'applescript' {
+    return this.broker instanceof ThsWebSimulatedBroker ? 'web' : 'applescript';
+  }
+
+  /** 交易页面进入时的登录态检测：AppleScript 通道无网页会话概念，恒视为已登录。 */
+  async getLoginStatus(): Promise<{ mode: 'web' | 'applescript'; logged_in: boolean; login_in_progress: boolean; login_error: string | null }> {
+    if (!(this.broker instanceof ThsWebSimulatedBroker)) {
+      return { mode: 'applescript', logged_in: true, login_in_progress: false, login_error: null };
+    }
+    const loggedIn = await this.broker.checkLoginStatus();
+    const state = this.broker.getLoginState();
+    return {
+      mode: 'web',
+      logged_in: loggedIn,
+      login_in_progress: state.in_progress,
+      login_error: loggedIn ? null : state.error,
+    };
+  }
+
+  /** 启动本机浏览器登录（非阻塞，结果通过 getLoginStatus 轮询获取）。 */
+  requestInteractiveLogin(traceId: string): { started: boolean; in_progress: boolean; reason?: string } {
+    if (!(this.broker instanceof ThsWebSimulatedBroker)) {
+      throw new Error('当前模拟交易通道为 AppleScript，不支持网页登录（请检查 THS_BROKER_MODE）');
+    }
+    return this.broker.requestInteractiveLogin({ traceId, stage: 'login', source: 'simulated_trading_page' });
   }
 
   async getAutomation() {

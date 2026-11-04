@@ -22,11 +22,15 @@ const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 const DEFAULT_COOKIE_FILE = path.resolve(MODULE_DIR, '..', '..', '.tools', 'ths-cookie-bound.txt');
 
 const LOGIN_PAGE_URL = `https://upass.10jqka.com.cn/login?redir=${encodeURIComponent('http://moni.10jqka.com.cn/moni/')}`;
-const EDGE_CANDIDATES = [
+/** 本机浏览器候选：优先 Chrome，回退 Edge（均支持相同的 CDP 调试参数）。 */
+const BROWSER_CANDIDATES = [
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
   'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-];
-const LOGIN_PROFILE_DIR = path.resolve(MODULE_DIR, '..', '..', '.tools', 'edge-login-popup');
+].filter((candidate): candidate is string => Boolean(candidate));
+const LOGIN_PROFILE_DIR = path.resolve(MODULE_DIR, '..', '..', '.tools', 'browser-login-popup');
 const LOGIN_CDP_PORT = Number(process.env.THS_WEB_LOGIN_CDP_PORT ?? 9336);
 const LOGIN_TIMEOUT_MS = Number(process.env.THS_WEB_LOGIN_TIMEOUT_MS ?? 300_000);
 const LOGIN_POLL_MS = 3_000;
@@ -89,6 +93,9 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
   private readonly cookieFilePath: string | null = null;
   private operationQueue: Promise<void> = Promise.resolve();
   private sessionChecked = false;
+  /** 当前正在进行的浏览器交互登录（多个入口共享同一个登录窗口与轮询）。 */
+  private loginInFlight: Promise<boolean> | null = null;
+  private lastLoginError: string | null = null;
 
   constructor(options: ThsWebBrokerOptions = {}) {
     this.audit = options.audit ?? NOOP_AUDIT_LOGGER;
@@ -100,13 +107,9 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
     const raw = options.cookie
       ?? process.env.THS_WEB_COOKIE
       ?? this.readCookieFile(cookieFile);
-    if (!raw) {
-      throw new ThsSimulatedBrokerError(
-        `缺少同花顺 Web 模拟盘 Cookie：请设置 THS_WEB_COOKIE 或提供 Cookie 文件（默认 ${DEFAULT_COOKIE_FILE}）`,
-      );
-    }
+    // Cookie 缺失不再报错：进入未登录态，由登录态检测 / 交互登录流程补齐。
     if (!options.cookie && !process.env.THS_WEB_COOKIE) this.cookieFilePath = cookieFile;
-    Object.entries(parseCookieHeader(raw.trim())).forEach(([key, value]) => this.jar.set(key, value));
+    if (raw) Object.entries(parseCookieHeader(raw.trim())).forEach(([key, value]) => this.jar.set(key, value));
   }
 
   private readCookieFile(cookieFile: string): string | null {
@@ -180,6 +183,55 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
     return { loggedIn, detail: loggedIn ? '绑定链成功' : '绑定链走完后仍未登录' };
   }
 
+  /**
+   * 检测当前登录态：先查 cgiwt 会话；失效时静默尝试绑定链（不弹浏览器）。
+   * 供前端进入交易页面时轮询使用。
+   */
+  async checkLoginStatus(): Promise<boolean> {
+    if (await this.checkLogin().catch(() => false)) {
+      this.sessionChecked = true;
+      return true;
+    }
+    if (this.loginInFlight) return false;
+    const { loggedIn } = await this.runRebindChain({ stage: 'login_status', source: 'api' })
+      .catch(() => ({ loggedIn: false, detail: '绑定链异常' }));
+    if (loggedIn) {
+      this.sessionChecked = true;
+      this.persistCookies();
+    }
+    return loggedIn;
+  }
+
+  /** 交互登录的进行状态与最近一次失败原因（供 login-status 接口回报前端）。 */
+  getLoginState(): { in_progress: boolean; error: string | null } {
+    return { in_progress: this.loginInFlight != null, error: this.lastLoginError };
+  }
+
+  /** 路由入口：非阻塞地启动（或加入）一次浏览器交互登录。 */
+  requestInteractiveLogin(context: BrokerCallContext): { started: boolean; in_progress: boolean; reason?: string } {
+    if (!this.interactiveLoginEnabled) {
+      return { started: false, in_progress: false, reason: '交互登录已被禁用（THS_WEB_INTERACTIVE_LOGIN=0）' };
+    }
+    if (this.loginInFlight) return { started: false, in_progress: true };
+    void this.startInteractiveLogin(context);
+    return { started: true, in_progress: true };
+  }
+
+  /** 启动或加入进行中的交互登录；禁用交互登录时返回 null。永不 reject。 */
+  private startInteractiveLogin(context: BrokerCallContext): Promise<boolean> | null {
+    if (!this.interactiveLoginEnabled) return null;
+    if (this.loginInFlight) return this.loginInFlight;
+    this.lastLoginError = null;
+    const wrapped = this.runInteractiveLogin(context)
+      .catch((error: unknown) => {
+        this.lastLoginError = error instanceof Error ? error.message : String(error);
+        return false;
+      })
+      .finally(() => { this.loginInFlight = null; });
+    this.loginInFlight = wrapped;
+    return wrapped;
+  }
+
   private async rebind(context: BrokerCallContext): Promise<void> {
     const started = Date.now();
     let { loggedIn, detail } = await this.runRebindChain(context);
@@ -188,7 +240,7 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
         traceId: context.traceId,
         data: { reason: detail.slice(0, 300) },
       });
-      loggedIn = await this.interactiveLogin(context);
+      loggedIn = (await this.startInteractiveLogin(context)) ?? false;
       detail = loggedIn ? '用户登录成功' : detail;
     }
     await this.audit.info('ths_web_broker', 'rebind_completed', {
@@ -210,18 +262,19 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
     }
   }
 
-  /** 弹出可见 Edge 窗口（独立 profile + CDP 端口）等待用户登录，登录成功后把浏览器 Cookie 合入会话 jar。 */
-  private async interactiveLogin(context: BrokerCallContext): Promise<boolean> {
-    const edge = EDGE_CANDIDATES.find((candidate) => existsSync(candidate));
-    if (!edge) {
-      await this.audit.warn('ths_web_broker', 'login_edge_not_found', { traceId: context.traceId, data: { candidates: EDGE_CANDIDATES } });
+  /** 弹出可见的本机浏览器窗口（Chrome 优先、Edge 兜底；独立 profile + CDP 端口）等待用户登录，成功后把浏览器 Cookie 合入会话 jar。 */
+  private async runInteractiveLogin(context: BrokerCallContext): Promise<boolean> {
+    const browser = BROWSER_CANDIDATES.find((candidate) => existsSync(candidate));
+    if (!browser) {
+      this.lastLoginError = '未在本机找到 Chrome/Edge 浏览器，请安装 Chrome 或 Edge 后重试';
+      await this.audit.warn('ths_web_broker', 'login_browser_not_found', { traceId: context.traceId, data: { candidates: BROWSER_CANDIDATES } });
       return false;
     }
     let spawned: ChildProcess | null = null;
     let cdpUp = (await this.cdpVersion()) != null;
     if (!cdpUp) {
       mkdirSync(LOGIN_PROFILE_DIR, { recursive: true });
-      spawned = spawn(edge, [
+      spawned = spawn(browser, [
         `--user-data-dir=${LOGIN_PROFILE_DIR}`,
         `--remote-debugging-port=${LOGIN_CDP_PORT}`,
         '--no-first-run',
@@ -234,6 +287,7 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
       }
       if (!cdpUp) {
         spawned.kill();
+        this.lastLoginError = `无法连接浏览器调试端口（CDP ${LOGIN_CDP_PORT}），请关闭残留的登录窗口后重试`;
         await this.audit.warn('ths_web_broker', 'login_cdp_unreachable', { traceId: context.traceId, data: { port: LOGIN_CDP_PORT } });
         return false;
       }
@@ -253,11 +307,15 @@ export class ThsWebSimulatedBroker implements SimulatedBroker {
       const { loggedIn } = await this.runRebindChain(context).catch(() => ({ loggedIn: false, detail: 'rebind 轮询异常' }));
       if (loggedIn) {
         spawned?.kill();
+        this.sessionChecked = true;
+        this.lastLoginError = null;
+        this.persistCookies();
         await this.audit.info('ths_web_broker', 'login_popup_completed', { traceId: context.traceId, data: { waited_ms: Date.now() - (deadline - LOGIN_TIMEOUT_MS) } });
         return true;
       }
     }
     spawned?.kill();
+    this.lastLoginError = '等待登录超时（约 5 分钟），请重新发起登录';
     await this.audit.warn('ths_web_broker', 'login_popup_timeout', { traceId: context.traceId, data: { timeout_ms: LOGIN_TIMEOUT_MS } });
     return false;
   }

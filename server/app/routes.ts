@@ -800,17 +800,30 @@ export function registerRoutes(
   });
 
   app.get('/api/simulated-trading/health', (_request, response) => {
+    const brokerMode = paper.getBrokerMode();
     response.json({
       ok: true,
       mode: 'simulated',
-      source: 'tonghuashun-gui',
-      account_source: 'tonghuashun-gui',
-      execution_tool: 'applescript',
+      broker_mode: brokerMode,
+      source: brokerMode === 'web' ? 'tonghuashun-web' : 'tonghuashun-gui',
+      account_source: brokerMode === 'web' ? 'tonghuashun-web' : 'tonghuashun-gui',
+      execution_tool: brokerMode === 'web' ? 'cgiwt' : 'applescript',
       trading_core: 'nodejs',
       engine_version: PAPER_ENGINE_VERSION,
       service: 'node-polars-ths-simulated-trading',
     });
   });
+
+  // 进入交易页面时的登录态检测（Web 通道）
+  app.get('/api/simulated-trading/login-status', asyncHandler(async (_request, response) => {
+    response.json(await paper.getLoginStatus());
+  }));
+
+  // 未登录时启动本机浏览器（Chrome/Edge）登录窗口，非阻塞；前端轮询 login-status
+  app.post('/api/simulated-trading/login', asyncHandler(async (_request, response) => {
+    const traceId = String(response.locals.traceId);
+    response.json(paper.requestInteractiveLogin(traceId));
+  }));
 
   app.get('/api/simulated-trading/bootstrap', asyncHandler(async (_request, response) => {
     const traceId = String(response.locals.traceId);
