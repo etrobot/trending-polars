@@ -7,3 +7,4 @@ server/data/
 *.tsbuildinfo
 retry-claude.sh
 retry-codex.sh
+.env
