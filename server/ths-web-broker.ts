@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { PaperOrder, PaperPosition } from '../src/types.js';
@@ -24,11 +25,18 @@ const DEFAULT_COOKIE_FILE = path.resolve(MODULE_DIR, '..', '..', '.tools', 'ths-
 const LOGIN_PAGE_URL = `https://upass.10jqka.com.cn/login?redir=${encodeURIComponent('http://moni.10jqka.com.cn/moni/')}`;
 /** 本机浏览器候选：优先 Chrome，其次 Brave，回退 Edge（均为 Chromium 内核，支持相同的 CDP 调试参数）。 */
 const BROWSER_CANDIDATES = [
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  path.join(homedir(), 'Applications', 'Google Chrome.app', 'Contents', 'MacOS', 'Google Chrome'),
+  '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+  path.join(homedir(), 'Applications', 'Brave Browser.app', 'Contents', 'MacOS', 'Brave Browser'),
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+  path.join(homedir(), 'Applications', 'Microsoft Edge.app', 'Contents', 'MacOS', 'Microsoft Edge'),
   'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe') : '',
   'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
   'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+  process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe') : '',
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
   'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
 ].filter((candidate): candidate is string => Boolean(candidate));
